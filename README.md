@@ -2,7 +2,7 @@
 
 RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` 完成协议登录，沿用该账号绑定的代理，成功后将新授权写回原账号
 
-**当前状态：实验性功能**，已完成离线协议、前端及制品校验，尚未用真实账号验证完整登录与写回链路，请先在测试实例和自有测试账号上验证，不建议直接批量操作生产账号
+**当前状态：实验性功能**，已完成离线协议、前端及制品校验，并在 RS v3.26.2 验证安装、管理页加载、真实账号列表、筛选和分页，尚未用真实账号验证完整登录与写回链路，请先在测试实例和自有测试账号上验证，不建议直接批量操作生产账号
 
 ![模拟数据界面](docs/screenshots/overview-dark.png)
 
@@ -12,12 +12,12 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 
 在 [Releases](https://github.com/Lemon-57/rs-reauth-manager/releases) 下载对应版本的 `.tar.gz` 与 `.sha256`，核对摘要后，在 RS 的插件管理中上传安装
 
-也可以使用 GitHub 来源安装，仓库填写 `Lemon-57/rs-reauth-manager`，标签填写 `v0.1.2`，选择插件 `.tar.gz` 附件，不是 GitHub 自动生成的 Source code 归档
+也可以使用 GitHub 来源安装，仓库填写 `Lemon-57/rs-reauth-manager`，标签填写 `v0.1.3` 或留空查询最新正式发行版，选择插件 `.tar.gz` 附件，不是 GitHub 自动生成的 Source code 归档
 
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前版本 | `0.1.2` |
+| 当前版本 | `0.1.3` |
 | 宿主兼容清单 | `>=3.26.2, <3.27.0` |
 | 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |
 | 账号范围 | 非 Free 的 ChatGPT OAuth 账号 |
@@ -76,7 +76,7 @@ cargo +1.97.0 fmt --manifest-path backend/Cargo.toml --check
 cargo +1.97.0 clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
 cargo +1.97.0 build --manifest-path backend/Cargo.toml --locked
 node verification/protocol-test.mjs
-python -B -m unittest discover -s verification -p test_protocol.py -v
+python -B -m unittest discover -s verification -p 'test_*.py' -v
 ```
 
 Windows 使用已配置到 PATH 的 `python`，Linux 使用 `python3`，也可以通过 `RS_REAUTH_TEST_PYTHON` 指定离线测试解释器
@@ -115,6 +115,7 @@ Windows 交叉编译需先配置 Zig 与 cargo-zigbuild，将构建命令换成 
 
 ## 验证范围
 
-包含 15 项真实 SDK 子进程协议场景、11 项 Python 离线协议测试、9 项前端桥与响应解码测试，以及公开依赖、SFC、主题和资源边界检查
-已进行本机 Linux 交叉编译、官方 CLI 打包、内部摘要校验和模拟页面的明暗主题及窄屏检查
+包含 15 项真实 SDK 子进程协议场景、11 项 Python 离线协议测试、5 项 HTML 资源回归测试、9 项前端桥与响应解码测试，以及公开依赖、SFC、主题和资源边界检查
+已进行本机 Linux 交叉编译、官方 CLI 打包、内部摘要校验和模拟页面的明暗主题及窄屏检查，发行包检查会拒绝不受宿主支持的 HTML 资源引用
+已在 RS v3.26.2 实际安装并验证管理页、真实账号列表、会员筛选、页容量切换和窄屏布局，iframe 保持原有隔离策略
 这些结果不等于已经验证真实账号可完成授权，代理、账号状态、工作区和人工验证都可能导致实际登录失败

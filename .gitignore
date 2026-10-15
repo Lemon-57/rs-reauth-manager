@@ -16,5 +16,6 @@ verification/*
 !verification/protocol-test.mjs
 !verification/fake-worker.py
 !verification/test_protocol.py
+!verification/test_page_resources.py
 !verification/bridge-test.mjs
 !verification/conventions.mjs
