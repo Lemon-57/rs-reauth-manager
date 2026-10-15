@@ -26,6 +26,6 @@ with tarfile.open(path) as archive:
                 assert marker not in raw
         if name == "web/app.js":
             assert b"acct_preview_" not in raw and b"fixture-password" not in raw
-result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 15, "pythonProtocolTests": 11, "pageResourceTests": 5}
+result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 16, "runtimeExtractionTests": 4, "pythonProtocolTests": 11, "pageResourceTests": 5}
 (ROOT / "verification/artifact.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result, indent=2))

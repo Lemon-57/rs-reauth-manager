@@ -68,6 +68,7 @@ fn registration() -> ManagementRegistration {
             ("POST", "api/submit"),
             ("POST", "api/cancel"),
             ("POST", "api/tick"),
+            ("POST", "api/runtime-check"),
         ]
         .into_iter()
         .map(|(m, p)| ManagementRoute {
@@ -330,6 +331,7 @@ impl Manager {
             // 凭据发送前先持久化意图，中断任务不自动恢复
             host::save(host, &queue, version).await?;
             let result=async {
+                self.runtime.prepare().await?;
                 let job=&queue.jobs[position];let a=detail(host,&job.account_id).await?;
                 require_idle(&a)?;
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
@@ -372,6 +374,13 @@ async fn handle(
     }
     if call.request.method != "POST" {
         return Err(fault("请求方法不支持"));
+    }
+    if call.request.path == "api/runtime-check" {
+        if call.payload != b"{}" {
+            return Err(fault("请求格式无效"));
+        }
+        manager.runtime.prepare().await?;
+        return Ok(json!({"ready":true}));
     }
     if call.request.path == "api/tick" {
         if call.payload != b"{}" {
@@ -490,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recovered: false,
     }));
     let background = Arc::clone(&manager);
+    let shutdown = Arc::clone(&manager);
     let plugin = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .management(registration(), move |call| {
             let manager = Arc::clone(&manager);
@@ -517,6 +527,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?
         .build()?;
-    session.run(plugin).await?;
+    let result = session.run(plugin).await;
+    // SDK 生命周期线程可能仍持有处理器，退出前显式回收子进程和运行目录
+    let mut manager = shutdown.lock().await;
+    if let Some(mut worker) = manager.worker.take() {
+        let _ = worker.child.kill().await;
+    }
+    let cleanup = manager.runtime.cleanup();
+    result?;
+    cleanup.map_err(|error| std::io::Error::other(error.message))?;
     Ok(())
 }
