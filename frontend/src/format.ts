@@ -1,7 +1,8 @@
 import type { Account, Job } from './types'
 
 export const isActive = (job?: Job) => !!job && ['queued', 'running'].includes(job.status)
-export function planLabel(value: string) { return ({ team: 'Team', business: 'Business', plus: 'Plus', pro: 'Pro', free: 'Free', unknown: '未知' } as Record<string, string>)[value.toLowerCase()] || value }
+export function planKey(value: string | null) { return value?.trim().toLowerCase() || 'unknown' }
+export function planLabel(value: string) { return ({ team: 'Team', business: 'Business', plus: 'Plus', pro: 'Pro', free: 'Free', unknown: '未知' } as Record<string, string>)[planKey(value)] || value }
 export function planType(value: string | null): 'success' | 'info' | 'primary' | 'default' {
   const plan = value?.trim().toLowerCase()
   return plan === 'team' || plan === 'business' ? 'success' : plan === 'plus' ? 'info' : plan?.startsWith('pro') ? 'primary' : 'default'

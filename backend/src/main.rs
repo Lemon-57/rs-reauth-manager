@@ -100,11 +100,7 @@ fn registration() -> ManagementRegistration {
     }
 }
 fn eligible(a: &Value) -> bool {
-    a["provider"] == "openai"
-        && a["authenticationKind"] == "oauth"
-        && !a["planType"]
-            .as_str()
-            .is_some_and(|plan| plan.trim().eq_ignore_ascii_case("free"))
+    a["provider"] == "openai" && a["authenticationKind"] == "oauth"
 }
 fn notes_valid(a: &Value) -> bool {
     let Some(notes) = a["notes"].as_str() else {
@@ -138,7 +134,7 @@ async fn detail(host: &HostClient, id: &str) -> Result<Value, PluginFault> {
     .await?;
     let mut a = data["account"].clone();
     if a["id"] != id || !eligible(&a) {
-        return Err(fault("该账号不是适用的非 Free OpenAI OAuth 账号"));
+        return Err(fault("该账号不是适用的 OpenAI OAuth 账号"));
     }
     let reply = host
         .call(
@@ -538,4 +534,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     result?;
     cleanup.map_err(|error| std::io::Error::other(error.message))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_oauth_plans_are_eligible_but_other_credentials_are_not() {
+        for plan in [
+            json!("free"),
+            json!(" Free "),
+            json!("plus"),
+            json!("pro"),
+            json!("team"),
+            json!("business"),
+            Value::Null,
+        ] {
+            assert!(eligible(
+                &json!({"provider":"openai","authenticationKind":"oauth","planType":plan})
+            ));
+        }
+        assert!(!eligible(
+            &json!({"provider":"openai","authenticationKind":"api_key","planType":"free"})
+        ));
+        assert!(!eligible(
+            &json!({"provider":"other","authenticationKind":"oauth","planType":"free"})
+        ));
+    }
 }

@@ -1,6 +1,6 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './api'
-import { isActive, planLabel } from './format'
+import { isActive, planKey, planLabel } from './format'
 import type { Account, Job } from './types'
 
 export function useReauthManager() {
@@ -15,9 +15,9 @@ export function useReauthManager() {
   const success = computed(() => jobs.value.filter(j => j.status === 'success').length)
   const failed = computed(() => jobs.value.filter(j => ['failed', 'review', 'interrupted'].includes(j.status)).length)
   const eligibleCount = computed(() => accounts.value.filter(ready).length)
-  const planOptions = computed(() => [{ value: 'all', label: '全部会员' }, ...Array.from(new Set(accounts.value.map(a => a.planType || 'unknown'))).sort().map(value => ({ value, label: planLabel(value) }))])
+  const planOptions = computed(() => [{ value: 'all', label: '全部会员' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
   const filtered = computed(() => accounts.value.filter(a => {
-    if (plan.value !== 'all' && (a.planType || 'unknown') !== plan.value) return false
+    if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
     const job = jobOf(a)
     return filter.value === 'all' || filter.value === 'error' && a.status === 'error' || filter.value === 'ready' && ready(a) || filter.value === 'active' && isActive(job) || filter.value === 'failed' && !!job && ['failed', 'review', 'interrupted'].includes(job.status) || filter.value === 'success' && job?.status === 'success' || filter.value === 'invalid' && (!a.notesValid || !a.proxy) || filter.value === 'disabled' && !a.enabled

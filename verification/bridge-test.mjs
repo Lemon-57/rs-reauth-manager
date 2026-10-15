@@ -14,6 +14,8 @@ const check = name => { count++; console.log(`PASS ${name}`) }
 try {
   const { request } = await server.ssrLoadModule('/src/api/request.ts')
   const { api } = await server.ssrLoadModule('/src/api/index.ts')
+  const { planKey, planLabel } = await server.ssrLoadModule('/src/format.ts')
+  assert.equal(planKey(' Free '), 'free'); assert.equal(planLabel(' Free '), 'Free'); assert.equal(planKey(null), 'unknown'); check('Free membership labels and filter keys normalize case and whitespace')
   handler = () => json({ accounts: [] }, 200, ' Application/JSON ; charset=utf-8')
   assert.deepEqual(await api.accounts(), { accounts: [] }); assert.deepEqual(calls.at(-1), { method: 'GET', path: 'api/accounts' }); check('Public bridge GET has no JSON declaration or body, MIME normalization matches workbench')
   handler = () => json({ jobs: [] })
