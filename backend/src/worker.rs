@@ -36,7 +36,7 @@ pub struct Runtime {
     directory: Option<tempfile::TempDir>,
     ready: bool,
 }
-const RUNTIME_CHECK: &str = "import ssl, curl_cffi; from vendor.lib.oauth_client import OAuthClient; from vendor.lib.chatgpt_client import ChatGPTClient; from totp import totp_code; assert totp_code('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',at_time=59,digits=8)[0] == '94287082'";
+const RUNTIME_CHECK: &str = "from selfcheck import check_runtime; check_runtime()";
 
 fn unpack_error(error: io::Error) -> PluginFault {
     fault(match error.kind() {

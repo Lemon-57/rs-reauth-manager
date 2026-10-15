@@ -1,5 +1,6 @@
 """Verify package digests and ensure release-only boundaries before delivery."""
 import hashlib
+import io
 import json
 from pathlib import Path
 import tarfile
@@ -26,6 +27,13 @@ with tarfile.open(path) as archive:
                 assert marker not in raw
         if name == "web/app.js":
             assert b"acct_preview_" not in raw and b"fixture-password" not in raw
-result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 16, "runtimeExtractionTests": 4, "pythonProtocolTests": 11, "pageResourceTests": 5}
+    with tarfile.open(fileobj=io.BytesIO(archive.extractfile("runtime/runtime.tar.gz").read())) as runtime:
+        for source in (ROOT / "protocol").rglob("*"):
+            if source.is_file() and "__pycache__" not in source.parts and source.suffix != ".pyc":
+                raw = source.read_bytes()
+                if source.suffix in {".py", ".txt"} or source.name.startswith("LICENSE"):
+                    raw = raw.replace(b"\r\n", b"\n")
+                assert runtime.extractfile("protocol/" + source.relative_to(ROOT / "protocol").as_posix()).read() == raw, "Packaged protocol differs from source"
+result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 16, "runtimeExtractionTests": 4, "pythonProtocolTests": 17, "upstreamContractTests": 4, "pageResourceTests": 5}
 (ROOT / "verification/artifact.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result, indent=2))

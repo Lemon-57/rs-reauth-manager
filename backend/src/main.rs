@@ -229,6 +229,7 @@ fn protocol_error(code: &str) -> &'static str {
         "mfa" => "2FA 验证未通过，请检查原账号备注",
         "human" => "上游要求人工验证，请手动完成授权",
         "workspace" => "无法匹配原账号工作区，已停止写回",
+        "authorization" => "RS 授权链接格式无效，尚未发起账号登录",
         "state" => "OAuth state 校验失败，已停止写回",
         "proxy" => "原账号代理连接失败",
         "limited" => "上游登录限流，请稍后手动重试",

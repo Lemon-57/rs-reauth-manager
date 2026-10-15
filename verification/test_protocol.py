@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "protocol"))
@@ -13,7 +14,11 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 EMAIL = "fixture@example.com"
-URL = "https://auth.openai.com/oauth/authorize?state=fixture&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&client_id=fixture&code_challenge=fixture"
+URL = "https://auth.openai.com/oauth/authorize?" + urlencode({"response_type": "code", "client_id": "fixture", "redirect_uri": "http://127.0.0.1:1455/auth/callback", "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke", "code_challenge": "a" * 43, "code_challenge_method": "S256", "id_token_add_organizations": "true", "codex_cli_simplified_flow": "true", "state": "fixture", "originator": "Codex Desktop", "codex_app_version": "fixture", "source_surface_stable_id": "fixture", "codex_origin_stable_id": "fixture", "codex_streamlined_login": "true"})
+
+
+def desktop_url(inner=URL):
+    return "https://chatgpt.com/codex/desktop-auth?" + urlencode({"authorize_url": inner, "codex_streamlined_login": "true", "no_universal_links": "1"})
 
 
 class Session:
@@ -40,6 +45,8 @@ class OAuth:
         return self.cookie
 
     def authorize_external_oauth_url(self, *args, **kwargs):
+        assert args[0] == URL
+        assert kwargs["expected_state"] == "fixture"
         kwargs["mfa_client"].get_mfa_code(timeout=5)
         return self.result
 
@@ -73,9 +80,51 @@ class ProtocolTests(unittest.TestCase):
             runner.parse_notes(f"{EMAIL}----fixture----not-base32-!", EMAIL)
 
     def test_auth_url_trusted_origin(self):
-        for url in [URL.replace("auth.openai.com", "untrusted.example"), URL.replace("https:", "http:"), URL + "&state=duplicate", URL.replace("localhost", "evil.example")]:
+        for url in [URL.replace("auth.openai.com", "untrusted.example"), URL.replace("https:", "http:"), URL + "&state=duplicate", URL.replace("127.0.0.1", "evil.example")]:
             with self.assertRaises(ValueError):
                 runner.authorization(url)
+
+    def test_rs_desktop_url_preserves_exact_inner_parameters(self):
+        resolved, state, redirect = runner.authorization(desktop_url())
+        self.assertEqual(resolved, URL)
+        self.assertEqual(state, "fixture")
+        self.assertEqual(redirect.geturl(), "http://127.0.0.1:1455/auth/callback")
+        self.assertEqual(runner.authorization(URL), runner.authorization(desktop_url()))
+
+    def test_rs_desktop_url_calls_protocol_with_inner_url(self):
+        self.data["authorizationUrl"] = desktop_url()
+        self.run_login()
+        self.assertEqual(self.messages[-1]["event"], "complete")
+
+    def test_invalid_wrappers_rejected_before_session_creation(self):
+        urls = [desktop_url().replace("chatgpt.com/", "chatgpt.com.evil.example/"), desktop_url().replace("https:", "http:", 1), desktop_url().replace("/desktop-auth?", "/other?"), desktop_url("") , desktop_url() + "&authorize_url=", desktop_url(desktop_url()), desktop_url(URL.replace("auth.openai.com", "evil.example")), desktop_url() + "#fragment", desktop_url().replace("chatgpt.com", "user@chatgpt.com"), desktop_url().replace("chatgpt.com", "chatgpt.com:444")]
+        with patch.object(Chat, "__init__", side_effect=AssertionError("Must reject before session creation")):
+            for url in urls:
+                with self.subTest(url=url):
+                    self.data["authorizationUrl"] = url
+                    with self.assertRaisesRegex(ValueError, "^authorization$"):
+                        self.run_login()
+
+    def test_invalid_inner_parameters_and_redirects_rejected(self):
+        params = {k: v[0] for k, v in parse_qs(urlsplit(URL).query).items()}
+        invalid = [URL + "&state=", URL + "&client_id=", URL + "&code_challenge=", URL + "#fragment", URL.replace("auth.openai.com", "auth.openai.com:444"), URL.replace("auth.openai.com", "user@auth.openai.com"), "\n" + URL]
+        for key, value in [("response_type", "token"), ("code_challenge_method", "plain"), ("code_challenge", "short"), ("state", ""), ("redirect_uri", "http://localhost:80/auth/callback"), ("redirect_uri", "http://user@localhost:1455/auth/callback"), ("redirect_uri", "http://localhost:1455/auth/callback?x=1"), ("redirect_uri", "http://localhost:1455/auth/callback#x"), ("state", "bad\nstate")]:
+            invalid.append("https://auth.openai.com/oauth/authorize?" + urlencode(params | {key: value}))
+        for url in invalid:
+            for candidate in [url, desktop_url(url)]:
+                with self.subTest(url=candidate), self.assertRaisesRegex(ValueError, "^authorization$"):
+                    runner.authorization(candidate)
+
+    def test_wrapped_flow_still_rejects_mismatched_callback_state(self):
+        self.data["authorizationUrl"] = desktop_url()
+        OAuth.result["state"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "^state$"):
+            self.run_login()
+
+    def test_legacy_direct_localhost_callback_still_supported(self):
+        _, state, redirect = runner.authorization(URL.replace("127.0.0.1", "localhost"))
+        self.assertEqual(state, "fixture")
+        self.assertEqual(redirect.netloc, "localhost:1455")
 
     def test_login_callback_and_secret_free_progress(self):
         self.run_login()

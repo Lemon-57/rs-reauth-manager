@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto'
 const binary = process.argv[2] || fileURLToPath(new URL(`../backend/target/debug/reauth-manager${process.platform === 'win32' ? '.exe' : ''}`, import.meta.url))
 const python = process.env.RS_REAUTH_TEST_PYTHON || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
 const worker = fileURLToPath(new URL('./fake-worker.py', import.meta.url))
+const innerAuthorization = 'https://auth.openai.com/oauth/authorize?' + new URLSearchParams({ response_type: 'code', client_id: 'fixture', redirect_uri: 'http://127.0.0.1:1455/auth/callback', state: 'fixture', code_challenge: 'a'.repeat(43), code_challenge_method: 'S256' })
+const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLSearchParams({ authorize_url: innerAuthorization, codex_streamlined_login: 'true', no_universal_links: '1' })
 const make = (id, prefix = id) => ({ id, provider: 'openai', name: `team+${prefix}@example.com+workspace3`, email: `${prefix}@example.com`, authenticationKind: 'oauth', enabled: id !== 'disabled', planType: 'team', status: 'error', notes: `${prefix}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`, outboundProxyEndpoint: 'http://127.0.0.1:21001', accountId: 'original-workspace', groups: [{ id: 'g1', name: 'Team' }], weight: 3, concurrencyLimit: null, modelAccess: { mode: 'all' }, hasRefreshToken: true, accessTokenExpiresAt: '2026-10-23T00:00:00Z', capacity: { usedSlots: 0, totalSlots: null } })
 const accounts = [make('good'), make('disabled'), make('slow'), make('failed'), make('missing_proxy'), make('bad_notes'), make('changed'), make('active'), make('uncertain')]
 accounts.find(a => a.id === 'missing_proxy').outboundProxyEndpoint = null
@@ -41,7 +43,7 @@ async function callback(meta, payload) {
       const id = url.searchParams.get('accountIds'); assert.ok(!id.includes(','))
       dataReply = { documents: [{ provider: 'openai', document: { accounts: [{ id, outboundProxyUrl: 'http://fixture:pass@127.0.0.1:21001', refreshToken: 'old-secret-rt' }] } }] }
     }
-    else if (url.pathname === '/api/admin/accounts/oauth/start') { assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountId', 'name', 'provider']); starts.push(structuredClone(data)); dataReply = { flowId: `flow_${data.accountId}`, authorizationUrl: 'https://auth.openai.com/oauth/authorize?state=fixture' }; status = 201 }
+    else if (url.pathname === '/api/admin/accounts/oauth/start') { assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountId', 'name', 'provider']); starts.push(structuredClone(data)); dataReply = { flowId: `flow_${data.accountId}`, authorizationUrl: nativeAuthorization }; status = 201 }
     else if (url.pathname === '/api/admin/accounts/oauth/complete') {
       assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['callbackUrl', 'flowId', 'provider']); completes.push(structuredClone(data)); const a = accounts.find(a => `flow_${a.id}` === data.flowId)
       assert.ok(a); a.status = 'normal'; a.accessTokenExpiresAt = '2026-10-24T00:00:00Z'; dataReply = { accountId: a.id }; status = 201

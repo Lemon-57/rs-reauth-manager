@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -30,17 +31,36 @@ def parse_notes(notes, email):
 
 
 def authorization(url):
-    parsed = urlsplit(url)
-    params = parse_qs(parsed.query)
-    if parsed.scheme != "https" or parsed.netloc != "auth.openai.com" or parsed.path != "/oauth/authorize":
-        raise ValueError("state")
-    required = ["state", "redirect_uri", "code_challenge", "client_id"]
-    if any(len(params.get(k, [])) != 1 or not params[k][0] for k in required):
-        raise ValueError("state")
-    redirect = urlsplit(params["redirect_uri"][0])
-    if redirect.scheme != "http" or redirect.hostname not in {"localhost", "127.0.0.1"} or redirect.path != "/auth/callback":
-        raise ValueError("state")
-    return params["state"][0], redirect
+    def parse(value):
+        if not isinstance(value, str) or not value or len(value) > 16384 or any(ord(c) <= 32 or ord(c) == 127 for c in value):
+            raise ValueError("authorization")
+        parsed = urlsplit(value)
+        params = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=64)
+        if parsed.fragment or any(len(values) != 1 for values in params.values()):
+            raise ValueError("authorization")
+        return parsed, params
+
+    try:
+        parsed, params = parse(url)
+        # RS wraps the upstream authorize URL in the official desktop entry point.
+        if parsed.scheme == "https" and parsed.netloc == "chatgpt.com" and parsed.path == "/codex/desktop-auth":
+            url = params.get("authorize_url", [""])[0]
+            parsed, params = parse(url)
+        if parsed.scheme != "https" or parsed.netloc != "auth.openai.com" or parsed.path != "/oauth/authorize":
+            raise ValueError("authorization")
+        required = ["state", "redirect_uri", "code_challenge", "client_id", "response_type", "code_challenge_method"]
+        if any(not params.get(k, [""])[0] for k in required):
+            raise ValueError("authorization")
+        if params["response_type"] != ["code"] or params["code_challenge_method"] != ["S256"] or not re.fullmatch(r"[A-Za-z0-9_-]{43}", params["code_challenge"][0]):
+            raise ValueError("authorization")
+        if any(ord(c) <= 32 or ord(c) == 127 for k in required for c in params[k][0]):
+            raise ValueError("authorization")
+        redirect = urlsplit(params["redirect_uri"][0])
+        if redirect.scheme != "http" or redirect.netloc not in {"localhost:1455", "127.0.0.1:1455"} or redirect.path != "/auth/callback" or redirect.query or redirect.fragment:
+            raise ValueError("authorization")
+        return url, params["state"][0], redirect
+    except (ValueError, TypeError):
+        raise ValueError("authorization") from None
 
 
 def error_code(result):
@@ -59,7 +79,7 @@ def error_code(result):
 
 def run(data):
     email, password, secret = parse_notes(data["notes"], data["email"])
-    state, redirect = authorization(data["authorizationUrl"])
+    authorize_url, state, redirect = authorization(data["authorizationUrl"])
     proxy = str(data["proxy"])
     parsed_proxy = urlsplit(proxy)
     if parsed_proxy.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed_proxy.hostname:
@@ -111,7 +131,7 @@ def run(data):
     oauth.session = chat.session
     try:
         emit("step", step="login")
-        result = oauth.authorize_external_oauth_url(data["authorizationUrl"], chat, expected_state=state, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+        result = oauth.authorize_external_oauth_url(authorize_url, chat, expected_state=state, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
         if not isinstance(result, dict) or not result.get("ok"):
             emit("error", code=error_code(result if isinstance(result, dict) else {}))
             return
@@ -141,7 +161,7 @@ def main():
             run(data)
     except ValueError as exc:
         code = str(exc)
-        emit("error", code=code if code in {"credentials", "state", "workspace", "proxy"} else "credentials")
+        emit("error", code=code if code in {"credentials", "authorization", "state", "workspace", "proxy"} else "credentials")
     except Exception:
         emit("error", code="protocol")
 
