@@ -1,26 +1,30 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './api'
-import { isActive, planKey, planLabel } from './format'
+import { isActive, isUnfinished, needsReauth, planKey, planLabel } from './format'
 import type { Account, Job } from './types'
 
 export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
   const showConfirm = ref(false), targets = ref<Account[]>([])
+  const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
   const byAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
+  const batchByAccount = computed(() => new Map(batchJobs.value.map(j => [j.accountId, j])))
   const jobOf = (a: Account) => byAccount.value.get(a.id)
+  const resultOf = (a: Account) => ['success', 'failed'].includes(filter.value) ? batchByAccount.value.get(a.id) : jobOf(a)
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
   const active = computed(() => jobs.value.filter(isActive).length)
-  const success = computed(() => jobs.value.filter(j => j.status === 'success').length)
-  const failed = computed(() => jobs.value.filter(j => ['failed', 'review', 'interrupted'].includes(j.status)).length)
-  const eligibleCount = computed(() => accounts.value.filter(ready).length)
+  const success = computed(() => batchJobs.value.filter(j => j.status === 'success').length)
+  const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
+  const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
   const planOptions = computed(() => [{ value: 'all', label: '全部会员' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
   const filtered = computed(() => accounts.value.filter(a => {
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
-    if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
+    if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
     const job = jobOf(a)
-    return filter.value === 'all' || filter.value === 'error' && a.status === 'error' || filter.value === 'ready' && ready(a) || filter.value === 'active' && isActive(job) || filter.value === 'failed' && !!job && ['failed', 'review', 'interrupted'].includes(job.status) || filter.value === 'success' && job?.status === 'success' || filter.value === 'invalid' && (!a.notesValid || !a.proxy) || filter.value === 'disabled' && !a.enabled
+    const batchJob = batchByAccount.value.get(a.id)
+    return filter.value === 'all' || filter.value === 'error' && needsReauth(a) || filter.value === 'ready' && ready(a) || filter.value === 'active' && isActive(job) || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success' || filter.value === 'invalid' && (!a.notesValid || !a.proxy) || filter.value === 'disabled' && !a.enabled
   }))
   const visible = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
   const pageCandidates = computed(() => visible.value.filter(ready))
@@ -30,19 +34,46 @@ export function useReauthManager() {
   watch(() => filtered.value.length, n => { page.value = Math.min(page.value, Math.max(1, Math.ceil(n / pageSize.value))) })
   function selectOne(id: string, checked: boolean) { selected.value = checked ? [...new Set([...selected.value, id])] : selected.value.filter(v => v !== id) }
   function selectPage(checked: boolean) { for (const a of pageCandidates.value) selectOne(a.id, checked) }
-  async function load() { loading.value = true; error.value = ''; try { accounts.value = (await api.accounts()).accounts; jobs.value = (await api.jobs()).jobs } catch (e) { error.value = (e as Error).message } finally { loading.value = false } }
+  function receiveJobs(next: Job[]) {
+    const changed = next.some(j => !isActive(j) && jobs.value.some(old => old.requestId === j.requestId && isActive(old)))
+    jobs.value = next
+    if (batchId.value) {
+      // Keep this page's outcomes even if another submission trims server history.
+      const records = new Map(batchJobs.value.map(j => [j.requestId, j]))
+      for (const job of next) if (job.requestId.startsWith(`${batchId.value}:`)) records.set(job.requestId, job)
+      batchJobs.value = [...records.values()]
+    }
+    return changed
+  }
+  function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
+  async function load() { loading.value = true; error.value = ''; try { accounts.value = (await api.accounts()).accounts; receiveJobs((await api.jobs()).jobs) } catch (e) { error.value = (e as Error).message } finally { loading.value = false } }
   function confirm(rows: Account[]) { targets.value = rows; showConfirm.value = true }
-  async function submit() { if (!targets.value.length || busy.value) return; busy.value = true; error.value = ''; try { jobs.value = (await api.submit(targets.value.map(a => a.id), crypto.randomUUID())).jobs; selected.value = selected.value.filter(id => !targets.value.some(a => a.id === id)); showConfirm.value = false; await api.tick(); jobs.value = (await api.jobs()).jobs } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
-  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { jobs.value = (await api.cancel(job?.requestId || null)).jobs } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
+  async function submit() {
+    if (!targets.value.length || busy.value) return
+    const accountIds = targets.value.map(a => a.id), requestId = crypto.randomUUID()
+    busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
+    if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+    try {
+      receiveJobs((await api.submit(accountIds, requestId)).jobs)
+      selected.value = selected.value.filter(id => !accountIds.includes(id)); showConfirm.value = false
+      await api.tick()
+      if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts
+    } catch (e) {
+      error.value = (e as Error).message
+      // A failed response does not prove the submission was rejected; read, never replay it.
+      try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve the original submission error. */ }
+    } finally { busy.value = false }
+  }
+  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { receiveJobs((await api.cancel(job?.requestId || null)).jobs) } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
   async function poll() {
     if (destroyed || polling) return
     polling = true
     try {
-      if (active.value && !busy.value) { await api.tick(); const next = (await api.jobs()).jobs; const changed = next.some(j => !isActive(j) && jobs.value.some(old => old.requestId === j.requestId && isActive(old))); jobs.value = next; if (changed) accounts.value = (await api.accounts()).accounts }
+      if (active.value && !busy.value) { await api.tick(); if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts }
     } catch (e) { error.value = (e as Error).message }
     finally { polling = false; if (!destroyed) timer = setTimeout(poll, 3000) }
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, load, confirm, submit, cancel }
+  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel }
 }

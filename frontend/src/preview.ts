@@ -4,7 +4,7 @@ export function installPreview() {
   if (window.codexProxyPlugin) return
   const theme = new URLSearchParams(location.search).get('theme') === 'dark' ? 'dark' : 'light'
   applyResolvedTheme(document.documentElement, resolveTheme(theme, DEFAULT_THEME_COLOR, DEFAULT_CUSTOM_THEME_COLOR))
-  const accounts: Account[] = Array.from({ length: 61 }, (_, i) => ({ id: `acct_preview_${i}`, name: `team+account-${i + 1}@example.com+workspace3`, email: `account-${i + 1}@example.com`, enabled: i !== 4, planType: i % 6 ? 'team' : 'plus', status: i % 3 ? 'normal' : 'error', accessTokenExpiresAt: new Date(Date.now() + 86400000 * 6).toISOString(), proxy: i === 3 ? null : `http://127.0.0.1:${21001 + i}`, notesValid: i !== 7 }))
+  const accounts: Account[] = Array.from({ length: 61 }, (_, i) => ({ id: `acct_preview_${i}`, name: `team+account-${i + 1}@example.com+workspace3`, email: `account-${i + 1}@example.com`, enabled: i !== 4, planType: i % 6 ? 'team' : 'plus', status: i % 3 ? 'normal' : 'error', accessTokenExpiresAt: new Date(Date.now() + 86400000 * 6).toISOString(), proxy: i === 3 ? null : `http://127.0.0.1:${21001 + i}`, notesValid: i !== 7, groups: i % 5 === 0 ? [] : [{ id: 'preview-primary', name: '示例部署组' }, ...(i % 7 === 0 ? [{ id: 'preview-shared', name: '跨区域共享账号组' }] : [])] }))
   let jobs: Job[] = []
   const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer })
   window.codexProxyPlugin = { version: 2, theme, async request(input) {

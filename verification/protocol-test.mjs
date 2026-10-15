@@ -17,6 +17,8 @@ const free = make('free'); free.planType = ' Free '; accounts.push(free)
 accounts.push(make('credential_changed'))
 const apiKey = make('api_key'); apiKey.authenticationKind = 'api_key'; accounts.push(apiKey)
 const otherProvider = make('other_provider'); otherProvider.provider = 'other'; accounts.push(otherProvider)
+accounts[0].groups.push({ id: 'g2', name: 'Shared Group', privateField: 'fixture-password' })
+free.groups = []
 const revisions = new Map(accounts.map(a => [a.id, 1]))
 const records = new Map(), handles = new Map(), starts = [], completes = []
 let child, buffer, pending, ready, sequence = 99, errors = '', failComplete = false
@@ -97,6 +99,7 @@ try {
   const beforeProbe = records.get('queue')?.value.jobs.length ?? 0; assert.deepEqual((await request('runtime-check', {})).value, { ready: true }); assert.equal(starts.length, 0); assert.equal(completes.length, 0); assert.equal(records.get('queue')?.value.jobs.length ?? 0, beforeProbe); check('Runtime preflight never queues an account or starts native authorization')
   const listing = await request('accounts'); assert.equal(listing.status, 200); assert.equal(listing.value.accounts.length, 11); assert.ok(listing.value.accounts.some(a => a.id === 'free')); assert.ok(!listing.value.accounts.some(a => ['api_key', 'other_provider'].includes(a.id))); for (const a of listing.value.accounts) { assert.ok(!('notes' in a)); assert.ok(!('refreshToken' in a)); assert.ok(!JSON.stringify(a).includes('fixture-password')) } check('All OpenAI OAuth plans including Free are listed without leaking credentials')
   assert.equal(listing.value.accounts.find(a => a.id === 'bad_notes').notesValid, false); check('Notes must match original account email')
+  assert.deepEqual(listing.value.accounts.find(a => a.id === 'good').groups, [{ id: 'g1', name: 'Team' }, { id: 'g2', name: 'Shared Group' }]); assert.deepEqual(listing.value.accounts.find(a => a.id === 'free').groups, []); check('RS group names and multiple memberships are returned without leaking unrelated fields')
   assert.equal((await submit(['good', 'good'])).status, 400); assert.equal((await submit(['../escape'])).status, 400); assert.equal((await submit([])).status, 400); check('Reject duplicate, malformed and empty selections')
   const requestId = randomUUID(); await submit(['good'], requestId); await submit(['good'], requestId); assert.equal(records.get('queue').value.jobs.length, 1); assert.equal(starts.length, 0); check('Submission is idempotent and GET/submission never starts a login')
   assert.equal((await submit(['good'])).status, 400); check('Concurrent submissions cannot duplicate an account')

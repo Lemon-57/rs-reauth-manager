@@ -19,4 +19,5 @@ verification/*
 !verification/test_vendor_contract.py
 !verification/test_page_resources.py
 !verification/bridge-test.mjs
+!verification/batch-test.mjs
 !verification/conventions.mjs

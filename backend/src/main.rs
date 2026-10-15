@@ -210,7 +210,18 @@ async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
             .as_array()
             .ok_or_else(|| fault("账号列表格式无效"))?;
         for a in items.iter().filter(|a| eligible(a)) {
-            rows.push(json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a)}));
+            let groups = a["groups"]
+                .as_array()
+                .ok_or_else(|| fault("账号分组格式无效"))?
+                .iter()
+                .map(
+                    |group| match (group["id"].as_str(), group["name"].as_str()) {
+                        (Some(id), Some(name)) => Ok(json!({"id":id,"name":name})),
+                        _ => Err(fault("账号分组格式无效")),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.push(json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a),"groups":groups}));
         }
         if items.len() < 100 {
             return Ok(json!({"accounts":rows}));

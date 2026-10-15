@@ -1,6 +1,8 @@
 import type { Account, Job } from './types'
 
 export const isActive = (job?: Job) => !!job && ['queued', 'running'].includes(job.status)
+export const needsReauth = (account: Account) => account.status === 'error'
+export const isUnfinished = (job?: Job) => !!job && ['failed', 'review', 'interrupted'].includes(job.status)
 export function planKey(value: string | null) { return value?.trim().toLowerCase() || 'unknown' }
 export function planLabel(value: string) { return ({ team: 'Team', business: 'Business', plus: 'Plus', pro: 'Pro', free: 'Free', unknown: '未知' } as Record<string, string>)[planKey(value)] || value }
 export function planType(value: string | null): 'success' | 'info' | 'primary' | 'default' {

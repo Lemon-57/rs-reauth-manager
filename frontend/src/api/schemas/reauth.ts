@@ -8,6 +8,7 @@ function account(value: unknown): value is Account {
     && nullableString(value.email) && nullableString(value.planType) && nullableString(value.proxy)
     && nullableString(value.accessTokenExpiresAt) && typeof value.enabled === 'boolean'
     && typeof value.notesValid === 'boolean' && typeof value.status === 'string'
+    && Array.isArray(value.groups) && value.groups.every(group => isRecord(group) && typeof group.id === 'string' && typeof group.name === 'string')
 }
 function job(value: unknown): value is Job {
   return isRecord(value) && typeof value.requestId === 'string' && typeof value.accountId === 'string'

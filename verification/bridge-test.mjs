@@ -16,6 +16,12 @@ try {
   const { api } = await server.ssrLoadModule('/src/api/index.ts')
   const { planKey, planLabel } = await server.ssrLoadModule('/src/format.ts')
   assert.equal(planKey(' Free '), 'free'); assert.equal(planLabel(' Free '), 'Free'); assert.equal(planKey(null), 'unknown'); check('Free membership labels and filter keys normalize case and whitespace')
+  const { parseAccounts } = await server.ssrLoadModule('/src/api/schemas/reauth.ts')
+  const grouped = { id: 'fixture', name: 'fixture', email: null, enabled: true, planType: 'free', status: 'error', accessTokenExpiresAt: null, proxy: null, notesValid: false, groups: [{ id: 'g1', name: 'Primary' }, { id: 'g2', name: 'Shared' }] }
+  assert.deepEqual(parseAccounts({ accounts: [grouped] }).accounts[0].groups, grouped.groups)
+  assert.deepEqual(parseAccounts({ accounts: [{ ...grouped, groups: [] }] }).accounts[0].groups, [])
+  assert.throws(() => parseAccounts({ accounts: [{ ...grouped, groups: [{ id: 'g1' }] }] }))
+  check('Account decoding preserves all group names and rejects malformed memberships')
   handler = () => json({ accounts: [] }, 200, ' Application/JSON ; charset=utf-8')
   assert.deepEqual(await api.accounts(), { accounts: [] }); assert.deepEqual(calls.at(-1), { method: 'GET', path: 'api/accounts' }); check('Public bridge GET has no JSON declaration or body, MIME normalization matches workbench')
   handler = () => json({ jobs: [] })
