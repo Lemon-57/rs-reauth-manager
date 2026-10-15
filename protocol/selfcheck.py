@@ -9,6 +9,7 @@ def check_runtime():
     from vendor.lib.chatgpt_client import ChatGPTClient
     from runner import authorization
     from totp import totp_code
+    from fallback import personal_candidate, verify_free_tokens
 
     assert totp_code('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', at_time=59, digits=8)[0] == '94287082'
     inner = 'https://auth.openai.com/oauth/authorize?' + urlencode({
@@ -24,3 +25,5 @@ def check_runtime():
     assert resolved == inner and state == 'runtime-fixture'
     assert redirect.geturl() == 'http://127.0.0.1:1455/auth/callback'
     assert authorization(inner) == authorization(outer)
+    assert personal_candidate({'workspaces': [{'id': 'personal-fixture', 'is_personal': True}]}, 'old-fixture') == 'personal-fixture'
+    assert callable(verify_free_tokens)

@@ -34,6 +34,6 @@ with tarfile.open(path) as archive:
                 if source.suffix in {".py", ".txt"} or source.name.startswith("LICENSE"):
                     raw = raw.replace(b"\r\n", b"\n")
                 assert runtime.extractfile("protocol/" + source.relative_to(ROOT / "protocol").as_posix()).read() == raw, "Packaged protocol differs from source"
-result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 18, "rustTests": 5, "pythonProtocolTests": 17, "upstreamContractTests": 4, "pageResourceTests": 5, "batchUiTests": 13}
+result = {"pluginId": "personal.reauth-manager", "version": manifest["version"], "bytes": path.stat().st_size, "sha256": digest, "fileDigestsVerified": len(expected), "sdkRevision": "ae5eaa46b447548571e6c46d69bd27d454adb785", "protocolSourceRevision": "db8251817fd1baefc83c14c851135fb6078bc001", "offlineProtocolScenarios": 29, "rustTests": 5, "pythonProtocolTests": 17, "upstreamContractTests": 4, "freeRecoveryTests": 9, "pageResourceTests": 5, "bridgeTests": 12, "batchUiTests": 14}
 (ROOT / "verification/artifact.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result, indent=2))

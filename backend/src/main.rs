@@ -1,6 +1,7 @@
 //! 管理接口、授权队列与宿主生命周期的组合
 
 mod host;
+mod recovery;
 mod worker;
 
 use gateway_plugin_sdk::{
@@ -116,7 +117,7 @@ fn notes_valid(a: &Value) -> bool {
         && !notes.contains(['\r', '\n', '\0'])
 }
 fn settings(a: &Value) -> Value {
-    json!({"id":a["id"],"email":a["email"],"name":a["name"],"enabled":a["enabled"],"notes":a["notes"],"groups":a["groups"],"proxy":a["outboundProxyEndpoint"],"weight":a["weight"],"concurrencyLimit":a["concurrencyLimit"],"modelAccess":a["modelAccess"],"accountId":a["accountId"]})
+    json!({"id":a["id"],"email":a["email"],"name":a["name"],"enabled":a["enabled"],"notes":a["notes"],"groups":a["groups"],"proxy":a["outboundProxyEndpoint"],"weight":a["weight"],"concurrencyLimit":a["concurrencyLimit"],"modelAccess":a["modelAccess"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"]})
 }
 fn require_idle(a: &Value) -> Result<(), PluginFault> {
     if a["capacity"]["usedSlots"].as_u64() != Some(0) {
@@ -236,6 +237,7 @@ fn protocol_error(code: &str) -> &'static str {
         "mfa" => "2FA 验证未通过，请检查原账号备注",
         "human" => "上游要求人工验证，请手动完成授权",
         "workspace" => "无法匹配原账号工作区，已停止写回",
+        "fallback_identity" => "无法确认同一用户的 Free 工作区，已停止写回",
         "authorization" => "RS 授权链接格式无效，尚未发起账号登录",
         "state" => "OAuth state 校验失败，已停止写回",
         "proxy" => "原账号代理连接失败",
@@ -299,6 +301,16 @@ impl Manager {
                         Ok(()) => job.finish("success", "新授权已写回原账号，配置校验通过"),
                         Err(error) => job.finish("review", &error.message),
                     }
+                } else if output["event"] == "free_fallback" {
+                    job.step = "saving".into();
+                    match recovery::commit(host, &job.account_id, &current.snapshot, &output).await
+                    {
+                        Ok(()) => {
+                            job.finish("success", "原工作区已失效，已切回 Free，已停止调度");
+                            job.step = "free".into();
+                        }
+                        Err(error) => job.finish("review", &error.message),
+                    }
                 } else {
                     job.finish(
                         "failed",
@@ -346,7 +358,7 @@ impl Manager {
                 let proxy=proxy(host,&a).await?;
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"]});
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"]});
                 self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
             }.await;
             match result {

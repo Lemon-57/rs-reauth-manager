@@ -21,19 +21,45 @@ accounts[0].groups.push({ id: 'g2', name: 'Shared Group', privateField: 'fixture
 free.groups = []
 const revisions = new Map(accounts.map(a => [a.id, 1]))
 const records = new Map(), handles = new Map(), starts = [], completes = []
+const disables = [], saves = [], credentials = new Map()
+function credential(a) {
+  return { account_id: a.id, provider_id: 'openai', credential_revision: revisions.get(a.id), facts: { name: a.name, authentication_kind: 'oauth', material: { schema_version: 1, installation_id: '3d07c9c6-3b57-4a12-a51d-1e21df254477', transport: 'http', principal: { oauth_subject: 'original-subject', poid: null }, access_token: 'old-access', refresh_token: 'old-secret-rt', id_token: 'old-id', oauth_client_id: 'fixture', oauth_scope: 'openid', cookies: [{ name: 'fixture', value: 'fixture-cookie' }] }, email: a.email, upstream_user_id: a.userId, upstream_account_id: a.accountId, plan_type: a.planType, has_refresh_token: true, access_token_expires_at_ms: null, next_refresh_at_ms: null } }
+}
 let child, buffer, pending, ready, sequence = 99, errors = '', failComplete = false
 function send(meta, payload = Buffer.alloc(0)) { if (!Buffer.isBuffer(payload)) payload = Buffer.from(JSON.stringify(payload)); const json = Buffer.from(JSON.stringify(meta)), head = Buffer.alloc(12); head.writeUInt32BE(json.length); head.writeBigUInt64BE(BigInt(payload.length), 4); child.stdin.write(Buffer.concat([head, json, payload])) }
 const result = (id, value = {}, payload) => send({ type: 'result', id, result: value }, payload)
 async function callback(meta, payload) {
   const data = payload.length ? JSON.parse(payload.toString()) : meta.params
   if (meta.method === 'host.auth.get_runtime') { assert.ok(payload.length); assert.deepEqual(meta.params, {}); return result(meta.id, {}, { account_id: data.account_id, provider_id: 'openai', credential_revision: revisions.get(data.account_id) }) }
+  if (meta.method === 'host.auth.get') {
+    assert.ok(payload.length); assert.deepEqual(meta.params, {}); assert.deepEqual(Object.keys(data), ['account_id'])
+    const a = accounts.find(a => a.id === data.account_id)
+    if (!credentials.has(a.id)) credentials.set(a.id, credential(a))
+    return result(meta.id, {}, credentials.get(a.id))
+  }
+  if (meta.method === 'host.auth.save') {
+    assert.ok(payload.length); assert.deepEqual(meta.params, {}); assert.equal(data.action, 'replace')
+    const a = accounts.find(a => a.id === data.account_id), old = credentials.get(a.id)
+    assert.equal(a.enabled, false); assert.equal(a.capacity.usedSlots, 0); assert.equal(data.credential_revision, revisions.get(a.id))
+    for (const key of ['installation_id', 'transport', 'cookies', 'oauth_client_id', 'oauth_scope']) assert.deepEqual(data.facts.material[key], old.facts.material[key])
+    assert.equal(data.facts.email, old.facts.email); assert.equal(data.facts.upstream_user_id, old.facts.upstream_user_id); assert.equal(data.facts.name, old.facts.name)
+    assert.equal(data.facts.plan_type, 'free'); assert.equal(data.facts.upstream_account_id, 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
+    saves.push(a.id)
+    if (a.id === 'fb_save_failure') return result(meta.id, {}, {})
+    a.accountId = data.facts.upstream_account_id; a.planType = data.facts.plan_type; a.status = 'normal'
+    const revision = revisions.get(a.id) + 1; revisions.set(a.id, revision)
+    credentials.set(a.id, { ...old, credential_revision: revision, facts: structuredClone(data.facts) })
+    if (a.id === 'fb_uncertain') return result(meta.id, {}, {})
+    if (a.id === 'fb_postcheck') a.enabled = true
+    return result(meta.id, {}, { account_id: a.id, credential_revision: revision })
+  }
   if (meta.method === 'host.state.get') return result(meta.id, { record: records.get(data.key) || null })
   if (meta.method === 'host.state.put') {
     const old = records.get(data.key)
     assert.equal(data.expected_version, old?.version ?? null)
     const version = (old?.version || 0) + 1
     const serialized = JSON.stringify(data.value)
-    for (const secret of ['fixture-password', 'fixture:pass', 'secret-code', 'refreshToken', 'authorizationUrl', 'callbackUrl']) assert.ok(!serialized.includes(secret), `Persistent state leaked ${secret}`)
+    for (const secret of ['fixture-password', 'fixture:pass', 'secret-code', 'refreshToken', 'authorizationUrl', 'callbackUrl', 'fallback-private-rt', 'access_token', 'id_token', 'refresh_token', 'fixture-cookie']) assert.ok(!serialized.includes(secret), `Persistent state leaked ${secret}`)
     records.set(data.key, { value: structuredClone(data.value), version, schema_version: 1 })
     return result(meta.id, { version })
   }
@@ -48,6 +74,13 @@ async function callback(meta, payload) {
       dataReply = { documents: [{ provider: 'openai', document: { accounts: [{ id, outboundProxyUrl: 'http://fixture:pass@127.0.0.1:21001', refreshToken: 'old-secret-rt' }] } }] }
     }
     else if (url.pathname === '/api/admin/accounts/oauth/start') { assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountId', 'name', 'provider']); starts.push(structuredClone(data)); dataReply = { flowId: `flow_${data.accountId}`, authorizationUrl: nativeAuthorization }; status = 201 }
+    else if (url.pathname === '/api/admin/accounts/batch-update') {
+      assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountIds', 'enabled']); assert.equal(data.accountIds.length, 1); assert.equal(data.enabled, false)
+      const a = accounts.find(a => a.id === data.accountIds[0]); assert.equal(a.capacity.usedSlots, 0)
+      disables.push(a.id); dataReply = {}
+      if (a.id === 'fb_disable_failure') { status = 502; code = 50201 }
+      else { a.enabled = false; if (a.id === 'fb_disable_race') revisions.set(a.id, revisions.get(a.id) + 1); if (a.id === 'fb_inflight_race') a.capacity.usedSlots = 1 }
+    }
     else if (url.pathname === '/api/admin/accounts/oauth/complete') {
       assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['callbackUrl', 'flowId', 'provider']); completes.push(structuredClone(data)); const a = accounts.find(a => `flow_${a.id}` === data.flowId)
       assert.ok(a); a.status = 'normal'; a.accessTokenExpiresAt = '2026-10-24T00:00:00Z'; dataReply = { accountId: a.id }; status = 201
@@ -113,5 +146,41 @@ try {
   await submit(['slow', 'good']); await tick(); const startsBefore = starts.length; const c = completes.length; await request('cancel', { requestId: null }); await tick(); assert.equal(job('slow').status, 'cancelled'); assert.equal(job('good').status, 'cancelled'); assert.equal(starts.length, startsBefore); assert.equal(completes.length, c); check('Cancel kills current helper and stops all later accounts without writeback')
   failComplete = true; await submit(['uncertain']); assert.equal((await finish('uncertain')).status, 'review'); const committed = completes.length; await tick(); await tick(); assert.equal(completes.length, committed); failComplete = false; check('Uncertain native commit is never automatically replayed')
   await submit(['slow', 'good']); await tick(); await stop(); await start(); await request('jobs'); assert.equal(job('slow').status, 'interrupted'); assert.equal(job('good').status, 'interrupted'); const prior = starts.length; await tick(); assert.equal(starts.length, prior); check('Restart interrupts all queued/running tasks without automatic credential submission')
+  function fallbackAccount(id) { const a = make(id); a.userId = 'original-user'; accounts.push(a); revisions.set(id, 1); return a }
+  for (const id of ['fb_good', 'fb_disabled', 'fb_already_free']) {
+    const a = fallbackAccount(id)
+    if (id === 'fb_disabled') a.enabled = false
+    if (id === 'fb_already_free') a.planType = 'free'
+    const before = structuredClone(a), oldCompletes = completes.length, d = disables.length
+    await submit([id]); const done = await finish(id)
+    assert.equal(done.status, 'success'); assert.equal(done.step, 'free'); assert.match(done.message, /原工作区已失效.*已切回 Free.*已停止调度/)
+    assert.equal(a.enabled, false); assert.equal(a.planType, 'free'); assert.equal(a.accountId, 'personal-workspace'); assert.equal(a.status, 'normal')
+    for (const k of ['id', 'email', 'userId', 'name', 'groups', 'notes', 'outboundProxyEndpoint', 'weight', 'concurrencyLimit', 'modelAccess']) assert.deepEqual(a[k], before[k])
+    assert.equal(completes.length, oldCompletes); assert.equal(disables.length, d + (before.enabled ? 1 : 0)); assert.equal(saves.at(-1), id)
+    check(`${id}: verified Free recovery replaces original ID via SDK CAS, preserves settings, and stops scheduling`)
+  }
+  for (const id of ['fb_user', 'fb_workspace', 'fb_plan', 'fb_email', 'fb_expired', 'fb_proof', 'fb_rt', 'fb_old_workspace', 'fb_missing_user']) {
+    const a = fallbackAccount(id); if (id === 'fb_missing_user') a.userId = null
+    const old = structuredClone(a), d = disables.length, s = saves.length
+    await submit([id]); assert.equal((await finish(id)).status, 'review'); assert.equal(disables.length, d); assert.equal(saves.length, s); assert.deepEqual(a, old)
+  }
+  check('Wrong user/email/workspace/plan, stale token, missing proof/RT/original identity never disable or write')
+  for (const id of ['fb_changed', 'fb_revision', 'fb_active']) {
+    const a = fallbackAccount(id), d = disables.length, s = saves.length
+    await submit([id]); await tick()
+    if (id === 'fb_changed') a.weight = 4
+    if (id === 'fb_revision') revisions.set(id, 2)
+    if (id === 'fb_active') a.capacity.usedSlots = 1
+    assert.equal((await finish(id)).status, 'review'); assert.equal(disables.length, d); assert.equal(saves.length, s)
+  }
+  check('Concurrent settings/credential changes and in-flight work stop before Free recovery mutations')
+  for (const id of ['fb_disable_failure', 'fb_disable_race', 'fb_inflight_race', 'fb_save_failure', 'fb_uncertain', 'fb_postcheck']) {
+    const a = fallbackAccount(id), s = saves.length
+    await submit([id]); assert.equal((await finish(id)).status, 'review')
+    if (!['fb_disable_failure', 'fb_postcheck'].includes(id)) assert.equal(a.enabled, false)
+    if (['fb_disable_failure', 'fb_disable_race', 'fb_inflight_race'].includes(id)) assert.equal(saves.length, s)
+    const count = saves.length, d = disables.length; await tick(); await tick(); assert.equal(saves.length, count); assert.equal(disables.length, d)
+    check(`${id}: partial or uncertain mutation requires review and is never replayed`)
+  }
   await stop(); assert.equal(errors, ''); console.log(`Verified ${passed} protocol scenarios`)
 } catch (error) { child?.kill(); console.error(error); process.exitCode = 1 }

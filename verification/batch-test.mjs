@@ -28,9 +28,11 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
   }
   if (input.path === 'api/tick') {
     for (const entry of jobs.filter(j => j.requestId.startsWith(`${latestBatch}:`) && ['queued', 'running'].includes(j.status))) {
-      entry.status = outcomes[entry.accountId] || 'success'; entry.step = entry.status
+      const freeFallback = outcomes[entry.accountId] === 'free'
+      entry.status = freeFallback ? 'success' : outcomes[entry.accountId] || 'success'; entry.step = freeFallback ? 'free' : entry.status
       entry.message = entry.status === 'failed' ? 'fixture current failure' : ''; entry.finishedAt = 3
       if (entry.status === 'success') accounts.find(a => a.id === entry.accountId).status = 'normal'
+      if (freeFallback) { const a = accounts.find(a => a.id === entry.accountId); a.enabled = false; a.planType = 'free'; entry.message = '原工作区已失效，已切回 Free，已停止调度' }
     }
     return reply({ ok: true })
   }
@@ -102,5 +104,11 @@ try {
   check('A lost submission response is reconciled through read-only jobs lookup, never auto-resubmitted')
   await state.cancel(); assert.equal(state.active.value, 0); assert.equal(state.failed.value, 0)
   check('Cancelling updates live queue state without treating cancellation as a failed authorization')
+  throwAfterSubmit = false; outcomes = { error: 'free' }; state.confirm([accounts[0]]); await state.submit()
+  assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0)
+  const recovered = state.accounts.value.find(a => a.id === 'error')
+  assert.equal(recovered.enabled, false); assert.equal(recovered.planType, 'free'); assert.equal(recovered.status, 'normal')
+  state.showResults('success'); assert.equal(state.resultOf(recovered).step, 'free'); assert.match(state.resultOf(recovered).message, /已停止调度/)
+  check('Free recovery counts in this batch success, refreshes the disabled Free account and preserves the explanatory outcome')
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }

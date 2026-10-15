@@ -216,7 +216,7 @@ impl Runtime {
         let output = Arc::new(Mutex::new(Output::default()));
         let target = Arc::clone(&output);
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout.take(32768));
+            let mut reader = BufReader::new(stdout.take(131072));
             let mut line = String::new();
             loop {
                 line.clear();
@@ -239,7 +239,7 @@ impl Runtime {
                         }
                         .into();
                     }
-                    Some("complete" | "error") => {
+                    Some("complete" | "free_fallback" | "error") => {
                         data.result = Some(value);
                         break;
                     }

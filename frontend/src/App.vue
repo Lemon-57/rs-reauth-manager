@@ -48,7 +48,7 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
     </ZTable>
     <ZPagination v-model:current-page="page" v-model:page-size="pageSize" :total="filtered.length" :page-sizes="[10, 20, 50, 100]" />
     <ZDialog v-model="showConfirm" title="确认重新授权" width="32rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
-      <p>重新登录以下 {{ targets.length }} 个账号，新授权将写回原账号</p><ul class="targets"><li v-for="a in targets" :key="a.id">{{ a.email || a.name }}<span v-if="!a.enabled">已停用</span></li></ul><div class="muted"><p>保留启用状态、分组和账号代理</p><p>密码、2FA 密钥和 RT 不在页面展示</p></div><p v-if="error" class="danger">{{ error }}</p>
+      <p>重新登录以下 {{ targets.length }} 个账号，新授权将写回原账号</p><ul class="targets"><li v-for="a in targets" :key="a.id">{{ a.email || a.name }}<span v-if="!a.enabled">已停用</span></li></ul><div class="muted"><p>保留分组和账号代理，通常保留启用状态</p><p>确认原工作区失效时，切回同一用户的 Free 并停止调度</p><p>密码、2FA 密钥和 RT 不在页面展示</p></div><p v-if="error" class="danger">{{ error }}</p>
       <template #footer><ZButton :disabled="busy" @click="showConfirm = false">取消</ZButton><ZButton type="primary" :loading="busy" @click="submit"><template #icon><KeyRound :size="16" /></template>确认重新授权</ZButton></template>
     </ZDialog>
   </main>

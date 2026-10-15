@@ -87,24 +87,33 @@ def run(data):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
+    from fallback import WorkspaceUnavailable, personal_candidate, recover_free
 
     target = str(data.get("accountId") or "")
 
     class BoundOAuthClient(OAuthClient):
         bound_workspace = False
+        selected_workspace = target
 
         def _extract_workspace_id_from_session(self):
-            if not target:
+            selected = self.selected_workspace
+            if not selected:
                 raise ValueError("workspace")
             session = self._decode_oauth_session_cookie() or {}
             workspaces = session.get("workspaces") or []
-            if session.get("workspace_id") == target or any(isinstance(w, dict) and w.get("id") == target for w in workspaces):
-                return target
+            if session.get("workspace_id") == selected or any(isinstance(w, dict) and w.get("id") == selected for w in workspaces):
+                return selected
+            if selected == target:
+                try:
+                    personal = personal_candidate(session, target)
+                except ValueError:
+                    return ""
+                raise WorkspaceUnavailable(personal)
             return ""
 
         def _extract_workspace_id_from_html(self, html_text):
-            if target and target in str(html_text):
-                return target
+            if self.selected_workspace and self.selected_workspace in str(html_text):
+                return self.selected_workspace
             raise ValueError("workspace")
 
         def _select_workspace_for_callback(self, *args, **kwargs):
@@ -116,7 +125,8 @@ def run(data):
         def workspace_matches(self):
             session = self._decode_oauth_session_cookie() or {}
             ids = [w.get("id") for w in session.get("workspaces", []) if isinstance(w, dict)]
-            return bool(target) and (self.bound_workspace or session.get("workspace_id") == target or ids == [target])
+            selected = self.selected_workspace
+            return bool(selected) and (self.bound_workspace or session.get("workspace_id") == selected or ids == [selected])
 
     class ProgressMfa(TotpMfaClient):
         def get_mfa_code(self, *args, **kwargs):
@@ -131,14 +141,29 @@ def run(data):
     oauth.session = chat.session
     try:
         emit("step", step="login")
-        result = oauth.authorize_external_oauth_url(authorize_url, chat, expected_state=state, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+        def authorize(url, expected):
+            return oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+
+        def fallback(personal):
+            if not data.get("userId"):
+                raise ValueError("fallback_identity")
+            oauth.bound_workspace = False
+            tokens = recover_free(oauth, chat, authorize_url, data, personal, authorize)
+            emit("free_fallback", workspaceId=personal, originalWorkspaceId=target, originalWorkspaceUnavailable=True, tokens=tokens)
+
+        try:
+            result = authorize(authorize_url, state)
+        except WorkspaceUnavailable as unavailable:
+            fallback(unavailable.personal_id)
+            return
         if not isinstance(result, dict) or not result.get("ok"):
             emit("error", code=error_code(result if isinstance(result, dict) else {}))
             return
         if result.get("state") != state or not result.get("code"):
             raise ValueError("state")
         if not oauth.workspace_matches():
-            raise ValueError("workspace")
+            fallback(personal_candidate(oauth._decode_oauth_session_cookie(), target))
+            return
         callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
         emit("complete", callbackUrl=callback)
     finally:
@@ -161,7 +186,7 @@ def main():
             run(data)
     except ValueError as exc:
         code = str(exc)
-        emit("error", code=code if code in {"credentials", "authorization", "state", "workspace", "proxy"} else "credentials")
+        emit("error", code=code if code in {"credentials", "authorization", "state", "workspace", "fallback_identity", "proxy"} else "credentials")
     except Exception:
         emit("error", code="protocol")
 

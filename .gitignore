@@ -17,6 +17,7 @@ verification/*
 !verification/fake-worker.py
 !verification/test_protocol.py
 !verification/test_vendor_contract.py
+!verification/test_fallback.py
 !verification/test_page_resources.py
 !verification/bridge-test.mjs
 !verification/batch-test.mjs

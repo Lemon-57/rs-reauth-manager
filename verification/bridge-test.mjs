@@ -14,7 +14,10 @@ const check = name => { count++; console.log(`PASS ${name}`) }
 try {
   const { request } = await server.ssrLoadModule('/src/api/request.ts')
   const { api } = await server.ssrLoadModule('/src/api/index.ts')
-  const { planKey, planLabel } = await server.ssrLoadModule('/src/format.ts')
+  const { planKey, planLabel, progress, statusText } = await server.ssrLoadModule('/src/format.ts')
+  assert.equal(progress({ step: 'free', status: 'success' }), '登录成功')
+  assert.equal(statusText({ enabled: false, status: 'normal' }), '已停用')
+  check('Verified Free fallback is labelled login success while scheduling remains disabled')
   assert.equal(planKey(' Free '), 'free'); assert.equal(planLabel(' Free '), 'Free'); assert.equal(planKey(null), 'unknown'); check('Free membership labels and filter keys normalize case and whitespace')
   const { parseAccounts } = await server.ssrLoadModule('/src/api/schemas/reauth.ts')
   const grouped = { id: 'fixture', name: 'fixture', email: null, enabled: true, planType: 'free', status: 'error', accessTokenExpiresAt: null, proxy: null, notesValid: false, groups: [{ id: 'g1', name: 'Primary' }, { id: 'g2', name: 'Shared' }] }
