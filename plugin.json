@@ -1,0 +1,16 @@
+{
+  "manifestVersion": 2,
+  "publisher": "personal",
+  "name": "reauth-manager",
+  "displayName": "账号重新授权",
+  "version": "0.1.2",
+  "description": "沿用账号备注及绑定代理重新授权并写回原账号",
+  "license": "MIT",
+  "engines": { "codex-proxy-rs": ">=3.26.2, <3.27.0" },
+  "main": "bin/reauth-manager",
+  "runtime": "trustedProcess",
+  "contributes": { "management": {}, "maintenance": {} },
+  "configurationSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+  "resources": { "web/index.html": "text/html", "web/app.js": "text/javascript", "web/app.css": "text/css", "runtime/runtime.tar.gz": "application/gzip", "legal/NOTICE.md": "text/plain", "legal/Apache-2.0.txt": "text/plain" },
+  "state": [{ "namespace": "reauth-manager", "schemaVersion": 1, "schema": { "type": "object" }, "maximumRecords": 10, "maximumBytes": 1048576, "maximumValueBytes": 262144, "migratesFrom": [] }]
+}
