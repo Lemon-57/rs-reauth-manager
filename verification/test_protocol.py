@@ -154,6 +154,10 @@ class ProtocolTests(unittest.TestCase):
     def test_workspace_choices_can_be_recovered_from_login_page_fields(self):
         self.assertEqual(runner.workspace_ids_from_text('{"workspace_id":"alternate-workspace","workspaceId":"second-workspace"}', "original-workspace"), ["alternate-workspace", "second-workspace"])
 
+    def test_workspace_session_ids_are_recorded_by_active_binding(self):
+        session = {"workspace_id": "other-workspace", "workspaces": [{"id": "second-workspace"}]}
+        self.assertEqual([session["workspace_id"], session["workspaces"][0]["id"]], ["other-workspace", "second-workspace"])
+
     def test_single_matching_workspace(self):
         OAuth.cookie = {"workspaces": [{"id": "original-workspace"}]}
         self.run_login()

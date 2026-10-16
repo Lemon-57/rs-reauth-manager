@@ -123,6 +123,12 @@ def run(data):
                 raise ValueError("workspace")
             session = self._decode_oauth_session_cookie() or {}
             workspaces = session.get("workspaces") or []
+            if isinstance(session.get("workspace_id"), str):
+                self._remember_workspace(session.get("workspace_id"))
+            if isinstance(workspaces, list):
+                for item in workspaces:
+                    if isinstance(item, dict):
+                        self._remember_workspace(item.get("id"))
             if session.get("workspace_id") == selected or any(isinstance(w, dict) and w.get("id") == selected for w in workspaces):
                 return selected
             if selected == target:

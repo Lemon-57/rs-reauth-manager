@@ -3,7 +3,7 @@
   "publisher": "personal",
   "name": "reauth-manager",
   "displayName": "账号重新授权",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "沿用账号备注及绑定代理重新授权并写回原账号",
   "license": "MIT",
   "engines": { "codex-proxy-rs": ">=3.26.2, <3.28.0" },
