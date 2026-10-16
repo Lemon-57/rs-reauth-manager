@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "protocol"))
 import runner
-from fallback import personal_candidate, verify_free_tokens
+from fallback import personal_candidate, verify_free_tokens, workspace_choices
 from test_protocol import EMAIL, SECRET, URL, desktop_url
 from requests.cookies import RequestsCookieJar
 from vendor.lib import chatgpt_client, oauth_client
@@ -33,6 +33,29 @@ def tokens():
 
 
 class FallbackGuards(unittest.TestCase):
+    def test_workspace_choices_are_bounded_ids_only(self):
+        self.assertEqual(workspace_choices({"workspace_id": "other"}, "original-workspace"), [{"id": "other"}])
+        self.assertEqual(workspace_choices({"workspaces": [{"id": "original-workspace"}, {"id": "other", "name": "private-name", "token": "private-material"}]}, "original-workspace"), [{"id": "other"}])
+        for session in [None, {"workspaces": [{"id": "bad\nvalue"}]}, {"workspaces": [{"id": "x"}, {"id": "x"}]}, {"workspaces": [{"id": str(i)} for i in range(31)]}]:
+            self.assertEqual(workspace_choices(session, "original-workspace"), [])
+
+    def test_forced_tokens_allow_other_plan_but_preserve_identity_checks(self):
+        value = tokens()
+        for key in ["id_token", "access_token"]:
+            payload = json.loads(base64.urlsafe_b64decode(value[key].split('.')[1] + '=='))
+            payload[AUTH]["chatgpt_plan_type"] = "plus"
+            value[key] = jwt(payload)
+        self.assertEqual(verify_free_tokens(value, EMAIL, "original-user", "personal-workspace", force=True), value)
+        with self.assertRaisesRegex(ValueError, "fallback_identity"):
+            verify_free_tokens(value, EMAIL, "original-user", "personal-workspace")
+        for email, user, workspace in [("wrong@example.com", "original-user", "personal-workspace"), (EMAIL, "wrong-user", "personal-workspace"), (EMAIL, "original-user", "wrong-workspace")]:
+            with self.assertRaisesRegex(ValueError, "fallback_identity"):
+                verify_free_tokens(value, email, user, workspace, force=True)
+        payload = json.loads(base64.urlsafe_b64decode(value["access_token"].split('.')[1] + '=='))
+        value["access_token"] = jwt(payload | {"sub": "different-subject"})
+        with self.assertRaisesRegex(ValueError, "fallback_identity"):
+            verify_free_tokens(value, EMAIL, "original-user", "personal-workspace", force=True)
+
     def test_explicit_personal_only_and_original_absent(self):
         for key, value in [("is_personal", True), ("type", "personal"), ("account_type", "individual"), ("kind", "personal")]:
             self.assertEqual(personal_candidate({"workspaces": [{"id": "personal-workspace", key: value}]}, "original-workspace"), "personal-workspace")
@@ -72,14 +95,21 @@ class FallbackGuards(unittest.TestCase):
 
 
 class RealVendorFreeRecovery(unittest.TestCase):
-    def execute(self, selection_page=False, bad_state=False, bad_tokens=False, user="original-user"):
+    def execute(self, selection_page=False, bad_state=False, bad_tokens=False, user="original-user", force=False):
         messages, calls = [], []
         exchanged = tokens()
+        if force:
+            for key in ["id_token", "access_token"]:
+                payload = json.loads(base64.urlsafe_b64decode(exchanged[key].split('.')[1] + '=='))
+                payload[AUTH]["chatgpt_plan_type"] = "team"
+                exchanged[key] = jwt(payload)
         if bad_tokens:
             exchanged["refresh_token"] = ""
         data = {"notes": f"{EMAIL}----fixture-password----{SECRET}", "email": EMAIL,
                 "proxy": "http://fixture:pass@127.0.0.1:21001", "authorizationUrl": desktop_url(),
                 "accountId": "original-workspace", "userId": user}
+        if force:
+            data["forceWorkspaceId"] = "personal-workspace"
         testcase = self
 
         class Session:
@@ -135,6 +165,19 @@ class RealVendorFreeRecovery(unittest.TestCase):
     def test_selection_page_recovers_without_vendor_changes(self):
         self.execute(selection_page=True)
         self.assertEqual(self.messages[-1]["event"], "free_fallback")
+
+    def test_explicit_forced_workspace_uses_fresh_pkce_and_verified_nonfree_tokens(self):
+        self.execute(force=True)
+        self.assertEqual(self.messages[-1]["event"], "forced_workspace")
+        self.assertEqual(self.messages[-1]["workspaceId"], "personal-workspace")
+        self.assertIs(self.messages[-1]["administratorConfirmed"], True)
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotIn("fixture-private-rt", json.dumps(self.messages[:-1]))
+
+    def test_forced_wrong_state_never_emits_or_exchanges_tokens(self):
+        with self.assertRaisesRegex(ValueError, "fallback_identity"):
+            self.execute(force=True, bad_state=True)
+        self.assertFalse(any(call[0] == "POST" for call in self.calls))
 
     def test_wrong_new_state_never_exchanges_or_emits_tokens(self):
         with self.assertRaisesRegex(ValueError, "^fallback_identity$"):

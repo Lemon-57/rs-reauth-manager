@@ -7,4 +7,5 @@ export const api = {
   submit: (accountIds: string[], requestId: string) => request('POST', 'api/submit', { accountIds, requestId }).then(parseJobs),
   cancel: (requestId: string | null = null) => request('POST', 'api/cancel', { requestId }).then(parseJobs),
   tick: () => request('POST', 'api/tick', {}).then(parseTick),
+  forceSubmit: (sourceRequestId: string, workspaceId: string, requestId: string) => request('POST', 'api/force-submit', { sourceRequestId, workspaceId, requestId, confirmation: 'replace_workspace_and_disable' }).then(parseJobs),
 }

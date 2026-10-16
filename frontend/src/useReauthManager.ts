@@ -14,6 +14,22 @@ export function useReauthManager() {
   const jobOf = (a: Account) => byAccount.value.get(a.id)
   const resultOf = (a: Account) => ['success', 'failed'].includes(filter.value) ? batchByAccount.value.get(a.id) : jobOf(a)
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
+  const showForce = ref(false), forceTarget = ref<Account>(), forceSource = ref<Job>(), forceWorkspace = ref(''), forceConfirmed = ref(false)
+  const canForce = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && (j.step === 'workspace' || j.message === '无法匹配原账号工作区，已停止写回') }
+  function openForce(a: Account) { forceTarget.value = a; forceSource.value = jobOf(a); forceWorkspace.value = ''; forceConfirmed.value = false; showForce.value = true }
+  async function submitForce() {
+    const source = forceSource.value
+    if (!source || !forceWorkspace.value || !forceConfirmed.value || busy.value) return
+    const requestId = crypto.randomUUID()
+    busy.value = true; error.value = ''
+    try {
+      const result = await api.forceSubmit(source.requestId, forceWorkspace.value, requestId)
+      batchId.value = requestId; batchJobs.value = []; receiveJobs(result.jobs); showForce.value = false
+      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      await api.tick()
+    } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
+    finally { busy.value = false }
+  }
   const active = computed(() => jobs.value.filter(isActive).length)
   const success = computed(() => batchJobs.value.filter(j => j.status === 'success').length)
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
@@ -75,5 +91,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel }
+  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce }
 }

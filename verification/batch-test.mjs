@@ -12,7 +12,7 @@ const account = (id, overrides = {}) => ({ id, name: `${id}@example.com`, email:
 let accounts = [account('error'), account('missing', { notesValid: false, proxy: null }), account('paused', { enabled: false }), account('healthy', { status: 'normal' }), account('expired-access', { status: 'normal', accessTokenExpiresAt: '2020-01-01T00:00:00Z' }), account('quota', { status: 'quota_exhausted' }), account('limited', { status: 'rate_limited' })]
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
-let outcomes = {}, throwAfterSubmit = false, calls = [], latestBatch = null, checks = 0, mounted
+let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, calls = [], latestBatch = null, checks = 0, mounted
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
@@ -24,6 +24,14 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
     latestBatch = body.requestId
     jobs.push(...body.accountIds.map(id => job(id, 'queued', latestBatch)))
     if (throwAfterSubmit) throw new Error('fixture response lost')
+    return reply({ jobs })
+  }
+  if (input.path === 'api/force-submit') {
+    assert.equal(body.confirmation, 'replace_workspace_and_disable')
+    assert.equal(body.workspaceId, 'alternate-workspace')
+    latestBatch = body.requestId
+    jobs.push({ ...job('error', 'queued', latestBatch), forceWorkspaceId: body.workspaceId })
+    if (throwAfterForce) throw new Error('fixture forced response lost')
     return reply({ jobs })
   }
   if (input.path === 'api/tick') {
@@ -110,5 +118,25 @@ try {
   assert.equal(recovered.enabled, false); assert.equal(recovered.planType, 'free'); assert.equal(recovered.status, 'normal')
   state.showResults('success'); assert.equal(state.resultOf(recovered).step, 'free'); assert.match(state.resultOf(recovered).message, /已停止调度/)
   check('Free recovery counts in this batch success, refreshes the disabled Free account and preserves the explanatory outcome')
+  jobs.push({ ...job('error', 'failed', 'workspace-source'), step: 'workspace', message: '无法匹配原账号工作区，已停止写回', workspaceChoices: [{ id: 'alternate-workspace' }] })
+  await state.load(); const target = state.accounts.value.find(a => a.id === 'error')
+  assert.equal(state.canForce(target), true)
+  const count = calls.length; state.openForce(target)
+  assert.equal(calls.length, count); assert.equal(state.forceWorkspace.value, ''); assert.equal(state.forceConfirmed.value, false)
+  await state.submitForce(); assert.equal(calls.length, count)
+  state.forceWorkspace.value = 'alternate-workspace'; await state.submitForce(); assert.equal(calls.length, count)
+  state.showForce.value = false; assert.equal(calls.length, count)
+  check('Opening/cancelling forced writeback never submits; both selection and confirmation are required')
+  state.openForce(target); state.forceWorkspace.value = 'alternate-workspace'; state.forceConfirmed.value = true; outcomes = { error: 'success' }
+  await state.submitForce(); assert.equal(calls.filter(c => c.path === 'api/force-submit').length, 1)
+  assert.equal(state.showForce.value, false)
+  await state.load(); assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0)
+  check('Confirmed forced submission forms a new batch with the exact source job and selected workspace')
+  jobs.push({ ...job('error', 'failed', 'workspace-source-2'), step: 'workspace', workspaceChoices: [{ id: 'alternate-workspace' }] }); await state.load()
+  state.openForce(target); state.forceWorkspace.value = 'alternate-workspace'; state.forceConfirmed.value = true; throwAfterForce = true
+  await state.submitForce(); assert.match(state.error.value, /forced response lost/)
+  assert.equal(calls.filter(c => c.path === 'api/force-submit').length, 2)
+  assert.equal(state.active.value, 1)
+  check('Lost forced submission response is read back without automatically replaying authorization')
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }

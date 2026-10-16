@@ -28,6 +28,14 @@ struct Job {
     message: String,
     started_at: Option<u64>,
     finished_at: Option<u64>,
+    #[serde(default)]
+    workspace_choices: Vec<WorkspaceChoice>,
+    #[serde(default)]
+    force_workspace_id: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkspaceChoice {
+    id: String,
 }
 impl Job {
     fn active(&self) -> bool {
@@ -60,6 +68,41 @@ struct Submit {
 struct Cancel {
     request_id: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForceSubmit {
+    source_request_id: String,
+    workspace_id: String,
+    request_id: String,
+    confirmation: String,
+}
+
+fn workspace_choices(output: &Value) -> Vec<WorkspaceChoice> {
+    let Some(items) = output["workspaces"].as_array() else {
+        return vec![];
+    };
+    if items.len() > 30 {
+        return vec![];
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut choices = vec![];
+    for item in items {
+        let Some(id) = item["id"].as_str() else {
+            return vec![];
+        };
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            || !seen.insert(id)
+        {
+            return vec![];
+        }
+        choices.push(WorkspaceChoice { id: id.into() });
+    }
+    choices
+}
 
 fn registration() -> ManagementRegistration {
     ManagementRegistration {
@@ -70,6 +113,7 @@ fn registration() -> ManagementRegistration {
             ("POST", "api/cancel"),
             ("POST", "api/tick"),
             ("POST", "api/runtime-check"),
+            ("POST", "api/force-submit"),
         ]
         .into_iter()
         .map(|(m, p)| ManagementRoute {
@@ -284,6 +328,11 @@ impl Manager {
             let job = &mut queue.jobs[position];
             if let Some(output) = output {
                 if output["event"] == "complete" {
+                    if job.force_workspace_id.is_some() {
+                        job.finish("review", "强制授权返回类型不匹配，未写回");
+                        host::save(host, &queue, version).await?;
+                        return Ok(());
+                    }
                     job.step = "saving".into();
                     let result=async {
                         let latest=detail(host,&job.account_id).await?;
@@ -301,13 +350,32 @@ impl Manager {
                         Ok(()) => job.finish("success", "新授权已写回原账号，配置校验通过"),
                         Err(error) => job.finish("review", &error.message),
                     }
-                } else if output["event"] == "free_fallback" {
+                } else if output["event"] == "free_fallback"
+                    || output["event"] == "forced_workspace"
+                {
                     job.step = "saving".into();
+                    let forced = output["event"] == "forced_workspace";
+                    if (forced
+                        && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
+                            || job.force_workspace_id.is_none()))
+                        || (!forced && job.force_workspace_id.is_some())
+                    {
+                        job.finish("review", "工作区与管理员确认不一致，未写回");
+                        host::save(host, &queue, version).await?;
+                        return Ok(());
+                    }
                     match recovery::commit(host, &job.account_id, &current.snapshot, &output).await
                     {
                         Ok(()) => {
-                            job.finish("success", "原工作区已失效，已切回 Free，已停止调度");
-                            job.step = "free".into();
+                            if forced {
+                                job.finish(
+                                    "success",
+                                    "管理员已确认，其他工作区授权已写回原账号，已停止调度",
+                                );
+                            } else {
+                                job.finish("success", "原工作区已失效，已切回 Free，已停止调度");
+                                job.step = "free".into();
+                            }
                         }
                         Err(error) => job.finish("review", &error.message),
                     }
@@ -316,6 +384,10 @@ impl Manager {
                         "failed",
                         protocol_error(output["code"].as_str().unwrap_or_default()),
                     );
+                    if output["code"] == "workspace" && job.force_workspace_id.is_none() {
+                        job.step = "workspace".into();
+                        job.workspace_choices = workspace_choices(&output);
+                    }
                 }
             } else if now().saturating_sub(current.started) > 420000 {
                 job.finish("failed", "协议登录超时，未自动重试");
@@ -358,7 +430,7 @@ impl Manager {
                 let proxy=proxy(host,&a).await?;
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"]});
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"forceWorkspaceId":job.force_workspace_id});
                 self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
             }.await;
             match result {
@@ -470,8 +542,72 @@ async fn handle(
                     message: String::new(),
                     started_at: None,
                     finished_at: None,
+                    workspace_choices: vec![],
+                    force_workspace_id: None,
                 });
             }
+        }
+        "api/force-submit" => {
+            let request: ForceSubmit =
+                serde_json::from_slice(&call.payload).map_err(|_| fault("强制授权参数无效"))?;
+            if request.confirmation != "replace_workspace_and_disable"
+                || uuid::Uuid::parse_str(&request.request_id).is_err()
+            {
+                return Err(fault("必须由管理员确认工作区替换并停止调度"));
+            }
+            let source = queue
+                .jobs
+                .iter()
+                .find(|j| j.request_id == request.source_request_id)
+                .cloned()
+                .ok_or_else(|| fault("原失败任务已失效，请重新检测"))?;
+            let key = format!("{}:{}", request.request_id, source.account_id);
+            if queue.jobs.iter().any(|j| j.request_id == key) {
+                return Ok(json!({"jobs":queue.jobs}));
+            }
+            if source.status != "failed"
+                || source.step != "workspace"
+                || !source
+                    .workspace_choices
+                    .iter()
+                    .any(|w| w.id == request.workspace_id)
+                || queue
+                    .jobs
+                    .iter()
+                    .rev()
+                    .find(|j| j.account_id == source.account_id)
+                    .is_none_or(|j| j.request_id != source.request_id)
+                || queue.jobs.iter().filter(|j| j.active()).count() >= 100
+            {
+                return Err(fault("工作区选择或原任务已变化，请重新检测"));
+            }
+            let account = detail(&call.host, &source.account_id).await?;
+            require_idle(&account)?;
+            if account["accountId"] == request.workspace_id
+                || account["userId"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(fault("原账号身份不完整或无需强制替换"));
+            }
+            let mut completed = queue.jobs.iter().filter(|job| !job.active()).count();
+            queue.jobs.retain(|job| {
+                if !job.active() && completed > 100 {
+                    completed -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            queue.jobs.push(Job {
+                request_id: key,
+                account_id: source.account_id,
+                status: "queued".into(),
+                step: "queued".into(),
+                message: "管理员已确认替换工作区并停止调度".into(),
+                started_at: None,
+                finished_at: None,
+                workspace_choices: vec![],
+                force_workspace_id: Some(request.workspace_id),
+            });
         }
         "api/cancel" => {
             let request: Cancel =

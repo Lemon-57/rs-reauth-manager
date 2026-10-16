@@ -43,7 +43,7 @@ async function callback(meta, payload) {
     assert.equal(a.enabled, false); assert.equal(a.capacity.usedSlots, 0); assert.equal(data.credential_revision, revisions.get(a.id))
     for (const key of ['installation_id', 'transport', 'cookies', 'oauth_client_id', 'oauth_scope']) assert.deepEqual(data.facts.material[key], old.facts.material[key])
     assert.equal(data.facts.email, old.facts.email); assert.equal(data.facts.upstream_user_id, old.facts.upstream_user_id); assert.equal(data.facts.name, old.facts.name)
-    assert.equal(data.facts.plan_type, 'free'); assert.equal(data.facts.upstream_account_id, 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
+    assert.equal(data.facts.plan_type, a.id.startsWith('force_') ? 'plus' : 'free'); assert.equal(data.facts.upstream_account_id, a.id.startsWith('force_') ? 'alternate-workspace' : 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
     saves.push(a.id)
     if (a.id === 'fb_save_failure') return result(meta.id, {}, {})
     a.accountId = data.facts.upstream_account_id; a.planType = data.facts.plan_type; a.status = 'normal'
@@ -128,7 +128,7 @@ let passed = 0
 const check = name => { passed++; console.log(`PASS ${name}`) }
 try {
   await start()
-  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 6); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
+  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 7); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
   const beforeProbe = records.get('queue')?.value.jobs.length ?? 0; assert.deepEqual((await request('runtime-check', {})).value, { ready: true }); assert.equal(starts.length, 0); assert.equal(completes.length, 0); assert.equal(records.get('queue')?.value.jobs.length ?? 0, beforeProbe); check('Runtime preflight never queues an account or starts native authorization')
   const listing = await request('accounts'); assert.equal(listing.status, 200); assert.equal(listing.value.accounts.length, 11); assert.ok(listing.value.accounts.some(a => a.id === 'free')); assert.ok(!listing.value.accounts.some(a => ['api_key', 'other_provider'].includes(a.id))); for (const a of listing.value.accounts) { assert.ok(!('notes' in a)); assert.ok(!('refreshToken' in a)); assert.ok(!JSON.stringify(a).includes('fixture-password')) } check('All OpenAI OAuth plans including Free are listed without leaking credentials')
   assert.equal(listing.value.accounts.find(a => a.id === 'bad_notes').notesValid, false); check('Notes must match original account email')
@@ -181,6 +181,30 @@ try {
     if (['fb_disable_failure', 'fb_disable_race', 'fb_inflight_race'].includes(id)) assert.equal(saves.length, s)
     const count = saves.length, d = disables.length; await tick(); await tick(); assert.equal(saves.length, count); assert.equal(disables.length, d)
     check(`${id}: partial or uncertain mutation requires review and is never replayed`)
+  }
+  for (const id of ['force_good', 'force_wrong_user', 'force_wrong_workspace', 'force_changed', 'force_disabled', 'force_no_confirmation']) {
+    const a = fallbackAccount(id); if (id === 'force_disabled') a.enabled = false
+    const original = structuredClone(a), saved = saves.length, disabled = disables.length
+    await submit([id]); assert.equal((await finish(id)).step, 'workspace')
+    assert.equal(saves.length, saved); assert.equal(disables.length, disabled)
+    const source = structuredClone(job(id))
+    assert.deepEqual(source.workspaceChoices, [{ id: 'alternate-workspace' }, { id: 'second-workspace' }])
+    const payload = { sourceRequestId: source.requestId, workspaceId: 'alternate-workspace', requestId: randomUUID(), confirmation: 'replace_workspace_and_disable' }
+    assert.equal((await request('force-submit', { ...payload, confirmation: '' })).status, 400)
+    assert.equal((await request('force-submit', { ...payload, workspaceId: 'unknown-workspace' })).status, 400)
+    assert.equal((await request('force-submit', payload)).status, 200)
+    assert.equal((await request('force-submit', payload)).status, 200)
+    assert.equal((await request('force-submit', { ...payload, requestId: randomUUID() })).status, 400)
+    await tick()
+    if (id === 'force_changed') a.weight = 5
+    const done = await finish(id)
+    if (['force_good', 'force_disabled'].includes(id)) {
+      assert.equal(done.status, 'success'); assert.match(done.message, /管理员已确认.*已停止调度/)
+      assert.equal(a.accountId, 'alternate-workspace'); assert.equal(a.planType, 'plus'); assert.equal(a.enabled, false)
+      for (const key of ['id', 'email', 'userId', 'name', 'groups', 'notes', 'outboundProxyEndpoint', 'weight', 'concurrencyLimit', 'modelAccess']) assert.deepEqual(a[key], original[key])
+      const count = saves.length; await tick(); assert.equal(saves.length, count)
+    } else { assert.equal(done.status, 'review'); assert.equal(saves.length, saved); assert.equal(disables.length, disabled) }
+    check(`${id}: explicit workspace selection and confirmation, identity/CAS guards and scheduling policy`)
   }
   await stop(); assert.equal(errors, ''); console.log(`Verified ${passed} protocol scenarios`)
 } catch (error) { child?.kill(); console.error(error); process.exitCode = 1 }

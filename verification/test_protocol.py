@@ -141,13 +141,15 @@ class ProtocolTests(unittest.TestCase):
 
     def test_other_workspace_stops_before_writeback(self):
         OAuth.cookie = {"workspace_id": "other-workspace", "workspaces": [{"id": "other-workspace"}]}
-        with self.assertRaisesRegex(ValueError, "workspace"):
-            self.run_login()
+        self.run_login()
+        self.assertEqual(self.messages[-1], {"event": "error", "code": "workspace", "workspaces": [{"id": "other-workspace"}]})
 
     def test_ambiguous_workspaces_require_explicit_selection(self):
         OAuth.cookie = {"workspaces": [{"id": "original-workspace"}, {"id": "other-workspace"}]}
-        with self.assertRaisesRegex(ValueError, "workspace"):
-            self.run_login()
+        self.run_login()
+        self.assertEqual(self.messages[-1]["event"], "error")
+        self.assertEqual(self.messages[-1]["code"], "workspace")
+        self.assertFalse(any(m["event"] == "complete" for m in self.messages))
 
     def test_single_matching_workspace(self):
         OAuth.cookie = {"workspaces": [{"id": "original-workspace"}]}

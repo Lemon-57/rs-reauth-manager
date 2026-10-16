@@ -13,7 +13,7 @@ import { displayTime, isActive, planLabel, planType, progress, statusText } from
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
 
-const { accounts, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, pageCandidates } = useReauthManager()
+const { accounts, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce } = useReauthManager()
 const statusOptions = [{ value: 'all', label: '全部状态' }, { value: 'error', label: '账号异常' }, { value: 'ready', label: '可重新授权' }, { value: 'active', label: '处理中' }, { value: 'failed', label: '本次未完成' }, { value: 'success', label: '本次成功' }, { value: 'invalid', label: '备注或代理缺失' }, { value: 'disabled', label: '已停用' }]
 const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }, { key: 'identity', label: '账号', kind: 'identity', width: 300 }, { key: 'groups', label: '分组', kind: 'meta', width: 160 }, { key: 'plan', label: '订阅', width: 85 }, { key: 'status', label: '账号状态', width: 110 }, { key: 'credentials', label: '登录资料', width: 112 }, { key: 'proxy', label: '账号代理', minWidth: 165 }, { key: 'expiry', label: '访问令牌到期', width: 170 }, { key: 'result', label: '重新授权', minWidth: 210 }, { key: 'actions', label: '操作', kind: 'actions', width: 86 }]
 </script>
@@ -44,12 +44,25 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
       <template #proxy="{ row }"><span class="proxy" :title="row.proxy || '未绑定代理'">{{ row.proxy || '未绑定代理' }}</span></template>
       <template #expiry="{ row }"><span class="date">{{ displayTime(row.accessTokenExpiresAt) }}</span></template>
       <template #result="{ row }"><div class="result" :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }"><span><RefreshCw v-if="isActive(resultOf(row))" class="spin" :size="13" /><CircleCheck v-else-if="resultOf(row)?.status === 'success'" :size="14" />{{ progress(resultOf(row)) }}</span><small v-if="resultOf(row)?.message" :title="resultOf(row)?.message">{{ resultOf(row)?.message }}</small><time v-if="resultOf(row)?.finishedAt">{{ displayTime(resultOf(row)?.finishedAt) }}</time></div></template>
-      <template #actions="{ row }"><ZIconButton v-if="isActive(jobOf(row))" title="取消该账号" :aria-label="`取消 ${row.email || row.name}`" :disabled="busy" @click="cancel(jobOf(row))"><Square :size="15" /></ZIconButton><ZIconButton v-else title="重新授权并写回原账号" :aria-label="`重新授权 ${row.email || row.name}`" :disabled="!ready(row) || busy" @click="confirm([row])"><KeyRound :size="17" /></ZIconButton></template>
+      <template #actions="{ row }"><ZButton v-if="canForce(row)" size="small" type="danger" :disabled="busy" @click="openForce(row)">强制写回</ZButton><ZIconButton v-else-if="isActive(jobOf(row))" title="取消该账号" :aria-label="`取消 ${row.email || row.name}`" :disabled="busy" @click="cancel(jobOf(row))"><Square :size="15" /></ZIconButton><ZIconButton v-else title="重新授权并写回原账号" :aria-label="`重新授权 ${row.email || row.name}`" :disabled="!ready(row) || busy" @click="confirm([row])"><KeyRound :size="17" /></ZIconButton></template>
     </ZTable>
     <ZPagination v-model:current-page="page" v-model:page-size="pageSize" :total="filtered.length" :page-sizes="[10, 20, 50, 100]" />
     <ZDialog v-model="showConfirm" title="确认重新授权" width="32rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
       <p>重新登录以下 {{ targets.length }} 个账号，新授权将写回原账号</p><ul class="targets"><li v-for="a in targets" :key="a.id">{{ a.email || a.name }}<span v-if="!a.enabled">已停用</span></li></ul><div class="muted"><p>保留分组和账号代理，通常保留启用状态</p><p>确认原工作区失效时，切回同一用户的 Free 并停止调度</p><p>密码、2FA 密钥和 RT 不在页面展示</p></div><p v-if="error" class="danger">{{ error }}</p>
       <template #footer><ZButton :disabled="busy" @click="showConfirm = false">取消</ZButton><ZButton type="primary" :loading="busy" @click="submit"><template #icon><KeyRound :size="16" /></template>确认重新授权</ZButton></template>
+    </ZDialog>
+    <ZDialog v-model="showForce" title="强制写回其他工作区" width="34rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
+      <p>{{ forceTarget?.email || forceTarget?.name }}</p>
+      <template v-if="forceSource?.workspaceChoices?.length">
+        <p>请选择要写入原账号的其他工作区</p>
+        <ZSelect v-model="forceWorkspace" :options="forceSource.workspaceChoices.map(w => ({ value: w.id, label: w.id }))" aria-label="目标工作区" />
+        <p class="danger">将重新登录并替换原账号的工作区及授权，套餐以新授权为准，写回前会停止该账号调度</p>
+        <p class="muted">仍需验证同一邮箱和用户，保留分组、代理、备注及其他配置，不显示 RT</p>
+        <ZCheckbox v-model="forceConfirmed" class="force-confirm" :disabled="busy" label="我确认使用所选工作区的 RT 替换原授权，并停止该账号调度" />
+      </template>
+      <p v-else class="muted">旧任务未记录可用工作区，请先重新检测，取得工作区列表后再选择并确认强制写回</p>
+      <p v-if="error" class="danger" role="alert">{{ error }}</p>
+      <template #footer><ZButton :disabled="busy" @click="showForce = false">取消</ZButton><ZButton v-if="!forceSource?.workspaceChoices?.length" :disabled="busy || !forceTarget" @click="showForce = false; forceTarget && confirm([forceTarget])">重新检测工作区</ZButton><ZButton v-else type="danger" :loading="busy" :disabled="busy || !forceConfirmed || !forceWorkspace" @click="submitForce">确认替换并停止调度</ZButton></template>
     </ZDialog>
   </main>
 </template>

@@ -1,4 +1,4 @@
-//! 校验同一用户的 Free 恢复凭据，停用调度后以精确版本写回原账号
+//! 校验同一用户的工作区恢复凭据，停用调度后以精确版本写回原账号
 use crate::{
     detail,
     host::{admin, fault, now},
@@ -14,7 +14,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const AUTH: &str = "https://api.openai.com/auth";
-const IDENTITY_ERROR: &str = "Free 授权身份校验失败，未更改账号或提交凭据";
+const IDENTITY_ERROR: &str = "工作区授权身份校验失败，未更改账号或提交凭据";
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
     value[key]
@@ -51,8 +51,9 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
     let workspace = text(output, "workspaceId")?;
     let user = text(original, "userId")?;
     let email = text(original, "email")?;
-    if output["event"] != "free_fallback"
-        || output["originalWorkspaceUnavailable"] != true
+    let forced = output["event"] == "forced_workspace" && output["administratorConfirmed"] == true;
+    if (!forced
+        && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
         || workspace == text(original, "accountId")?
     {
@@ -78,10 +79,15 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
                 != Some(user)
             || !auth["chatgpt_plan_type"]
                 .as_str()
-                .is_some_and(|p| p.eq_ignore_ascii_case("free"))
+                .is_some_and(|p| !p.trim().is_empty() && (forced || p.eq_ignore_ascii_case("free")))
         {
             return Err(fault(IDENTITY_ERROR));
         }
+    }
+    if identity["sub"] != access["sub"]
+        || identity[AUTH]["chatgpt_plan_type"] != access[AUTH]["chatgpt_plan_type"]
+    {
+        return Err(fault(IDENTITY_ERROR));
     }
     Ok((identity, access))
 }
@@ -103,7 +109,9 @@ async fn auth_call<T: DeserializeOwned>(
 fn unchanged(a: &Value, snapshot: &Value, expected: &Value) -> Result<(), PluginFault> {
     require_idle(a)?;
     if settings(a) != *expected || a["_credentialRevision"] != snapshot["credentialRevision"] {
-        return Err(fault("登录期间账号配置或凭据发生变化，已停止 Free 写回"));
+        return Err(fault(
+            "登录期间账号配置或凭据发生变化，已停止工作区授权写回",
+        ));
     }
     Ok(())
 }
@@ -122,7 +130,7 @@ pub async fn commit(
         host,
         "host.auth.get",
         &json!({"account_id": id}),
-        "原账号凭据读取失败，未提交 Free 授权",
+        "原账号凭据读取失败，未提交工作区授权",
     )
     .await?;
     let mut facts = credential.facts;
@@ -159,7 +167,8 @@ pub async fn commit(
         json!({"oauth_subject":identity["sub"],"poid":null}),
     );
     facts.upstream_account_id = output["workspaceId"].as_str().map(str::to_owned);
-    facts.plan_type = Some("free".into());
+    let plan = text(&identity[AUTH], "chatgpt_plan_type")?.to_ascii_lowercase();
+    facts.plan_type = Some(plan.clone());
     facts.has_refresh_token = true;
     facts.access_token_expires_at_ms = access["exp"].as_i64().and_then(|exp| exp.checked_mul(1000));
     facts.next_refresh_at_ms = None;
@@ -173,7 +182,7 @@ pub async fn commit(
             Some(json!({"accountIds":[id],"enabled":false})),
         )
         .await
-        .map_err(|_| fault("停止调度结果待核对，尚未提交 Free 授权，请检查原账号"))?;
+        .map_err(|_| fault("停止调度结果待核对，尚未提交工作区授权，请检查原账号"))?;
     }
     let result = async {
         let mut disabled = original.clone();
@@ -187,46 +196,46 @@ pub async fn commit(
                 credential_revision: credential.credential_revision,
                 facts,
             },
-            "Free 授权提交结果不确定",
+            "工作区授权提交结果不确定",
         )
         .await?;
         if result.account_id != id || result.credential_revision <= credential.credential_revision {
-            return Err(fault("Free 授权写回版本未确认"));
+            return Err(fault("工作区授权写回版本未确认"));
         }
         let after = detail(host, id).await?;
         let mut expected = disabled;
         expected["accountId"] = output["workspaceId"].clone();
-        expected["planType"] = json!("free");
+        expected["planType"] = json!(plan);
         if settings(&after) != expected
             || after["_credentialRevision"] != result.credential_revision
             || after["status"] != "normal"
             || after["hasRefreshToken"] != true
         {
-            return Err(fault("Free 授权写回后的账号状态未确认"));
+            return Err(fault("工作区授权写回后的账号状态未确认"));
         }
         let saved: AuthCredential = auth_call(
             host,
             "host.auth.get",
             &json!({"account_id":id}),
-            "Free 授权凭据读回失败",
+            "工作区授权凭据读回失败",
         )
         .await?;
         if saved.account_id != id
             || saved.provider_id != "openai"
             || saved.credential_revision != result.credential_revision
-            || saved.facts.plan_type.as_deref() != Some("free")
+            || saved.facts.plan_type.as_deref() != Some(plan.as_str())
             || saved.facts.upstream_account_id.as_deref() != output["workspaceId"].as_str()
             || saved.facts.upstream_user_id.as_deref() != original["userId"].as_str()
             || ["access_token", "refresh_token", "id_token"]
                 .iter()
                 .any(|k| saved.facts.material.get(*k) != output["tokens"].get(*k))
         {
-            return Err(fault("Free 授权凭据写回未确认"));
+            return Err(fault("工作区授权凭据写回未确认"));
         }
         Ok(())
     }
     .await;
     result.map_err(|_: PluginFault| {
-        fault("已执行停止调度，但 Free 授权写回未确认，请人工核对；不会自动重试")
+        fault("已执行停止调度，但工作区授权写回未确认，请人工核对；不会自动重试")
     })
 }

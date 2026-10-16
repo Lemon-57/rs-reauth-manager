@@ -87,13 +87,16 @@ def run(data):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
-    from fallback import WorkspaceUnavailable, personal_candidate, recover_free
+    from fallback import WorkspaceUnavailable, personal_candidate, recover_free, workspace_choices
 
     target = str(data.get("accountId") or "")
+    forced = data.get("forceWorkspaceId")
+    if forced is not None and (not isinstance(forced, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", forced) or forced == target):
+        raise ValueError("workspace")
 
     class BoundOAuthClient(OAuthClient):
         bound_workspace = False
-        selected_workspace = target
+        selected_workspace = forced or target
 
         def _extract_workspace_id_from_session(self):
             selected = self.selected_workspace
@@ -152,20 +155,29 @@ def run(data):
             emit("free_fallback", workspaceId=personal, originalWorkspaceId=target, originalWorkspaceUnavailable=True, tokens=tokens)
 
         try:
-            result = authorize(authorize_url, state)
-        except WorkspaceUnavailable as unavailable:
-            fallback(unavailable.personal_id)
-            return
-        if not isinstance(result, dict) or not result.get("ok"):
-            emit("error", code=error_code(result if isinstance(result, dict) else {}))
-            return
-        if result.get("state") != state or not result.get("code"):
-            raise ValueError("state")
-        if not oauth.workspace_matches():
-            fallback(personal_candidate(oauth._decode_oauth_session_cookie(), target))
-            return
-        callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
-        emit("complete", callbackUrl=callback)
+            if forced:
+                tokens = recover_free(oauth, chat, authorize_url, data, forced, authorize, force=True)
+                emit("forced_workspace", workspaceId=forced, originalWorkspaceId=target, administratorConfirmed=True, tokens=tokens)
+                return
+            try:
+                result = authorize(authorize_url, state)
+            except WorkspaceUnavailable as unavailable:
+                fallback(unavailable.personal_id)
+                return
+            if not isinstance(result, dict) or not result.get("ok"):
+                emit("error", code=error_code(result if isinstance(result, dict) else {}))
+                return
+            if result.get("state") != state or not result.get("code"):
+                raise ValueError("state")
+            if not oauth.workspace_matches():
+                fallback(personal_candidate(oauth._decode_oauth_session_cookie(), target))
+                return
+            callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
+            emit("complete", callbackUrl=callback)
+        except ValueError as exc:
+            if str(exc) != "workspace":
+                raise
+            emit("error", code="workspace", workspaces=workspace_choices(oauth._decode_oauth_session_cookie(), target))
     finally:
         chat.session.close()
 

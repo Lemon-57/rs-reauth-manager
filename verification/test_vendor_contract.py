@@ -63,8 +63,8 @@ class VendorContractTests(unittest.TestCase):
         self.assertEqual(self.messages[-1]["event"], "error")
 
     def test_real_upstream_cookie_cannot_select_different_workspace(self):
-        with self.assertRaisesRegex(ValueError, "^workspace$"):
-            self.execute(desktop_url(), workspace="other-workspace")
+        self.execute(desktop_url(), workspace="other-workspace")
+        self.assertEqual(self.messages[-1], {"event": "error", "code": "workspace", "workspaces": [{"id": "other-workspace"}]})
         self.assertFalse(any(message["event"] == "complete" for message in self.messages))
 
 
