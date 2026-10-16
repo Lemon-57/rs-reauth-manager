@@ -16,7 +16,7 @@ export function useReauthManager() {
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
   const showForce = ref(false), forceTarget = ref<Account>(), forceSource = ref<Job>(), forceWorkspace = ref(''), forceConfirmed = ref(false)
   const showFreeFallback = ref(false), freeTarget = ref<Account>(), freeSource = ref<Job>(), freeConfirmed = ref(false)
-  const canForce = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && (j.step === 'workspace' || j.message === '无法匹配原账号工作区，已停止写回') }
+  const canForce = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && !!j.workspaceChoices?.length && (j.step === 'workspace' || j.message === '无法匹配原账号工作区，已停止写回') }
   function openForce(a: Account) { forceTarget.value = a; forceSource.value = jobOf(a); forceWorkspace.value = ''; forceConfirmed.value = false; showForce.value = true }
   const canFreeFallback = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && j.step === 'workspace' && !j.workspaceChoices?.length }
   function openFreeFallback(a: Account) { freeTarget.value = a; freeSource.value = jobOf(a); freeConfirmed.value = false; showFreeFallback.value = true }
