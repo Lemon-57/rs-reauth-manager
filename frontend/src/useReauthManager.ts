@@ -15,8 +15,24 @@ export function useReauthManager() {
   const resultOf = (a: Account) => ['success', 'failed'].includes(filter.value) ? batchByAccount.value.get(a.id) : jobOf(a)
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
   const showForce = ref(false), forceTarget = ref<Account>(), forceSource = ref<Job>(), forceWorkspace = ref(''), forceConfirmed = ref(false)
+  const showFreeFallback = ref(false), freeTarget = ref<Account>(), freeSource = ref<Job>(), freeConfirmed = ref(false)
   const canForce = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && (j.step === 'workspace' || j.message === '无法匹配原账号工作区，已停止写回') }
   function openForce(a: Account) { forceTarget.value = a; forceSource.value = jobOf(a); forceWorkspace.value = ''; forceConfirmed.value = false; showForce.value = true }
+  const canFreeFallback = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && j.step === 'workspace' && !j.workspaceChoices?.length }
+  function openFreeFallback(a: Account) { freeTarget.value = a; freeSource.value = jobOf(a); freeConfirmed.value = false; showFreeFallback.value = true }
+  async function submitFreeFallback() {
+    const source = freeSource.value
+    if (!source || !freeConfirmed.value || busy.value) return
+    const requestId = crypto.randomUUID()
+    busy.value = true; error.value = ''
+    try {
+      const result = await api.freeFallback(source.requestId, requestId)
+      batchId.value = requestId; batchJobs.value = []; receiveJobs(result.jobs); showFreeFallback.value = false
+      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      await api.tick()
+    } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
+    finally { busy.value = false }
+  }
   async function submitForce() {
     const source = forceSource.value
     if (!source || !forceWorkspace.value || !forceConfirmed.value || busy.value) return
@@ -91,5 +107,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce }
+  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, showFreeFallback, freeTarget, freeSource, freeConfirmed, canFreeFallback, openFreeFallback, submitFreeFallback }
 }

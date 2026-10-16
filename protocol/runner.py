@@ -95,10 +95,11 @@ def run(data):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
-    from fallback import WorkspaceUnavailable, personal_candidate, recover_free, workspace_choices
+    from fallback import WorkspaceUnavailable, personal_candidate, recover_free, recover_unbound_free, workspace_choices
 
     target = str(data.get("accountId") or "")
     forced = data.get("forceWorkspaceId")
+    forced_free = data.get("forceFree") is True
     if forced is not None and (not isinstance(forced, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", forced) or forced == target):
         raise ValueError("workspace")
 
@@ -106,6 +107,7 @@ def run(data):
         bound_workspace = False
         selected_workspace = forced or target
         workspace_candidates = []
+        unbound_workspace = False
 
         def _remember_workspace(self, value):
             value = str(value or '').strip()
@@ -120,6 +122,8 @@ def run(data):
         def _extract_workspace_id_from_session(self):
             selected = self.selected_workspace
             if not selected:
+                if self.unbound_workspace:
+                    return ""
                 raise ValueError("workspace")
             session = self._decode_oauth_session_cookie() or {}
             workspaces = session.get("workspaces") or []
@@ -145,6 +149,8 @@ def run(data):
                 self._remember_workspace(value)
             if self.selected_workspace and self.selected_workspace in text:
                 return self._remember_workspace(self.selected_workspace)
+            if self.unbound_workspace:
+                return ""
             raise ValueError("workspace")
 
         def _select_workspace_for_callback(self, *args, **kwargs):
@@ -183,6 +189,10 @@ def run(data):
             emit("free_fallback", workspaceId=personal, originalWorkspaceId=target, originalWorkspaceUnavailable=True, tokens=tokens)
 
         try:
+            if forced_free:
+                tokens, workspace = recover_unbound_free(oauth, chat, authorize_url, data, authorize)
+                emit("forced_free", workspaceId=workspace, originalWorkspaceId=target, administratorConfirmed=True, tokens=tokens)
+                return
             if forced:
                 tokens = recover_free(oauth, chat, authorize_url, data, forced, authorize, force=True)
                 emit("forced_workspace", workspaceId=forced, originalWorkspaceId=target, administratorConfirmed=True, tokens=tokens)

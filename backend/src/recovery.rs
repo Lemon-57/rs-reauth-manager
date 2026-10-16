@@ -52,7 +52,9 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
     let user = text(original, "userId")?;
     let email = text(original, "email")?;
     let forced = output["event"] == "forced_workspace" && output["administratorConfirmed"] == true;
+    let forced_free = output["event"] == "forced_free" && output["administratorConfirmed"] == true;
     if (!forced
+        && !forced_free
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
         || workspace == text(original, "accountId")?

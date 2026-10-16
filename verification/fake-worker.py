@@ -21,7 +21,9 @@ elif data["email"].startswith("failed"):
     print(json.dumps({"event": "error", "code": "password"}), flush=True)
 elif data["email"].startswith("force_") and not data.get("forceWorkspaceId"):
     print(json.dumps({"event": "error", "code": "workspace", "workspaces": [{"id": "alternate-workspace"}, {"id": "second-workspace"}]}), flush=True)
-elif data["email"].startswith(("fb_", "force_")):
+elif data["email"].startswith("free_fallback_no_candidates") and not data.get("forceFree"):
+    print(json.dumps({"event": "error", "code": "workspace", "workspaces": []}), flush=True)
+elif data["email"].startswith(("fb_", "force_", "free_fallback_no_candidates")):
     name = data["email"].split('@')[0]
     auth = {"chatgpt_account_id": "personal-workspace", "chatgpt_user_id": data.get("userId"), "chatgpt_plan_type": "free"}
     forced = bool(data.get("forceWorkspaceId"))
@@ -49,6 +51,8 @@ elif data["email"].startswith(("fb_", "force_")):
         output.update(event="forced_workspace", workspaceId=data["forceWorkspaceId"], administratorConfirmed=True)
         if name == "force_no_confirmation":
             output["administratorConfirmed"] = False
+    if data.get("forceFree"):
+        output.update(event="forced_free", workspaceId="personal-workspace", administratorConfirmed=True, originalWorkspaceUnavailable=True)
     if name == "fb_rt":
         output["tokens"]["refresh_token"] = ""
     if name == "fb_old_workspace":

@@ -123,12 +123,12 @@ const submit = (ids, requestId = randomUUID()) => request('submit', { accountIds
 const tick = () => request('tick', {})
 const job = id => records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function finish(id) { for (let i = 0; i < 60; i++) { await tick(); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish') }
+async function finish(id) { for (let i = 0; i < 60; i++) { await tick(); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish: ' + JSON.stringify(job(id))) }
 let passed = 0
 const check = name => { passed++; console.log(`PASS ${name}`) }
 try {
   await start()
-  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 7); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
+  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 8); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
   const beforeProbe = records.get('queue')?.value.jobs.length ?? 0; assert.deepEqual((await request('runtime-check', {})).value, { ready: true }); assert.equal(starts.length, 0); assert.equal(completes.length, 0); assert.equal(records.get('queue')?.value.jobs.length ?? 0, beforeProbe); check('Runtime preflight never queues an account or starts native authorization')
   const listing = await request('accounts'); assert.equal(listing.status, 200); assert.equal(listing.value.accounts.length, 11); assert.ok(listing.value.accounts.some(a => a.id === 'free')); assert.ok(!listing.value.accounts.some(a => ['api_key', 'other_provider'].includes(a.id))); for (const a of listing.value.accounts) { assert.ok(!('notes' in a)); assert.ok(!('refreshToken' in a)); assert.ok(!JSON.stringify(a).includes('fixture-password')) } check('All OpenAI OAuth plans including Free are listed without leaking credentials')
   assert.equal(listing.value.accounts.find(a => a.id === 'bad_notes').notesValid, false); check('Notes must match original account email')
@@ -205,6 +205,17 @@ try {
       const count = saves.length; await tick(); assert.equal(saves.length, count)
     } else { assert.equal(done.status, 'review'); assert.equal(saves.length, saved); assert.equal(disables.length, disabled) }
     check(`${id}: explicit workspace selection and confirmation, identity/CAS guards and scheduling policy`)
+  }
+  {
+    const id = 'free_fallback_no_candidates'; const a = fallbackAccount(id); const saved = saves.length; const disabled = disables.length
+    await submit([id]); assert.equal((await finish(id)).status, 'failed'); assert.equal(job(id).step, 'workspace'); assert.deepEqual(job(id).workspaceChoices, [])
+    const sourceRequestId = job(id).requestId
+    assert.equal((await request('free-fallback', { sourceRequestId, requestId: randomUUID(), confirmation: '' })).status, 400)
+    const fallbackRequestId = randomUUID(); const freeResult = await request('free-fallback', { sourceRequestId, requestId: fallbackRequestId, confirmation: 'fallback_free_and_disable' }); if (freeResult.status !== 200) console.log(JSON.stringify(freeResult)); assert.equal(freeResult.status, 200)
+    assert.equal((await request('free-fallback', { sourceRequestId, requestId: fallbackRequestId, confirmation: 'fallback_free_and_disable' })).status, 200)
+    await tick(); const done = await finish(id); assert.equal(done.status, 'success'); assert.equal(done.step, 'free'); assert.match(done.message, /退回同一用户的 Free/)
+    assert.equal(a.planType, 'free'); assert.equal(a.enabled, false); assert.equal(saves.at(-1), id); assert.equal(disables.length, disabled + 1); assert.ok(saves.length > saved)
+    check('No-candidate failure requires explicit Free fallback confirmation and writes the verified Free token')
   }
   await stop(); assert.equal(errors, ''); console.log(`Verified ${passed} protocol scenarios`)
 } catch (error) { child?.kill(); console.error(error); process.exitCode = 1 }

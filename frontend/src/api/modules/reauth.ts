@@ -8,4 +8,5 @@ export const api = {
   cancel: (requestId: string | null = null) => request('POST', 'api/cancel', { requestId }).then(parseJobs),
   tick: () => request('POST', 'api/tick', {}).then(parseTick),
   forceSubmit: (sourceRequestId: string, workspaceId: string, requestId: string) => request('POST', 'api/force-submit', { sourceRequestId, workspaceId, requestId, confirmation: 'replace_workspace_and_disable' }).then(parseJobs),
+  freeFallback: (sourceRequestId: string, requestId: string) => request('POST', 'api/free-fallback', { sourceRequestId, requestId, confirmation: 'fallback_free_and_disable' }).then(parseJobs),
 }

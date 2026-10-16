@@ -47,6 +47,11 @@ def claims(token):
 
 
 def verify_free_tokens(tokens, email, user_id, workspace, *, force=False):
+    verified, _, _ = verify_tokens(tokens, email, user_id, workspace, force=force)
+    return verified
+
+
+def verify_tokens(tokens, email, user_id, workspace=None, *, force=False):
     if not isinstance(tokens, dict) or any(not isinstance(tokens.get(key), str) or not tokens[key] or len(tokens[key]) > 32768 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in tokens[key]) for key in ["access_token", "refresh_token", "id_token"]):
         raise ValueError("fallback_identity")
     identity = claims(tokens.get("id_token"))
@@ -62,7 +67,7 @@ def verify_free_tokens(tokens, email, user_id, workspace, *, force=False):
             raise ValueError("fallback_identity")
     plans = []
     for auth in [identity_auth, access_auth]:
-        if not isinstance(auth, dict) or auth.get("chatgpt_account_id") != workspace or (auth.get("chatgpt_user_id") or auth.get("user_id")) != user_id:
+        if not isinstance(auth, dict) or (workspace is not None and auth.get("chatgpt_account_id") != workspace) or (auth.get("chatgpt_user_id") or auth.get("user_id")) != user_id:
             raise ValueError("fallback_identity")
         plan = auth.get("chatgpt_plan_type")
         if not isinstance(plan, str) or not plan.strip() or (not force and plan.lower() != "free"):
@@ -70,7 +75,10 @@ def verify_free_tokens(tokens, email, user_id, workspace, *, force=False):
         plans.append(plan.strip().lower())
     if len(set(plans)) != 1 or identity.get("sub") != access.get("sub"):
         raise ValueError("fallback_identity")
-    return {key: tokens[key] for key in ["access_token", "refresh_token", "id_token"]}
+    workspace_ids = {auth.get("chatgpt_account_id") for auth in [identity_auth, access_auth]}
+    if len(workspace_ids) != 1 or None in workspace_ids:
+        raise ValueError("fallback_identity")
+    return ({key: tokens[key] for key in ["access_token", "refresh_token", "id_token"]}, workspace_ids.pop(), plans[0])
 
 
 def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, force=False):
@@ -90,6 +98,28 @@ def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, fo
         raise ValueError("fallback_identity")
     tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
     return verify_free_tokens(tokens, data["email"], data.get("userId"), personal_id, force=force)
+
+
+def recover_unbound_free(oauth, chat, authorize_url, data, authorize):
+    from vendor.lib.utils import generate_pkce
+
+    verifier, challenge = generate_pkce()
+    state = secrets.token_urlsafe(32)
+    parsed = urlsplit(authorize_url)
+    params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+    params.update(state=state, code_challenge=challenge, code_challenge_method="S256")
+    oauth.oauth_client_id = params["client_id"]
+    oauth.oauth_redirect_uri = params["redirect_uri"]
+    oauth.unbound_workspace = True
+    oauth.selected_workspace = ""
+    result = authorize(urlunsplit(parsed._replace(query=urlencode(params))), state)
+    if not isinstance(result, dict) or result.get("ok") is not True or result.get("state") != state or not isinstance(result.get("code"), str) or not result["code"]:
+        raise ValueError("fallback_identity")
+    tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
+    verified, workspace, plan = verify_tokens(tokens, data["email"], data.get("userId"), None, force=False)
+    if workspace == data.get("accountId") or plan != "free":
+        raise ValueError("fallback_identity")
+    return verified, workspace
 
 
 def workspace_choices(session, original):

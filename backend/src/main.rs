@@ -32,6 +32,8 @@ struct Job {
     workspace_choices: Vec<WorkspaceChoice>,
     #[serde(default)]
     force_workspace_id: Option<String>,
+    #[serde(default)]
+    free_fallback: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkspaceChoice {
@@ -76,6 +78,13 @@ struct ForceSubmit {
     request_id: String,
     confirmation: String,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FreeFallbackSubmit {
+    source_request_id: String,
+    request_id: String,
+    confirmation: String,
+}
 
 fn workspace_choices(output: &Value) -> Vec<WorkspaceChoice> {
     let Some(items) = output["workspaces"].as_array() else {
@@ -114,6 +123,7 @@ fn registration() -> ManagementRegistration {
             ("POST", "api/tick"),
             ("POST", "api/runtime-check"),
             ("POST", "api/force-submit"),
+            ("POST", "api/free-fallback"),
         ]
         .into_iter()
         .map(|(m, p)| ManagementRoute {
@@ -352,13 +362,16 @@ impl Manager {
                     }
                 } else if output["event"] == "free_fallback"
                     || output["event"] == "forced_workspace"
+                    || output["event"] == "forced_free"
                 {
                     job.step = "saving".into();
                     let forced = output["event"] == "forced_workspace";
+                    let forced_free = output["event"] == "forced_free";
                     if (forced
                         && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
                             || job.force_workspace_id.is_none()))
                         || (!forced && job.force_workspace_id.is_some())
+                        || (forced_free && !job.free_fallback)
                     {
                         job.finish("review", "工作区与管理员确认不一致，未写回");
                         host::save(host, &queue, version).await?;
@@ -372,6 +385,12 @@ impl Manager {
                                     "success",
                                     "管理员已确认，其他工作区授权已写回原账号，已停止调度",
                                 );
+                            } else if forced_free {
+                                job.finish(
+                                    "success",
+                                    "管理员已确认，已退回同一用户的 Free 并停止调度",
+                                );
+                                job.step = "free".into();
                             } else {
                                 job.finish("success", "原工作区已失效，已切回 Free，已停止调度");
                                 job.step = "free".into();
@@ -430,7 +449,7 @@ impl Manager {
                 let proxy=proxy(host,&a).await?;
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"forceWorkspaceId":job.force_workspace_id});
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback});
                 self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
             }.await;
             match result {
@@ -544,6 +563,7 @@ async fn handle(
                     finished_at: None,
                     workspace_choices: vec![],
                     force_workspace_id: None,
+                    free_fallback: false,
                 });
             }
         }
@@ -607,6 +627,56 @@ async fn handle(
                 finished_at: None,
                 workspace_choices: vec![],
                 force_workspace_id: Some(request.workspace_id),
+                free_fallback: false,
+            });
+        }
+        "api/free-fallback" => {
+            let request: FreeFallbackSubmit =
+                serde_json::from_slice(&call.payload).map_err(|_| fault("退回 Free 参数无效"))?;
+            if request.confirmation != "fallback_free_and_disable"
+                || uuid::Uuid::parse_str(&request.request_id).is_err()
+            {
+                return Err(fault("必须由管理员确认退回 Free 并停止调度"));
+            }
+            let source = queue
+                .jobs
+                .iter()
+                .find(|j| j.request_id == request.source_request_id)
+                .cloned()
+                .ok_or_else(|| fault("原失败任务已失效，请重新检测"))?;
+            let key = format!("{}:{}", request.request_id, source.account_id);
+            if queue.jobs.iter().any(|j| j.request_id == key) {
+                return Ok(json!({"jobs":queue.jobs}));
+            }
+            if source.status != "failed"
+                || source.step != "workspace"
+                || !source.workspace_choices.is_empty()
+                || queue
+                    .jobs
+                    .iter()
+                    .rev()
+                    .find(|j| j.account_id == source.account_id)
+                    .is_none_or(|j| j.request_id != source.request_id)
+                || queue.jobs.iter().filter(|j| j.active()).count() >= 100
+            {
+                return Err(fault("只能对没有候选工作区的最新失败任务执行退回 Free"));
+            }
+            let account = detail(&call.host, &source.account_id).await?;
+            require_idle(&account)?;
+            if account["userId"].as_str().is_none_or(str::is_empty) {
+                return Err(fault("原账号身份不完整，不能退回 Free"));
+            }
+            queue.jobs.push(Job {
+                request_id: key,
+                account_id: source.account_id,
+                status: "queued".into(),
+                step: "queued".into(),
+                message: "管理员已确认退回同一用户 Free 并停止调度".into(),
+                started_at: None,
+                finished_at: None,
+                workspace_choices: vec![],
+                force_workspace_id: None,
+                free_fallback: true,
             });
         }
         "api/cancel" => {

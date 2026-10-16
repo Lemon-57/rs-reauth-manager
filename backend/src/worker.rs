@@ -239,7 +239,7 @@ impl Runtime {
                         }
                         .into();
                     }
-                    Some("complete" | "free_fallback" | "forced_workspace" | "error") => {
+                    Some("complete" | "free_fallback" | "forced_workspace" | "forced_free" | "error") => {
                         data.result = Some(value);
                         break;
                     }
