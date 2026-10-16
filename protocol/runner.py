@@ -77,6 +77,14 @@ def error_code(result):
     return "protocol"
 
 
+def workspace_ids_from_text(text, original):
+    values = []
+    for value in re.findall(r'(?i)(?:workspace_id|workspaceId)[^A-Za-z0-9_-]{0,8}([A-Za-z0-9_-]{8,128})', str(text)):
+        if value != original and value not in values:
+            values.append(value)
+    return values
+
+
 def run(data):
     email, password, secret = parse_notes(data["notes"], data["email"])
     authorize_url, state, redirect = authorization(data["authorizationUrl"])
@@ -97,6 +105,17 @@ def run(data):
     class BoundOAuthClient(OAuthClient):
         bound_workspace = False
         selected_workspace = forced or target
+        workspace_candidates = []
+
+        def _remember_workspace(self, value):
+            value = str(value or '').strip()
+            if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value) and value != target and value not in self.workspace_candidates:
+                self.workspace_candidates.append(value)
+            return value
+
+        def _extract_workspace_id_from_session(self):
+            value = super()._extract_workspace_id_from_session()
+            return self._remember_workspace(value)
 
         def _extract_workspace_id_from_session(self):
             selected = self.selected_workspace
@@ -115,8 +134,11 @@ def run(data):
             return ""
 
         def _extract_workspace_id_from_html(self, html_text):
-            if self.selected_workspace and self.selected_workspace in str(html_text):
-                return self.selected_workspace
+            text = str(html_text)
+            for value in workspace_ids_from_text(text, target):
+                self._remember_workspace(value)
+            if self.selected_workspace and self.selected_workspace in text:
+                return self._remember_workspace(self.selected_workspace)
             raise ValueError("workspace")
 
         def _select_workspace_for_callback(self, *args, **kwargs):
@@ -177,7 +199,13 @@ def run(data):
         except ValueError as exc:
             if str(exc) != "workspace":
                 raise
-            emit("error", code="workspace", workspaces=workspace_choices(oauth._decode_oauth_session_cookie(), target))
+            choices = workspace_choices(oauth._decode_oauth_session_cookie(), target)
+            known = {item["id"] for item in choices}
+            for value in getattr(oauth, "workspace_candidates", []):
+                if value not in known and len(choices) < 30:
+                    choices.append({"id": value})
+                    known.add(value)
+            emit("error", code="workspace", workspaces=choices)
     finally:
         chat.session.close()
 
