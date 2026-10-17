@@ -16,6 +16,7 @@ verification/*
 !verification/protocol-test.mjs
 !verification/fake-worker.py
 !verification/test_protocol.py
+!verification/test_diagnostics.py
 !verification/test_vendor_contract.py
 !verification/test_fallback.py
 !verification/test_page_resources.py

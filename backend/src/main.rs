@@ -1,5 +1,6 @@
 //! 管理接口、授权队列与宿主生命周期的组合
 
+mod diagnostics;
 mod host;
 mod recovery;
 mod worker;
@@ -288,7 +289,7 @@ fn protocol_error(code: &str) -> &'static str {
     match code {
         "credentials" => "备注格式、邮箱或 2FA 密钥无效",
         "password" => "邮箱或密码错误，请检查原账号备注",
-        "mfa" => "2FA 验证未通过，请检查原账号备注",
+        "mfa" => "2FA 流程未完成，协议未提供具体原因，不能仅凭此提示判断密钥错误",
         "human" => "上游要求人工验证，请手动完成授权",
         "workspace" => "无法匹配原账号工作区，已停止写回",
         "fallback_identity" => "无法确认同一用户的 Free 工作区，已停止写回",
@@ -296,7 +297,7 @@ fn protocol_error(code: &str) -> &'static str {
         "state" => "OAuth state 校验失败，已停止写回",
         "proxy" => "原账号代理连接失败",
         "limited" => "上游登录限流，请稍后手动重试",
-        _ => "协议登录未完成，请检查账号或代理后重试",
+        _ => "协议登录未完成，协议未提供具体失败阶段，未自动重试",
     }
 }
 impl Manager {
@@ -401,7 +402,10 @@ impl Manager {
                 } else {
                     job.finish(
                         "failed",
-                        protocol_error(output["code"].as_str().unwrap_or_default()),
+                        &diagnostics::message(
+                            &output,
+                            protocol_error(output["code"].as_str().unwrap_or_default()),
+                        ),
                     );
                     if output["code"] == "workspace" && job.force_workspace_id.is_none() {
                         job.step = "workspace".into();

@@ -35,6 +35,38 @@ class OfflineSession:
 
 
 class VendorContractTests(unittest.TestCase):
+    def mfa_failure(self, issue_status, verify_status=200):
+        messages = []
+        data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': URL, 'accountId': 'original-workspace'}
+        class Session:
+            def __init__(self):
+                self.cookies = RequestsCookieJar()
+                self.headers = {}
+            def close(self):
+                pass
+            def request(self, method, url, **kwargs):
+                if method == 'GET' and url == URL:
+                    return types.SimpleNamespace(status_code=302, url=url, headers={'Location':'https://auth.openai.com/mfa-challenge/fixture-factor'}, text='')
+                assert method == 'POST'
+                assert url in {'https://auth.openai.com/api/accounts/mfa/issue_challenge', 'https://auth.openai.com/api/accounts/mfa/verify'}
+                status = issue_status if url.endswith('issue_challenge') else verify_status
+                body = {} if status == 200 else {'error': {'code': 'unknown-upstream-code', 'message': 'private-body fixture-password'}}
+                return types.SimpleNamespace(status_code=status, url=url, headers={}, text=json.dumps(body), json=lambda:body)
+        with patch.object(chatgpt_client, 'create_http_session', side_effect=lambda **kwargs: Session()), patch.object(oauth_client, 'create_http_session', side_effect=lambda **kwargs: Session()), patch.object(oauth_client.OAuthClient, '_resolve_totp_factor', return_value={'id':'fixture-factor', 'factor_type':'totp'}), patch.object(oauth_client.OAuthClient, '_visit_oauth_page'), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **fields:messages.append({'event':event, **fields})):
+            runner.run(data)
+        return messages
+
+    def test_real_mfa_issue_failure_retains_stage_and_status_without_raw_body(self):
+        messages = self.mfa_failure(403)
+        self.assertEqual(messages[-1]['diagnostic'], {'stage':'mfa_issue', 'reason':'mfa_issue_failed', 'httpStatus':403})
+        self.assertNotIn('fixture-password', json.dumps(messages))
+        self.assertNotIn('private-body', json.dumps(messages))
+
+    def test_real_mfa_verify_rate_limit_is_not_wrong_secret(self):
+        messages = self.mfa_failure(200, 429)
+        self.assertEqual(messages[-1]['code'], 'limited')
+        self.assertEqual(messages[-1]['diagnostic'], {'stage':'mfa_verify', 'reason':'rate_limited', 'httpStatus':429})
+
     def execute(self, url, state="fixture", workspace="original-workspace"):
         self.messages, self.requests = [], []
         data = {"notes": f"{EMAIL}----fixture-password----{SECRET}", "email": EMAIL, "proxy": "http://fixture:pass@127.0.0.1:21001", "authorizationUrl": url, "accountId": "original-workspace"}

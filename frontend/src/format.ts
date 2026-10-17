@@ -1,5 +1,12 @@
 import type { Account, Job } from './types'
 
+export function resultMessage(job?: Job): string {
+  const message = job?.message || ''
+  if (message === '2FA 验证未通过，请检查原账号备注') return '历史记录：2FA 流程未完成，未记录具体原因，不能据此判断密钥错误'
+  if (message === '协议登录未完成，请检查账号或代理后重试') return '历史记录：协议登录未完成，未记录具体失败阶段'
+  return message
+}
+
 export const isActive = (job?: Job) => !!job && ['queued', 'running'].includes(job.status)
 export const needsReauth = (account: Account) => account.status === 'error'
 export const isUnfinished = (job?: Job) => !!job && ['failed', 'review', 'interrupted'].includes(job.status)

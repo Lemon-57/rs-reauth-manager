@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from diagnostics import describe_failure, stage_for_url, transport_reason
 
 
 def emit(event, **fields):
@@ -64,17 +65,7 @@ def authorization(url):
 
 
 def error_code(result):
-    reason = str(result.get("error", "")).lower()
-    page = str(result.get("page_type", "")).lower()
-    if "invalid_username_or_password" in reason:
-        return "password"
-    if "mfa" in reason or "totp" in reason:
-        return "mfa"
-    if "429" in reason or "rate_limit" in reason:
-        return "limited"
-    if any(v in reason + page for v in ("phone", "email_otp", "captcha", "challenge", "primary_factor")):
-        return "human"
-    return "protocol"
+    return describe_failure(result)['code']
 
 
 def workspace_ids_from_text(text, original):
@@ -108,6 +99,29 @@ def run(data):
         selected_workspace = forced or target
         workspace_candidates = []
         unbound_workspace = False
+        last_attempt = None
+        failed_authorization = None
+
+        def _oauth_request(self, method, url, **kwargs):
+            self.last_attempt = {'stage': stage_for_url(url), 'httpStatus': None}
+            try:
+                response = super()._oauth_request(method, url, **kwargs)
+            except Exception as exc:
+                self.last_attempt['transport'] = transport_reason(exc)
+                raise
+            self.last_attempt['httpStatus'] = getattr(response, 'status_code', None)
+            return response
+
+        def _exchange_code_for_tokens(self, *args, **kwargs):
+            self.last_attempt = {'stage': 'token_exchange', 'httpStatus': None}
+            try:
+                tokens = super()._exchange_code_for_tokens(*args, **kwargs)
+            except Exception as exc:
+                self.last_attempt['transport'] = transport_reason(exc)
+                raise
+            if not tokens:
+                self.failed_authorization = describe_failure({'error': 'token_exchange_failed'}, attempt=self.last_attempt)
+            return tokens
 
         def _remember_workspace(self, value):
             value = str(value or '').strip()
@@ -179,7 +193,12 @@ def run(data):
     try:
         emit("step", step="login")
         def authorize(url, expected):
-            return oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+            oauth.last_attempt = None
+            oauth.failed_authorization = None
+            result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                oauth.failed_authorization = describe_failure(result, attempt=oauth.last_attempt)
+            return result
 
         def fallback(personal):
             if not data.get("userId"):
@@ -203,7 +222,7 @@ def run(data):
                 fallback(unavailable.personal_id)
                 return
             if not isinstance(result, dict) or not result.get("ok"):
-                emit("error", code=error_code(result if isinstance(result, dict) else {}))
+                emit('error', **oauth.failed_authorization)
                 return
             if result.get("state") != state or not result.get("code"):
                 raise ValueError("state")
@@ -213,6 +232,9 @@ def run(data):
             callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
             emit("complete", callbackUrl=callback)
         except ValueError as exc:
+            if oauth.failed_authorization is not None:
+                emit('error', **oauth.failed_authorization)
+                return
             if str(exc) != "workspace":
                 raise
             choices = workspace_choices(oauth._decode_oauth_session_cookie(), target)
@@ -222,6 +244,8 @@ def run(data):
                     choices.append({"id": value})
                     known.add(value)
             emit("error", code="workspace", workspaces=choices)
+        except Exception as exc:
+            emit('error', **describe_failure(attempt=oauth.last_attempt, exception=exc))
     finally:
         chat.session.close()
 
@@ -242,7 +266,10 @@ def main():
             run(data)
     except ValueError as exc:
         code = str(exc)
-        emit("error", code=code if code in {"credentials", "authorization", "state", "workspace", "fallback_identity", "proxy"} else "credentials")
+        if code in {'credentials', 'authorization', 'workspace', 'proxy'}:
+            emit('error', code=code)
+        else:
+            emit('error', **describe_failure({'error': code}))
     except Exception:
         emit("error", code="protocol")
 

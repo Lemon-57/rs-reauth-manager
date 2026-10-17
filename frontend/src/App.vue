@@ -9,7 +9,7 @@ import { ZPagination } from '@codex-proxy/ui/pagination'
 import { ZSelect } from '@codex-proxy/ui/select'
 import { ZTable, type TableColumn } from '@codex-proxy/ui/table'
 import { ZTag } from '@codex-proxy/ui/tag'
-import { displayTime, isActive, planLabel, planType, progress, statusText } from './format'
+import { displayTime, isActive, planLabel, planType, progress, resultMessage, statusText } from './format'
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
 
@@ -36,14 +36,14 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
     <div v-if="error" class="message danger" role="alert"><AlertTriangle :size="16" /><span>{{ error }}</span><ZIconButton title="关闭提示" aria-label="关闭提示" @click="error = ''"><X :size="14" /></ZIconButton></div>
     <ZTable :columns="columns" :data="visible" :row-key="a => a.id" :loading="loading && !accounts.length" :empty-text="loading ? '正在读取账号' : '没有匹配的 OAuth 账号'">
       <template #select="{ row }"><ZCheckbox :model-value="selected.includes(row.id)" :disabled="!ready(row) || busy" :aria-label="`选择 ${row.email || row.name}`" @change="selectOne(row.id, $event)" /></template>
-      <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> {{ statusText(row) }}</span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }">{{ progress(resultOf(row)) }}<span v-if="resultOf(row)?.message"> · {{ resultOf(row)?.message }}</span></span></div></div></div></template>
+      <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> {{ statusText(row) }}</span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }">{{ progress(resultOf(row)) }}<span v-if="resultOf(row)?.message"> · {{ resultMessage(resultOf(row)) }}</span></span></div></div></div></template>
       <template #plan="{ row }"><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag></template>
       <template #groups="{ row }"><div v-if="row.groups.length" class="group-tags"><ZTag v-for="group in row.groups" :key="group.id" size="small" :title="group.name">{{ group.name }}</ZTag></div><span v-else class="muted">未分组</span></template>
       <template #status="{ row }"><span class="status" :class="{ danger: row.status === 'error', muted: !row.enabled, success: row.enabled && row.status === 'normal' }"><i></i>{{ statusText(row) }}</span></template>
       <template #credentials="{ row }"><span :class="row.notesValid ? 'success' : 'danger'">{{ row.notesValid ? '资料齐全' : '备注待检查' }}</span></template>
       <template #proxy="{ row }"><span class="proxy" :title="row.proxy || '未绑定代理'">{{ row.proxy || '未绑定代理' }}</span></template>
       <template #expiry="{ row }"><span class="date">{{ displayTime(row.accessTokenExpiresAt) }}</span></template>
-      <template #result="{ row }"><div class="result" :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }"><span><RefreshCw v-if="isActive(resultOf(row))" class="spin" :size="13" /><CircleCheck v-else-if="resultOf(row)?.status === 'success'" :size="14" />{{ progress(resultOf(row)) }}</span><small v-if="resultOf(row)?.message" :title="resultOf(row)?.message">{{ resultOf(row)?.message }}</small><time v-if="resultOf(row)?.finishedAt">{{ displayTime(resultOf(row)?.finishedAt) }}</time></div></template>
+      <template #result="{ row }"><div class="result" :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }"><span><RefreshCw v-if="isActive(resultOf(row))" class="spin" :size="13" /><CircleCheck v-else-if="resultOf(row)?.status === 'success'" :size="14" />{{ progress(resultOf(row)) }}</span><small v-if="resultOf(row)?.message" :title="resultMessage(resultOf(row))">{{ resultMessage(resultOf(row)) }}</small><time v-if="resultOf(row)?.finishedAt">{{ displayTime(resultOf(row)?.finishedAt) }}</time></div></template>
       <template #actions="{ row }"><ZButton v-if="canForce(row)" size="small" type="danger" :disabled="busy" @click="openForce(row)">强制写回</ZButton><ZButton v-else-if="canFreeFallback(row)" size="small" type="warning" :disabled="busy" @click="openFreeFallback(row)">退回 Free</ZButton><ZIconButton v-else-if="isActive(jobOf(row))" title="取消该账号" :aria-label="`取消 ${row.email || row.name}`" :disabled="busy" @click="cancel(jobOf(row))"><Square :size="15" /></ZIconButton><ZIconButton v-else title="重新授权并写回原账号" :aria-label="`重新授权 ${row.email || row.name}`" :disabled="!ready(row) || busy" @click="confirm([row])"><KeyRound :size="17" /></ZIconButton></template>
     </ZTable>
     <ZPagination v-model:current-page="page" v-model:page-size="pageSize" :total="filtered.length" :page-sizes="[10, 20, 50, 100]" />
@@ -66,8 +66,8 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
     </ZDialog>
     <ZDialog v-model="showFreeFallback" title="退回同一用户 Free" width="34rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
       <p>{{ freeTarget?.email || freeTarget?.name }}</p>
-      <p class="danger">上游没有返回任何候选工作区。确认后会重新获取同一用户的 Free 授权，写回原账号并停止该账号调度。</p>
-      <p class="muted">仍需验证邮箱、用户身份、Free 套餐、凭据版本和账号空闲状态；保留分组、代理、备注及其他配置，不显示 RT。</p>
+      <p class="danger">上游没有返回任何候选工作区，确认后会重新获取同一用户的 Free 授权，写回原账号并停止该账号调度</p>
+      <p class="muted">仍需验证邮箱、用户身份、Free 套餐、凭据版本和账号空闲状态，保留分组、代理、备注及其他配置，不显示 RT</p>
       <ZCheckbox v-model="freeConfirmed" class="force-confirm" :disabled="busy" label="我确认退回同一用户的 Free，替换原授权并停止该账号调度" />
       <p v-if="error" class="danger" role="alert">{{ error }}</p>
       <template #footer><ZButton :disabled="busy" @click="showFreeFallback = false">取消</ZButton><ZButton type="warning" :loading="busy" :disabled="busy || !freeConfirmed" @click="submitFreeFallback">确认退回 Free</ZButton></template>

@@ -166,7 +166,8 @@ class ProtocolTests(unittest.TestCase):
     def test_human_verification_not_bypassed(self):
         OAuth.result = {"ok": False, "error": "phone_required"}
         self.run_login()
-        self.assertEqual(self.messages[-1], {"event": "error", "code": "human"})
+        self.assertEqual(self.messages[-1]["code"], 'human')
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'phone_required')
 
     def test_no_direct_fallback(self):
         self.data["proxy"] = ""

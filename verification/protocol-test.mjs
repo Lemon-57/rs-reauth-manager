@@ -217,5 +217,14 @@ try {
     assert.equal(a.planType, 'free'); assert.equal(a.enabled, false); assert.equal(saves.at(-1), id); assert.equal(disables.length, disabled + 1); assert.ok(saves.length > saved)
     check('No-candidate failure requires explicit Free fallback confirmation and writes the verified Free token')
   }
+  for (const [id, expected] of [['diagnostic_issue', /创建 2FA 验证挑战.*HTTP 403/], ['diagnostic_limit', /限制登录频率.*HTTP 429/], ['diagnostic_transport', /密码验证.*请求超时/], ['diagnostic_unsafe', /未取得可公开的具体错误/]]) {
+    const a = make(id); accounts.push(a); revisions.set(id, 1)
+    const before = structuredClone(a), saved = saves.length, completed = completes.length
+    await submit([id]); const done = await finish(id)
+    assert.equal(done.status, 'failed'); assert.match(done.message, expected)
+    for (const secret of ['fixture-password', 'fallback-private-rt', 'private-host']) assert.ok(!done.message.includes(secret))
+    assert.equal(saves.length, saved); assert.equal(completes.length, completed); assert.deepEqual(a, before)
+    check(`${id}: specific diagnostics survive SDK transport without credential leakage or account changes`)
+  }
   await stop(); assert.equal(errors, ''); console.log(`Verified ${passed} protocol scenarios`)
 } catch (error) { child?.kill(); console.error(error); process.exitCode = 1 }

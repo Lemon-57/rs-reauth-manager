@@ -175,13 +175,13 @@ class RealVendorFreeRecovery(unittest.TestCase):
         self.assertNotIn("fixture-private-rt", json.dumps(self.messages[:-1]))
 
     def test_forced_wrong_state_never_emits_or_exchanges_tokens(self):
-        with self.assertRaisesRegex(ValueError, "fallback_identity"):
-            self.execute(force=True, bad_state=True)
+        self.execute(force=True, bad_state=True)
+        self.assertEqual(self.messages[-1]['event'], 'error')
         self.assertFalse(any(call[0] == "POST" for call in self.calls))
 
     def test_wrong_new_state_never_exchanges_or_emits_tokens(self):
-        with self.assertRaisesRegex(ValueError, "^fallback_identity$"):
-            self.execute(bad_state=True)
+        self.execute(bad_state=True)
+        self.assertEqual(self.messages[-1]['event'], 'error')
         self.assertFalse(any(call[0] == "POST" for call in self.calls))
         self.assertFalse(any(message["event"] == "free_fallback" for message in self.messages))
 
