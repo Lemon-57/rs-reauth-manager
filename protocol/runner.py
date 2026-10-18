@@ -11,7 +11,8 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-from diagnostics import describe_failure, stage_for_url, transport_reason
+from diagnostics import describe_failure, mfa_generation_failure, response_mfa_error, stage_for_url, transport_reason
+from tracing import ObservedSession
 
 
 def emit(event, **fields):
@@ -101,15 +102,23 @@ def run(data):
         unbound_workspace = False
         last_attempt = None
         failed_authorization = None
+        last_mfa_verification = None
+        local_mfa_failure = None
 
         def _oauth_request(self, method, url, **kwargs):
             self.last_attempt = {'stage': stage_for_url(url), 'httpStatus': None}
+            if self.last_attempt['stage'] == 'mfa_issue':
+                self.last_mfa_verification = None
             try:
                 response = super()._oauth_request(method, url, **kwargs)
             except Exception as exc:
                 self.last_attempt['transport'] = transport_reason(exc)
                 raise
             self.last_attempt['httpStatus'] = getattr(response, 'status_code', None)
+            if self.last_attempt['stage'] in {'mfa_verify', 'mfa_issue'}:
+                self.last_attempt['mfaError'] = response_mfa_error(response)
+            if self.last_attempt['stage'] == 'mfa_verify':
+                self.last_mfa_verification = describe_failure(attempt=self.last_attempt)
             return response
 
         def _exchange_code_for_tokens(self, *args, **kwargs):
@@ -182,22 +191,46 @@ def run(data):
     class ProgressMfa(TotpMfaClient):
         def get_mfa_code(self, *args, **kwargs):
             emit("step", step="mfa")
-            return super().get_mfa_code(*args, **kwargs)
+            oauth.local_mfa_failure = None
+            try:
+                code = super().get_mfa_code(*args, **kwargs)
+            except Exception:
+                oauth.local_mfa_failure = mfa_generation_failure('mfa_generation_failed', oauth.last_mfa_verification)
+                raise
+            if code is None:
+                reason = 'mfa_new_code_timeout' if kwargs.get('exclude_codes') else 'mfa_code_unavailable'
+                oauth.local_mfa_failure = mfa_generation_failure(reason, oauth.last_mfa_verification)
+            elif not isinstance(code, str) or not re.fullmatch(r'\d{6}', code):
+                oauth.local_mfa_failure = mfa_generation_failure('mfa_code_invalid_format', oauth.last_mfa_verification)
+            return code
 
     emit("step", step="session")
-    chat = ChatGPTClient(proxy=proxy, verbose=False, impersonate="chrome133a")
-    chat.current_email = email
-    oauth = BoundOAuthClient({"oauth_phone_strategy": "sms", "sub2api_oauth_max_hops": 20, "oauth_email_otp_max_attempts": 1, "oauth_email_otp_timeout": 30, "sub2api_oauth_impersonates": "chrome133a", "sub2api_redirect_uri": urlunsplit(redirect)}, proxy=proxy, verbose=False)
-    oauth.session.close()
+    chat = None
+    try:
+        chat = ChatGPTClient(proxy=proxy, verbose=False, impersonate="chrome133a")
+        chat.current_email = email
+        oauth = BoundOAuthClient({"oauth_phone_strategy": "sms", "sub2api_oauth_max_hops": 20, "oauth_email_otp_max_attempts": 1, "oauth_email_otp_timeout": 30, "sub2api_oauth_impersonates": "chrome133a", "sub2api_redirect_uri": urlunsplit(redirect)}, proxy=proxy, verbose=False)
+        oauth.session.close()
+    except Exception as exc:
+        if chat is not None:
+            try:
+                chat.session.close()
+            except Exception:
+                pass
+        emit('error', **describe_failure(attempt={'stage': 'session', 'httpStatus': None}, exception=exc))
+        return
+    chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt))
     oauth.session = chat.session
     try:
         emit("step", step="login")
         def authorize(url, expected):
-            oauth.last_attempt = None
+            oauth.last_attempt = {'stage': 'authorize', 'httpStatus': None}
             oauth.failed_authorization = None
+            oauth.last_mfa_verification = None
+            oauth.local_mfa_failure = None
             result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
             if not isinstance(result, dict) or result.get('ok') is not True:
-                oauth.failed_authorization = describe_failure(result, attempt=oauth.last_attempt)
+                oauth.failed_authorization = oauth.local_mfa_failure or describe_failure(result, attempt=oauth.last_attempt)
             return result
 
         def fallback(personal):
@@ -232,11 +265,15 @@ def run(data):
             callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
             emit("complete", callbackUrl=callback)
         except ValueError as exc:
+            if oauth.local_mfa_failure is not None:
+                emit('error', **oauth.local_mfa_failure)
+                return
             if oauth.failed_authorization is not None:
                 emit('error', **oauth.failed_authorization)
                 return
             if str(exc) != "workspace":
-                raise
+                emit('error', **describe_failure({'error': str(exc)}, attempt=oauth.last_attempt, exception=None if str(exc) in {'state', 'fallback_identity'} else exc))
+                return
             choices = workspace_choices(oauth._decode_oauth_session_cookie(), target)
             known = {item["id"] for item in choices}
             for value in getattr(oauth, "workspace_candidates", []):
@@ -245,7 +282,7 @@ def run(data):
                     known.add(value)
             emit("error", code="workspace", workspaces=choices)
         except Exception as exc:
-            emit('error', **describe_failure(attempt=oauth.last_attempt, exception=exc))
+            emit('error', **(oauth.local_mfa_failure or describe_failure(attempt=oauth.last_attempt, exception=exc)))
     finally:
         chat.session.close()
 

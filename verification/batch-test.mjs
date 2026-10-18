@@ -12,7 +12,7 @@ const account = (id, overrides = {}) => ({ id, name: `${id}@example.com`, email:
 let accounts = [account('error'), account('missing', { notesValid: false, proxy: null }), account('paused', { enabled: false }), account('healthy', { status: 'normal' }), account('expired-access', { status: 'normal', accessTokenExpiresAt: '2020-01-01T00:00:00Z' }), account('quota', { status: 'quota_exhausted' }), account('limited', { status: 'rate_limited' })]
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
-let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, calls = [], latestBatch = null, checks = 0, mounted
+let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, calls = [], latestBatch = null, checks = 0, mounted
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
@@ -32,6 +32,17 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
     latestBatch = body.requestId
     jobs.push({ ...job('error', 'queued', latestBatch), forceWorkspaceId: body.workspaceId })
     if (throwAfterForce) throw new Error('fixture forced response lost')
+    return reply({ jobs })
+  }
+  if (input.path === 'api/free-fallback') {
+    assert.equal(body.confirmation, 'fallback_free_and_disable')
+    assert.deepEqual(Object.keys(body).sort(), ['confirmation', 'requestId', 'sourceRequestId'])
+    const source = jobs.find(j => j.requestId === body.sourceRequestId)
+    assert.equal(source.status, 'failed'); assert.equal(source.step, 'workspace'); assert.ok(!source.workspaceChoices?.length)
+    latestBatch = body.requestId
+    jobs.push(job(source.accountId, 'queued', latestBatch))
+    if (freeGate) await freeGate.promise
+    if (throwAfterFree) throw new Error('fixture Free response lost')
     return reply({ jobs })
   }
   if (input.path === 'api/tick') {
@@ -70,6 +81,8 @@ try {
   }
   let state = await mount()
   assert.equal(state.success.value, 0); assert.equal(state.failed.value, 0); assert.equal(state.jobs.value.length, 3)
+  assert.equal(state.resultOf(accounts.find(a => a.id === 'healthy')), undefined)
+  assert.equal(state.resultOf(accounts.find(a => a.id === 'error')).status, 'failed')
   check('Entering the page clears batch counters without clearing retained history')
   assert.equal(state.eligibleCount.value, 3)
   assert.equal(state.ready(accounts[1]), false)
@@ -99,9 +112,12 @@ try {
   state.confirm([accounts[3]]); outcomes = { healthy: 'success' }; await state.submit()
   assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0); assert.equal(state.filter.value, 'all')
   check('Retrying a failed account in another batch replaces old totals instead of retaining its previous failure')
+  jobs.push(job('error', 'failed', 'historical-after-success')); await state.load()
   mounted.unmount(); state = await mount(); assert.equal(state.success.value, 0); assert.equal(state.failed.value, 0)
+  assert.equal(state.resultOf(accounts.find(a => a.id === 'healthy')), undefined)
+  assert.equal(state.resultOf(accounts.find(a => a.id === 'error')).status, 'failed')
   state.showResults('failed'); assert.equal(state.filtered.value.length, 0)
-  check('Reopening starts at zero and cannot show failures from the previous visit')
+  check('Reopening hides historical success as unexecuted while retaining the latest historical failure reason')
   outcomes = { error: 'review', healthy: 'interrupted', paused: 'cancelled' }; state.confirm([accounts[0], accounts[3], accounts[2]]); await state.submit()
   assert.equal(state.success.value, 0); assert.equal(state.failed.value, 2)
   check('Needs-review and interrupted count as unfinished, explicit cancellation does not')
@@ -138,5 +154,42 @@ try {
   assert.equal(calls.filter(c => c.path === 'api/force-submit').length, 2)
   assert.equal(state.active.value, 1)
   check('Lost forced submission response is read back without automatically replaying authorization')
+  await state.cancel()
+  const source = { ...job('error', 'failed', 'free-source'), step: 'workspace', workspaceChoices: [] }
+  jobs.push(source); accounts[0].enabled = true; accounts[0].planType = 'team'; accounts[0].status = 'error'; await state.load()
+  assert.equal(state.canFreeFallback(target), true)
+  assert.equal('showFreeFallback' in state, false); assert.equal('freeConfirmed' in state, false)
+  freeGate = Promise.withResolvers(); outcomes = { error: 'free' }
+  const freeCount = calls.filter(c => c.path === 'api/free-fallback').length
+  const pendingFree = state.submitFreeFallback(target)
+  assert.equal(state.busy.value, true)
+  await state.submitFreeFallback(target)
+  assert.equal(calls.filter(c => c.path === 'api/free-fallback').length, freeCount + 1)
+  assert.equal(JSON.parse(calls.findLast(c => c.path === 'api/free-fallback').body).sourceRequestId, source.requestId)
+  freeGate.resolve(); await pendingFree; freeGate = null
+  assert.equal(state.busy.value, false); assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0)
+  assert.equal(state.accounts.value.find(a => a.id === 'error').enabled, false)
+  assert.equal(state.accounts.value.find(a => a.id === 'error').planType, 'free')
+  assert.equal(state.resultOf(target).step, 'free'); assert.match(state.resultOf(target).message, /已停止调度/)
+  check('Free action submits immediately without dialog state, blocks double clicks and refreshes the disabled Free result')
+  const guardedCount = calls.filter(c => c.path === 'api/free-fallback').length
+  await state.submitFreeFallback(state.accounts.value.find(a => a.id === 'error'))
+  await state.submitFreeFallback(accounts.find(a => a.id === 'healthy'))
+  await state.submitFreeFallback(accounts.find(a => a.id === 'missing'))
+  jobs.push({ ...job('error', 'failed', 'free-with-choices'), step: 'workspace', workspaceChoices: [{ id: 'alternate-workspace' }] }); await state.load()
+  await state.submitFreeFallback(target)
+  assert.equal(calls.filter(c => c.path === 'api/free-fallback').length, guardedCount)
+  check('Free action rejects successful, unrelated, incomplete or workspace-selectable accounts without submitting')
+  jobs.push({ ...job('error', 'failed', 'free-lost-source'), step: 'workspace', workspaceChoices: [] }); await state.load()
+  throwAfterFree = true
+  const ticksBefore = calls.filter(c => c.path === 'api/tick').length
+  await state.submitFreeFallback(target)
+  assert.match(state.error.value, /Free response lost/); assert.equal(state.busy.value, false)
+  assert.equal(state.active.value, 1); assert.equal(state.resultOf(target).status, 'queued')
+  assert.equal(calls.filter(c => c.path === 'api/free-fallback').length, guardedCount + 1)
+  assert.equal(calls.filter(c => c.path === 'api/tick').length, ticksBefore)
+  await state.submitFreeFallback(target)
+  assert.equal(calls.filter(c => c.path === 'api/free-fallback').length, guardedCount + 1)
+  check('Lost Free submission response is reconciled with the current batch and never automatically resubmitted')
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }

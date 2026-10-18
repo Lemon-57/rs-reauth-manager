@@ -26,7 +26,18 @@ function credential(a) {
   return { account_id: a.id, provider_id: 'openai', credential_revision: revisions.get(a.id), facts: { name: a.name, authentication_kind: 'oauth', material: { schema_version: 1, installation_id: '3d07c9c6-3b57-4a12-a51d-1e21df254477', transport: 'http', principal: { oauth_subject: 'original-subject', poid: null }, access_token: 'old-access', refresh_token: 'old-secret-rt', id_token: 'old-id', oauth_client_id: 'fixture', oauth_scope: 'openid', cookies: [{ name: 'fixture', value: 'fixture-cookie' }] }, email: a.email, upstream_user_id: a.userId, upstream_account_id: a.accountId, plan_type: a.planType, has_refresh_token: true, access_token_expires_at_ms: null, next_refresh_at_ms: null } }
 }
 let child, buffer, pending, ready, sequence = 99, errors = '', failComplete = false
-function send(meta, payload = Buffer.alloc(0)) { if (!Buffer.isBuffer(payload)) payload = Buffer.from(JSON.stringify(payload)); const json = Buffer.from(JSON.stringify(meta)), head = Buffer.alloc(12); head.writeUInt32BE(json.length); head.writeBigUInt64BE(BigInt(payload.length), 4); child.stdin.write(Buffer.concat([head, json, payload])) }
+function send(meta, payload = Buffer.alloc(0)) {
+  if (!Buffer.isBuffer(payload)) payload = Buffer.from(JSON.stringify(payload))
+  meta = structuredClone(meta)
+  let business
+  if (meta.type === 'hello') { business = meta.handshake.configuration; delete meta.handshake.configuration }
+  else if (meta.type === 'call' || meta.type === 'callback') { business = meta.params; delete meta.params }
+  else if (meta.type === 'result') { business = meta.result; delete meta.result }
+  if (business !== undefined) { const data = Buffer.from(JSON.stringify(business)); meta.data_bytes = data.length; payload = Buffer.concat([data, payload]) }
+  const json = Buffer.from(JSON.stringify(meta)), head = Buffer.alloc(12)
+  head.writeUInt32BE(json.length); head.writeBigUInt64BE(BigInt(payload.length), 4)
+  child.stdin.write(Buffer.concat([head, json, payload]))
+}
 const result = (id, value = {}, payload) => send({ type: 'result', id, result: value }, payload)
 async function callback(meta, payload) {
   const data = payload.length ? JSON.parse(payload.toString()) : meta.params
@@ -97,8 +108,16 @@ function parse() {
   while (buffer.length >= 12) {
     const m = buffer.readUInt32BE(), p = Number(buffer.readBigUInt64BE(4)), total = 12 + m + p
     if (buffer.length < total) break
-    const meta = JSON.parse(buffer.subarray(12, 12 + m).toString()), payload = buffer.subarray(12 + m, total); buffer = buffer.subarray(total)
-    if (meta.type === 'ready') ready.resolve()
+    const meta = JSON.parse(buffer.subarray(12, 12 + m).toString()); let payload = buffer.subarray(12 + m, total); buffer = buffer.subarray(total)
+    const requestBytes = meta.request_context_bytes ?? 0, dataBytes = meta.data_bytes ?? 0
+    if (dataBytes) {
+      const data = JSON.parse(payload.subarray(requestBytes, requestBytes + dataBytes).toString())
+      if (meta.type === 'hello') meta.handshake.configuration = data
+      else if (meta.type === 'call' || meta.type === 'callback') meta.params = data
+      else if (meta.type === 'result') meta.result = data
+    }
+    payload = payload.subarray(requestBytes + dataBytes)
+    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 4); ready.resolve() }
     else if (meta.type === 'callback') callback(meta, payload).catch(e => { ready.reject(e); for (const w of pending.values()) w.reject(e) })
     else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result') w.resolve({ result: meta.result, payload }); else w.reject(new Error(JSON.stringify(meta.error))) } }
   }
@@ -109,7 +128,7 @@ async function start() {
   child.stdout.on('data', data => { buffer = Buffer.concat([buffer, data]); parse() }); child.stderr.on('data', data => errors += data)
   child.on('error', e => ready.reject(e))
   child.on('exit', code => { if (code) { const e = new Error(`Plugin exit ${code}: ${errors}`); ready.reject(e); for (const w of pending.values()) w.reject(e) } })
-  send({ type: 'hello', handshake: { protocol_version: 2, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration: {}, contributes: { management: { id: 'personal.reauth-manager.management', version: 1, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
+  send({ type: 'hello', handshake: { protocol_version: 4, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration: {}, contributes: { management: { id: 'personal.reauth-manager.management', version: 2, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
   await ready.promise
 }
 async function stop() { const exited = new Promise(resolve => child.once('exit', resolve)); send({ type: 'shutdown' }); child.stdin.end(); await exited }
@@ -217,7 +236,7 @@ try {
     assert.equal(a.planType, 'free'); assert.equal(a.enabled, false); assert.equal(saves.at(-1), id); assert.equal(disables.length, disabled + 1); assert.ok(saves.length > saved)
     check('No-candidate failure requires explicit Free fallback confirmation and writes the verified Free token')
   }
-  for (const [id, expected] of [['diagnostic_issue', /创建 2FA 验证挑战.*HTTP 403/], ['diagnostic_limit', /限制登录频率.*HTTP 429/], ['diagnostic_transport', /密码验证.*请求超时/], ['diagnostic_unsafe', /未取得可公开的具体错误/]]) {
+  for (const [id, expected] of [['diagnostic_issue', /创建 2FA 验证挑战.*HTTP 403/], ['diagnostic_limit', /限制登录频率.*HTTP 429/], ['diagnostic_transport', /密码验证.*请求超时/], ['diagnostic_unsafe', /未取得可公开的具体错误/], ['diagnostic_mfa_local', /本地生成.*本轮未向上游提交$/], ['diagnostic_mfa_previous', /本地生成.*未再次提交.*此前验证结果.*动态码已过期.*HTTP 409.*otp_expired/], ['diagnostic_security', /获取登录安全校验令牌.*HTTP 403/], ['diagnostic_parse', /交换授权令牌.*不是有效 JSON.*HTTP 200/]]) {
     const a = make(id); accounts.push(a); revisions.set(id, 1)
     const before = structuredClone(a), saved = saves.length, completed = completes.length
     await submit([id]); const done = await finish(id)

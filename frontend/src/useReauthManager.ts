@@ -9,27 +9,29 @@ export function useReauthManager() {
   const showConfirm = ref(false), targets = ref<Account[]>([])
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
-  const byAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
+  const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
   const batchByAccount = computed(() => new Map(batchJobs.value.map(j => [j.accountId, j])))
-  const jobOf = (a: Account) => byAccount.value.get(a.id)
-  const resultOf = (a: Account) => ['success', 'failed'].includes(filter.value) ? batchByAccount.value.get(a.id) : jobOf(a)
+  const jobOf = (a: Account) => {
+    const job = latestByAccount.value.get(a.id)
+    return job && (isActive(job) || isUnfinished(job)) ? job : undefined
+  }
+  const resultOf = (a: Account) => batchByAccount.value.get(a.id) || jobOf(a)
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
   const showForce = ref(false), forceTarget = ref<Account>(), forceSource = ref<Job>(), forceWorkspace = ref(''), forceConfirmed = ref(false)
-  const showFreeFallback = ref(false), freeTarget = ref<Account>(), freeSource = ref<Job>(), freeConfirmed = ref(false)
   const canForce = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && !!j.workspaceChoices?.length && (j.step === 'workspace' || j.message === '无法匹配原账号工作区，已停止写回') }
   function openForce(a: Account) { forceTarget.value = a; forceSource.value = jobOf(a); forceWorkspace.value = ''; forceConfirmed.value = false; showForce.value = true }
   const canFreeFallback = (a: Account) => { const j = jobOf(a); return ready(a) && j?.status === 'failed' && j.step === 'workspace' && !j.workspaceChoices?.length }
-  function openFreeFallback(a: Account) { freeTarget.value = a; freeSource.value = jobOf(a); freeConfirmed.value = false; showFreeFallback.value = true }
-  async function submitFreeFallback() {
-    const source = freeSource.value
-    if (!source || !freeConfirmed.value || busy.value) return
+  async function submitFreeFallback(a: Account) {
+    if (busy.value || !canFreeFallback(a)) return
+    const source = jobOf(a)
+    if (!source) return
     const requestId = crypto.randomUUID()
-    busy.value = true; error.value = ''
+    busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
+    if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
     try {
-      const result = await api.freeFallback(source.requestId, requestId)
-      batchId.value = requestId; batchJobs.value = []; receiveJobs(result.jobs); showFreeFallback.value = false
-      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      receiveJobs((await api.freeFallback(source.requestId, requestId)).jobs)
       await api.tick()
+      if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts
     } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
     finally { busy.value = false }
   }
@@ -107,5 +109,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, showFreeFallback, freeTarget, freeSource, freeConfirmed, canFreeFallback, openFreeFallback, submitFreeFallback }
+  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

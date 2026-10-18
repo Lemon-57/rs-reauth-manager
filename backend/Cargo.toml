@@ -1,13 +1,13 @@
 [package]
 name = "reauth-manager"
-version = "0.1.14"
+version = "0.1.16"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 publish = false
 
 [dependencies]
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "ae5eaa46b447548571e6c46d69bd27d454adb785", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "743a3aba70a4f78f27fb53d80a6e719599d2fe5e", features = ["io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", default-features = false, features = ["io-std", "io-util", "macros", "rt", "sync", "time", "process"] }

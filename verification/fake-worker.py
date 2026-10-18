@@ -21,6 +21,10 @@ elif data["email"].startswith("failed"):
     print(json.dumps({"event": "error", "code": "password"}), flush=True)
 elif data["email"].startswith('diagnostic_'):
     cases = {'diagnostic_issue': {'stage': 'mfa_issue', 'reason': 'mfa_issue_failed', 'httpStatus': 403}, 'diagnostic_limit': {'stage': 'mfa_verify', 'reason': 'rate_limited', 'httpStatus': 429}, 'diagnostic_transport': {'stage': 'password', 'reason': 'request_timeout', 'httpStatus': None}, 'diagnostic_unsafe': {'stage': 'private-host', 'reason': 'fixture-password', 'httpStatus': 'fallback-private-rt'}}
+    cases['diagnostic_mfa_local'] = {'stage': 'mfa_generate', 'reason': 'mfa_code_unavailable', 'httpStatus': None}
+    cases['diagnostic_security'] = {'stage': 'security_token', 'reason': 'http_rejected', 'httpStatus': 403}
+    cases['diagnostic_parse'] = {'stage': 'token_exchange', 'reason': 'response_invalid_json', 'httpStatus': 200}
+    cases['diagnostic_mfa_previous'] = {'stage': 'mfa_generate', 'reason': 'mfa_new_code_timeout', 'httpStatus': None, 'previousVerification': {'stage': 'mfa_verify', 'reason': 'mfa_code_expired', 'httpStatus': 409, 'upstreamCode': 'otp_expired', 'raw': 'fixture-password'}}
     diagnostic = cases[data['email'].split('@')[0]]
     print(json.dumps({'event': 'error', 'code': 'protocol', 'diagnostic': diagnostic, 'rawResponse': 'fixture-password fallback-private-rt'}), flush=True)
 elif data["email"].startswith("force_") and not data.get("forceWorkspaceId"):

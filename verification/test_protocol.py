@@ -118,8 +118,10 @@ class ProtocolTests(unittest.TestCase):
     def test_wrapped_flow_still_rejects_mismatched_callback_state(self):
         self.data["authorizationUrl"] = desktop_url()
         OAuth.result["state"] = "wrong"
-        with self.assertRaisesRegex(ValueError, "^state$"):
-            self.run_login()
+        self.run_login()
+        self.assertEqual(self.messages[-1]['code'], 'state')
+        self.assertEqual(self.messages[-1]['diagnostic']['stage'], 'callback')
+        self.assertFalse(any(m['event'] == 'complete' for m in self.messages))
 
     def test_legacy_direct_localhost_callback_still_supported(self):
         _, state, redirect = runner.authorization(URL.replace("127.0.0.1", "localhost"))
@@ -136,8 +138,10 @@ class ProtocolTests(unittest.TestCase):
 
     def test_mismatched_state_stops(self):
         OAuth.result["state"] = "wrong"
-        with self.assertRaisesRegex(ValueError, "state"):
-            self.run_login()
+        self.run_login()
+        self.assertEqual(self.messages[-1]['code'], 'state')
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'state_mismatch')
+        self.assertFalse(any(m['event'] == 'complete' for m in self.messages))
 
     def test_other_workspace_stops_before_writeback(self):
         OAuth.cookie = {"workspace_id": "other-workspace", "workspaces": [{"id": "other-workspace"}]}

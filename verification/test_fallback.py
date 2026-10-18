@@ -95,7 +95,7 @@ class FallbackGuards(unittest.TestCase):
 
 
 class RealVendorFreeRecovery(unittest.TestCase):
-    def execute(self, selection_page=False, bad_state=False, bad_tokens=False, user="original-user", force=False):
+    def execute(self, selection_page=False, bad_state=False, bad_tokens=False, user="original-user", force=False, token_status=200, token_json_invalid=False):
         messages, calls = [], []
         exchanged = tokens()
         if force:
@@ -138,7 +138,11 @@ class RealVendorFreeRecovery(unittest.TestCase):
                 testcase.assertEqual(params["code_challenge"], [challenge])
                 testcase.assertNotEqual(challenge, "a" * 43)
                 calls.append(("POST", url))
-                return types.SimpleNamespace(status_code=200, json=lambda: exchanged)
+                def read_json():
+                    if token_json_invalid:
+                        raise ValueError('private-response')
+                    return exchanged
+                return types.SimpleNamespace(status_code=token_status, json=read_json, text='private-response')
 
             def close(self):
                 pass
@@ -186,14 +190,28 @@ class RealVendorFreeRecovery(unittest.TestCase):
         self.assertFalse(any(message["event"] == "free_fallback" for message in self.messages))
 
     def test_missing_original_identity_prevents_new_authorization(self):
-        with self.assertRaisesRegex(ValueError, "^fallback_identity$"):
-            self.execute(user="")
+        self.execute(user="")
+        self.assertEqual(self.messages[-1]['code'], 'fallback_identity')
+        self.assertEqual(self.messages[-1]['diagnostic']['stage'], 'identity')
         self.assertEqual(len(self.calls), 1)
 
     def test_incomplete_tokens_never_emit_fallback(self):
-        with self.assertRaisesRegex(ValueError, "^fallback_identity$"):
-            self.execute(bad_tokens=True)
+        self.execute(bad_tokens=True)
+        self.assertEqual(self.messages[-1]['code'], 'fallback_identity')
+        self.assertEqual(self.messages[-1]['diagnostic']['stage'], 'identity')
+        self.assertIsNone(self.messages[-1]['diagnostic']['httpStatus'])
         self.assertFalse(any(message["event"] == "free_fallback" for message in self.messages))
+
+    def test_direct_token_exchange_retains_actual_http_failure(self):
+        self.execute(token_status=503)
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'upstream_unavailable', 'httpStatus': 503})
+        self.assertNotIn('private-response', json.dumps(self.messages))
+        self.assertFalse(any(message['event'] == 'free_fallback' for message in self.messages))
+
+    def test_token_exchange_parse_failure_is_not_reported_as_proxy_or_identity(self):
+        self.execute(token_json_invalid=True)
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'response_invalid_json', 'httpStatus': 200})
+        self.assertNotIn('private-response', json.dumps(self.messages))
 
 
 if __name__ == "__main__":

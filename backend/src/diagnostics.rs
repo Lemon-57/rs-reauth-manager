@@ -5,13 +5,42 @@ pub fn message(output: &Value, fallback: &str) -> String {
     let Some(diagnostic) = output.get("diagnostic").filter(|d| d.is_object()) else {
         return fallback.into();
     };
-    let stage = match diagnostic["stage"].as_str().unwrap_or_default() {
+    render(diagnostic, true)
+}
+
+fn render(diagnostic: &Value, include_previous: bool) -> String {
+    let local_generation = matches!(
+        diagnostic["reason"].as_str(),
+        Some(
+            "mfa_code_unavailable"
+                | "mfa_new_code_timeout"
+                | "mfa_code_invalid_format"
+                | "mfa_generation_failed"
+        )
+    );
+    let stage_key = if local_generation {
+        "mfa_generate"
+    } else {
+        diagnostic["stage"].as_str().unwrap_or_default()
+    };
+    let stage = match stage_key {
         "authorize" => "获取授权页面",
+        "authorize_follow" => "跟随授权页面跳转",
+        "account_request" => "调用上游账号接口",
+        "login_page" => "打开登录页面",
+        "password_page" => "打开密码验证页面",
+        "security_token" => "获取登录安全校验令牌",
+        "account_selection" => "选择登录账号",
+        "profile" => "补充账号资料",
+        "phone_send" => "发送手机验证码",
+        "phone_verify" => "提交手机验证码",
+        "session" => "初始化登录会话",
         "login" => "提交登录身份",
         "password" => "密码验证",
         "mfa_factor" => "识别 2FA 验证器",
         "mfa_issue" => "创建 2FA 验证挑战",
         "mfa_verify" => "提交 2FA 动态码",
+        "mfa_generate" => "本地生成 2FA 动态码",
         "email_send" => "发送邮箱验证码",
         "email_verify" => "邮箱验证码验证",
         "phone" => "手机验证",
@@ -21,22 +50,35 @@ pub fn message(output: &Value, fallback: &str) -> String {
         "callback" => "校验授权回调",
         "token_exchange" => "交换授权令牌",
         "identity" => "校验授权身份",
+        "account" => "检查账号状态",
+        "billing" => "检查付款状态",
         _ => "登录协议",
     };
     let reason = match diagnostic["reason"].as_str().unwrap_or_default() {
         "password_rejected" => "上游拒绝邮箱或密码",
+        "account_banned" => "账号已被封禁或停用，上游拒绝继续登录",
+        "payment_required" => "上游返回 Payment Required，账号需要付款或订阅状态异常",
         "mfa_secret_missing" => "未提供 2FA 密钥",
         "mfa_factor_missing" => "未找到可用的 TOTP 验证器，不能据此判断密钥错误",
         "mfa_provider_invalid" => "2FA 动态码生成器不可用",
-        "mfa_code_unavailable" => "未能取得有效的六位 2FA 动态码",
+        "mfa_code_unavailable" => "等待可用动态码超时，本轮未向上游提交",
+        "mfa_new_code_timeout" => "等待下一轮未使用的动态码超时，本轮未再次提交",
+        "mfa_code_invalid_format" => "生成器未返回六位数字，本轮未向上游提交",
+        "mfa_generation_failed" => "动态码生成器异常，本轮未向上游提交",
+        "mfa_code_invalid" => "上游明确返回动态码无效",
+        "mfa_code_expired" => "上游明确返回动态码已过期",
+        "mfa_challenge_invalid" => "上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误",
+        "mfa_conflict" => "动态码已生成并提交，上游返回验证冲突，未明确说明验证码是否错误",
         "mfa_issue_failed" => "上游未成功创建 2FA 验证挑战，并非已确认验证码错误",
         "mfa_code_rejected" => "上游拒绝 2FA 动态码，可能已失效、被使用或与验证器不匹配",
         "mfa_verification_failed" => "2FA 验证流程未完成，未取得明确的验证码拒绝原因",
         "primary_factor_required" => "上游要求先完成密码或邮箱验证，不能只使用 2FA",
         "email_code_required" => "上游要求邮箱验证码，当前任务不支持人工补码续跑",
+        "email_send_failed" => "上游未能发送邮箱验证码",
         "email_code_rejected" => "上游拒绝邮箱验证码",
         "email_verification_failed" => "邮箱验证流程未完成",
         "phone_required" => "上游要求手机验证，需要人工完成",
+        "phone_verification_failed" => "手机验证未完成，需要人工检查验证状态",
         "profile_required" => "上游要求补充账号资料",
         "security_challenge" => "上游要求浏览器安全验证，需要人工完成",
         "rate_limited" => "上游限制登录频率，不自动重试",
@@ -45,6 +87,9 @@ pub fn message(output: &Value, fallback: &str) -> String {
         "tls_failed" => "TLS 连接或证书校验失败",
         "connection_failed" => "连接中断或代理连接失败",
         "transport_failed" => "请求传输异常，未保存原始异常内容",
+        "protocol_processing_failed" => "读取或处理该步骤的协议数据时发生内部异常",
+        "response_invalid_json" => "该步骤的响应不是有效 JSON，无法继续解析",
+        "response_invalid_shape" => "该步骤的 JSON 响应结构不符合协议要求",
         "upstream_unavailable" => "上游服务暂不可用",
         "http_rejected" => "上游拒绝请求，未取得可公开的具体原因",
         "account_selection_failed" => "上游账号选择未完成",
@@ -60,9 +105,31 @@ pub fn message(output: &Value, fallback: &str) -> String {
     let mut message = format!("{stage}：{reason}");
     if let Some(status) = diagnostic["httpStatus"]
         .as_u64()
-        .filter(|v| (100..=599).contains(v))
+        .filter(|v| !local_generation && (100..=599).contains(v))
     {
-        message.push_str(&format!("（最后响应 HTTP {status}）"));
+        message.push_str(&format!("（HTTP {status}）"));
+    }
+    if let Some(code) = diagnostic["upstreamCode"].as_str().filter(|code| {
+        matches!(
+            *code,
+            "invalid_otp"
+                | "invalid_totp"
+                | "invalid_code"
+                | "invalid_verification_code"
+                | "totp_invalid"
+                | "otp_expired"
+                | "invalid_state"
+        )
+    }) {
+        message.push_str(&format!(" [上游错误码 {code}]"));
+    }
+    if include_previous
+        && local_generation
+        && let Some(previous) = diagnostic
+            .get("previousVerification")
+            .filter(|d| d.is_object() && d["stage"] == "mfa_verify")
+    {
+        message.push_str(&format!("；此前验证结果：{}", render(previous, false)));
     }
     message
 }
@@ -95,5 +162,72 @@ mod tests {
         assert!(
             !message(&json!({"diagnostic":{"httpStatus":999999}}), "fallback").contains("HTTP")
         );
+    }
+
+    #[test]
+    fn separates_local_generation_from_previous_upstream_rejection() {
+        let rendered = message(
+            &json!({"diagnostic":{
+                "stage":"mfa_generate","reason":"mfa_new_code_timeout","httpStatus":null,
+                "previousVerification":{"stage":"mfa_verify","reason":"mfa_conflict","httpStatus":409}
+            }}),
+            "fallback",
+        );
+        let (local, previous) = rendered.split_once('；').unwrap();
+        assert!(local.contains("本轮未再次提交"));
+        assert!(!local.contains("HTTP"));
+        assert!(previous.contains("动态码已生成并提交"));
+        assert!(previous.contains("HTTP 409"));
+        assert!(previous.contains("未明确说明验证码是否错误"));
+        let legacy = message(
+            &json!({"diagnostic":{"stage":"mfa_verify","reason":"mfa_code_unavailable","httpStatus":409}}),
+            "fallback",
+        );
+        assert!(legacy.starts_with("本地生成"));
+        assert!(!legacy.contains("HTTP"));
+    }
+
+    #[test]
+    fn preserves_known_machine_codes_without_exposing_arbitrary_details() {
+        let rendered = message(
+            &json!({"diagnostic":{
+                "stage":"mfa_generate","reason":"mfa_new_code_timeout",
+                "previousVerification":{"stage":"mfa_verify","reason":"mfa_code_expired","httpStatus":409,"upstreamCode":"otp_expired","raw":"private-secret",
+                    "previousVerification":{"stage":"private-secret"}}
+            }}),
+            "fallback",
+        );
+        assert!(rendered.contains("动态码已过期"));
+        assert!(rendered.contains("otp_expired"));
+        assert!(!rendered.contains("private-secret"));
+        let unknown = message(
+            &json!({"diagnostic":{"stage":"mfa_verify","reason":"mfa_conflict","httpStatus":409,"upstreamCode":"private-secret"}}),
+            "fallback",
+        );
+        assert!(!unknown.contains("private-secret"));
+    }
+
+    #[test]
+    fn reports_direct_request_stages_and_parse_errors_without_blames() {
+        let parse = message(
+            &json!({"diagnostic":{"stage":"token_exchange","reason":"response_invalid_json","httpStatus":200}}),
+            "fallback",
+        );
+        assert!(parse.starts_with("交换授权令牌"));
+        assert!(parse.contains("不是有效 JSON"));
+        assert!(!parse.contains("代理"));
+        let security = message(
+            &json!({"diagnostic":{"stage":"security_token","reason":"http_rejected","httpStatus":403}}),
+            "fallback",
+        );
+        assert!(security.starts_with("获取登录安全校验令牌"));
+        assert!(security.contains("HTTP 403"));
+        let processing = message(
+            &json!({"diagnostic":{"stage":"password_page","reason":"protocol_processing_failed","httpStatus":200}}),
+            "fallback",
+        );
+        assert!(processing.starts_with("打开密码验证页面"));
+        assert!(processing.contains("内部异常"));
+        assert!(!processing.contains("代理"));
     }
 }

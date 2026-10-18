@@ -774,6 +774,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_uses_rpc_v4_and_management_v2_not_a_renamed_legacy_contract() {
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 4);
+        let source = include_bytes!("../../plugin.json");
+        let manifest = Manifest::from_author_slice(source).unwrap();
+        assert_eq!(manifest.manifest_version, 2);
+        assert_eq!(
+            manifest.contributes[&gateway_plugin_sdk::Capability::Management].version,
+            2
+        );
+        assert_eq!(
+            manifest.contributes[&gateway_plugin_sdk::Capability::Maintenance].version,
+            1
+        );
+        let mut legacy: Value = serde_json::from_slice(source).unwrap();
+        legacy["contributes"]["management"] = json!({"version":1});
+        assert!(Manifest::from_author_slice(&serde_json::to_vec(&legacy).unwrap()).is_err());
+    }
+
+    #[test]
     fn all_oauth_plans_are_eligible_but_other_credentials_are_not() {
         for plan in [
             json!("free"),
