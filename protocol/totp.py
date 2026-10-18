@@ -57,9 +57,12 @@ class TotpMfaClient:
             if str(value).strip()
         }
         deadline = time.monotonic() + max(5.0, float(timeout or 90))
-        while time.monotonic() < deadline:
+        while time.monotonic() <= deadline:
             code, remaining = totp_code(self.secret, period=self.period)
             if code not in excluded and remaining > 4:
                 return code
-            time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                break
+            time.sleep(min(0.5, budget))
         return None

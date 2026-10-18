@@ -67,8 +67,13 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "mfa_generation_failed" => "动态码生成器异常，本轮未向上游提交",
         "mfa_code_invalid" => "上游明确返回动态码无效",
         "mfa_code_expired" => "上游明确返回动态码已过期",
-        "mfa_challenge_invalid" => "上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误",
-        "mfa_conflict" => "动态码已生成并提交，上游返回验证冲突，未明确说明验证码是否错误",
+        "mfa_challenge_invalid" => {
+            "上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误；已停止沿用该挑战重试，请重新发起授权"
+        }
+        "login_state_invalid" => "上游明确返回登录步骤状态无效，不能沿用旧登录会话",
+        "mfa_conflict" => {
+            "动态码已生成并提交，上游返回验证冲突，未明确说明验证码是否错误；未自动重试"
+        }
         "mfa_issue_failed" => "上游未成功创建 2FA 验证挑战，并非已确认验证码错误",
         "mfa_code_rejected" => "上游拒绝 2FA 动态码，可能已失效、被使用或与验证器不匹配",
         "mfa_verification_failed" => "2FA 验证流程未完成，未取得明确的验证码拒绝原因",
@@ -99,6 +104,10 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "token_exchange_failed" => "授权码换取令牌未成功，未写回",
         "state_mismatch" => "授权回调 state 校验未通过，未写回",
         "workspace_unmatched" => "无法匹配原账号工作区，已停止写回",
+        "free_workspace_missing" => "授权页面未提供可安全选择的个人 Free 候选工作区，未写回",
+        "free_workspace_ambiguous" => {
+            "授权页面存在多个候选工作区，无法唯一确定个人 Free 工作区，未自动选择或写回"
+        }
         "identity_unconfirmed" => "新授权的同一用户或 Free 工作区校验未通过，未写回",
         _ => "未取得可公开的具体错误，未保存上游原始响应",
     };
@@ -130,6 +139,12 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
             .filter(|d| d.is_object() && d["stage"] == "mfa_verify")
     {
         message.push_str(&format!("；此前验证结果：{}", render(previous, false)));
+    }
+    if include_previous && diagnostic["sessionRestarts"].as_u64() == Some(1) {
+        if let Some(previous) = diagnostic.get("previousLogin").filter(|d| d.is_object()) {
+            message.push_str(&format!("；首次登录失败：{}", render(previous, false)));
+        }
+        message.push_str("；已重建一次登录会话，本次仍失败，不再自动重登");
     }
     message
 }
@@ -205,6 +220,64 @@ mod tests {
             "fallback",
         );
         assert!(!unknown.contains("private-secret"));
+    }
+
+    #[test]
+    fn restarted_login_renders_both_safe_causes_without_repeating_recovery() {
+        let rendered = message(
+            &json!({"diagnostic":{
+                "stage":"mfa_verify","reason":"rate_limited","httpStatus":429,"sessionRestarts":1,
+                "previousLogin":{"stage":"mfa_verify","reason":"mfa_challenge_invalid","httpStatus":409,"upstreamCode":"invalid_state","raw":"private-cookie",
+                    "previousLogin":{"raw":"private-secret"},"sessionRestarts":1}
+            }}),
+            "fallback",
+        );
+        assert!(rendered.contains("HTTP 429"));
+        assert!(rendered.contains("HTTP 409"));
+        assert!(rendered.contains("首次登录失败"));
+        assert_eq!(rendered.matches("已重建一次登录会话").count(), 1);
+        assert!(rendered.contains("不再自动重登"));
+        assert!(!rendered.contains("private-"));
+        let untrusted = message(
+            &json!({"diagnostic":{"sessionRestarts":999,"previousLogin":{"raw":"private-cookie"}}}),
+            "fallback",
+        );
+        assert!(!untrusted.contains("已重建"));
+        assert!(!untrusted.contains("private-"));
+    }
+
+    #[test]
+    fn invalid_challenge_explains_retry_stopped_not_generation_timeout() {
+        let rendered = message(
+            &json!({"diagnostic":{"stage":"mfa_verify","reason":"mfa_challenge_invalid","httpStatus":409,"upstreamCode":"invalid_state"}}),
+            "fallback",
+        );
+        assert!(rendered.starts_with("提交 2FA 动态码"));
+        assert!(rendered.contains("已停止沿用该挑战重试"));
+        assert!(rendered.contains("不等同于密钥错误"));
+        assert!(rendered.contains("HTTP 409"));
+        assert!(rendered.contains("invalid_state"));
+        assert!(!rendered.contains("等待下一轮"));
+        assert!(!rendered.contains("本地生成"));
+    }
+
+    #[test]
+    fn distinguishes_missing_and_ambiguous_free_candidates() {
+        for (reason, expected) in [
+            ("free_workspace_missing", "未提供可安全选择"),
+            ("free_workspace_ambiguous", "存在多个候选"),
+        ] {
+            let rendered = message(
+                &json!({"diagnostic":{"stage":"workspace","reason":reason,"httpStatus":200,"raw":"private-cookie"}}),
+                "fallback",
+            );
+            assert!(rendered.starts_with("选择工作区"));
+            assert!(rendered.contains(expected));
+            assert!(rendered.contains("未写回") || rendered.contains("未自动选择或写回"));
+            assert!(rendered.contains("HTTP 200"));
+            assert!(!rendered.contains("private-cookie"));
+            assert!(!rendered.contains("2FA"));
+        }
     }
 
     #[test]

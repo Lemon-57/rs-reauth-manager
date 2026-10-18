@@ -233,6 +233,7 @@ impl Runtime {
                     Some("step") => {
                         data.step = match value["step"].as_str() {
                             Some("session") => "session",
+                            Some("session_restart") => "session_restart",
                             Some("login") => "login",
                             Some("mfa") => "mfa",
                             _ => "running",

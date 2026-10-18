@@ -1,6 +1,7 @@
 """Verified personal-Free recovery, using the upstream PKCE and token exchange protocol."""
 import base64
 import json
+import re
 import secrets
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -10,6 +11,46 @@ class WorkspaceUnavailable(ValueError):
     def __init__(self, personal_id):
         super().__init__("workspace")
         self.personal_id = personal_id
+
+
+def free_workspace_candidate(session, original):
+    """Choose only an unambiguous candidate; issued tokens must still prove Free."""
+    if not isinstance(session, dict):
+        raise ValueError('free_workspace_missing')
+    workspaces = session.get('workspaces', [])
+    if not isinstance(workspaces, list) or any(not isinstance(w, dict) for w in workspaces):
+        raise ValueError('free_workspace_missing')
+    if len(workspaces) > 30:
+        raise ValueError('free_workspace_ambiguous')
+    if not workspaces and session.get('workspace_id'):
+        workspaces = [{'id': session['workspace_id']}]
+    seen, personal, unknown = set(), [], []
+    for workspace in workspaces:
+        wid = workspace.get('id')
+        if not isinstance(wid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', wid):
+            raise ValueError('free_workspace_missing')
+        if wid in seen:
+            raise ValueError('free_workspace_ambiguous')
+        seen.add(wid)
+        if wid == original:
+            continue
+        kinds = [str(workspace.get(key) or '').strip().lower() for key in ['type', 'account_type', 'kind']]
+        plan = str(workspace.get('plan_type') or '').strip().lower()
+        if plan not in {'', 'free'} or workspace.get('is_personal') is False:
+            continue
+        if any(kind and kind not in {'personal', 'individual'} for kind in kinds):
+            continue
+        if workspace.get('is_personal') is True or any(kinds) or plan == 'free':
+            personal.append(wid)
+        else:
+            unknown.append(wid)
+    if len(personal) == 1:
+        return personal[0]
+    if len(personal) > 1 or len(unknown) > 1:
+        raise ValueError('free_workspace_ambiguous')
+    if len(unknown) == 1 and len(workspaces) == 1:
+        return unknown[0]
+    raise ValueError('free_workspace_missing')
 
 
 def personal_candidate(session, original):
@@ -103,6 +144,8 @@ def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, fo
 def recover_unbound_free(oauth, chat, authorize_url, data, authorize):
     from vendor.lib.utils import generate_pkce
 
+    if not data.get('userId'):
+        raise ValueError('fallback_identity')
     verifier, challenge = generate_pkce()
     state = secrets.token_urlsafe(32)
     parsed = urlsplit(authorize_url)
@@ -116,7 +159,7 @@ def recover_unbound_free(oauth, chat, authorize_url, data, authorize):
     if not isinstance(result, dict) or result.get("ok") is not True or result.get("state") != state or not isinstance(result.get("code"), str) or not result["code"]:
         raise ValueError("fallback_identity")
     tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
-    verified, workspace, plan = verify_tokens(tokens, data["email"], data.get("userId"), None, force=False)
+    verified, workspace, plan = verify_tokens(tokens, data["email"], data.get("userId"), oauth.selected_workspace or None, force=False)
     if workspace == data.get("accountId") or plan != "free":
         raise ValueError("fallback_identity")
     return verified, workspace

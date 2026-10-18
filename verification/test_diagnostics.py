@@ -5,10 +5,33 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'protocol'))
-from diagnostics import describe_failure, stage_for_url, transport_reason
+from diagnostics import describe_failure, retry_action, stage_for_url, transport_reason
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_retry_policy_requires_explicit_step_and_error_not_http_alone(self):
+        for stage in ['login', 'password', 'mfa_issue', 'mfa_verify']:
+            failure = describe_failure({'error': 'invalid_state'}, attempt={'stage': stage, 'httpStatus': 409})
+            self.assertEqual(failure['diagnostic']['stage'], stage)
+            self.assertEqual(retry_action(failure), 'restart_login')
+        for code in ['invalid_otp', 'otp_expired']:
+            failure = describe_failure({'error': code}, attempt={'stage': 'mfa_verify', 'httpStatus': 409})
+            self.assertEqual(retry_action(failure), 'new_code')
+        for stage, code, status in [
+            ('mfa_verify', 'invalid_state', 429), ('mfa_verify', 'invalid_state', 503),
+            ('mfa_verify', 'unknown', 409), ('mfa_verify', 'account_banned', 409),
+            ('mfa_verify', 'payment_required', 402), ('password', 'invalid_username_or_password', 401),
+            ('token_exchange', 'invalid_state', 409), ('callback', 'invalid_state', 409),
+            ('mfa_verify', 'phone_required', 403), ('mfa_verify', 'oauth_cloudflare_challenge', 200),
+        ]:
+            with self.subTest(stage=stage, code=code, status=status):
+                self.assertEqual(retry_action(describe_failure({'error': code}, attempt={'stage': stage, 'httpStatus': status})), 'stop')
+
+    def test_free_selection_errors_are_workspace_errors_not_mfa_or_transport(self):
+        for reason in ['free_workspace_missing', 'free_workspace_ambiguous']:
+            value = describe_failure({'error': reason}, attempt={'stage': 'consent', 'httpStatus': 200})
+            self.assertEqual(value, {'code': 'protocol', 'diagnostic': {'stage': 'workspace', 'reason': reason, 'httpStatus': 200}})
+
     def test_mfa_reasons_do_not_all_mean_wrong_secret(self):
         cases = {'mfa_totp_factor_not_available': 'mfa_factor_missing', 'mfa_totp_secret_required': 'mfa_secret_missing', 'mfa_totp_provider_invalid': 'mfa_provider_invalid', 'mfa_totp_code_unavailable': 'mfa_code_unavailable', 'mfa_totp_rejected_400': 'mfa_code_rejected', 'mfa_issue_challenge_http_403': 'mfa_issue_failed', 'mfa_primary_factor_required': 'primary_factor_required'}
         for source, expected in cases.items():

@@ -60,6 +60,8 @@ REASONS = {
     'state': ('state', 'state_mismatch'),
     'workspace': ('workspace', 'workspace_unmatched'),
     'fallback_identity': ('fallback_identity', 'identity_unconfirmed'),
+    'free_workspace_missing': ('protocol', 'free_workspace_missing'),
+    'free_workspace_ambiguous': ('protocol', 'free_workspace_ambiguous'),
 }
 
 MFA_ERRORS = {
@@ -85,6 +87,17 @@ def response_mfa_error(response):
         if isinstance(code, str) and code.lower() in MFA_ERRORS:
             return code.lower()
     return None
+
+
+def retry_action(failure):
+    diagnostic = failure.get('diagnostic', {}) if isinstance(failure, dict) else {}
+    stage, reason = diagnostic.get('stage'), diagnostic.get('reason')
+    status, code = diagnostic.get('httpStatus'), diagnostic.get('upstreamCode')
+    if stage in {'login', 'password', 'mfa_issue', 'mfa_verify'} and reason in {'mfa_challenge_invalid', 'login_state_invalid'} and status in {400, 409} and code == 'invalid_state':
+        return 'restart_login'
+    if stage == 'mfa_verify' and reason in {'mfa_code_invalid', 'mfa_code_expired'} and status in {400, 409} and code in MFA_ERRORS:
+        return 'new_code'
+    return 'stop'
 
 
 def mfa_generation_failure(reason, previous=None):
@@ -167,7 +180,10 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         reason = observed_mfa
     if reason == 'mfa_totp_code_unavailable':
         return mfa_generation_failure('mfa_code_unavailable')
-    if reason in {'fallback_identity', 'state', 'invalid_state'} and not (reason == 'invalid_state' and stage in {'mfa_verify', 'mfa_issue'}):
+    if reason in {'free_workspace_missing', 'free_workspace_ambiguous'}:
+        stage = 'workspace'
+    login_state_invalid = reason == 'invalid_state' and stage in {'login', 'password'} and status in {400, 409}
+    if reason in {'fallback_identity', 'state', 'invalid_state'} and not (reason == 'invalid_state' and (stage in {'mfa_verify', 'mfa_issue'} or login_state_invalid)):
         stage = 'identity' if reason == 'fallback_identity' else 'callback'
         if reason in {'fallback_identity', 'state'}:
             status = None
@@ -187,6 +203,8 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         detail = 'upstream_unavailable' if status >= 500 else 'http_rejected'
     elif stage in {'mfa_verify', 'mfa_issue'} and reason in MFA_ERRORS:
         code, detail = 'mfa', MFA_ERRORS[reason]
+    elif login_state_invalid:
+        code, detail = 'state', 'login_state_invalid'
     elif reason in REASONS:
         code, detail = REASONS[reason]
     elif re.fullmatch(r'mfa_issue_challenge_http_[1-5][0-9]{2}', reason):
@@ -219,6 +237,6 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         if status == 429:
             code, detail = 'limited', 'rate_limited'
     diagnostic = {'stage': stage, 'reason': detail, 'httpStatus': status}
-    if reason in MFA_ERRORS and stage in {'mfa_verify', 'mfa_issue'}:
+    if reason in MFA_ERRORS and stage in {'mfa_verify', 'mfa_issue'} or login_state_invalid:
         diagnostic['upstreamCode'] = reason
     return {'code': code, 'diagnostic': diagnostic}

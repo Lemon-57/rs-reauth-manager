@@ -6,7 +6,6 @@ import type { Account, Job } from './types'
 export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
-  const showConfirm = ref(false), targets = ref<Account[]>([])
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
   const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
@@ -81,15 +80,17 @@ export function useReauthManager() {
   }
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
   async function load() { loading.value = true; error.value = ''; try { accounts.value = (await api.accounts()).accounts; receiveJobs((await api.jobs()).jobs) } catch (e) { error.value = (e as Error).message } finally { loading.value = false } }
-  function confirm(rows: Account[]) { targets.value = rows; showConfirm.value = true }
-  async function submit() {
-    if (!targets.value.length || busy.value) return
-    const accountIds = targets.value.map(a => a.id), requestId = crypto.randomUUID()
+  async function submit(rows: Account[]) {
+    if (busy.value) return
+    const requested = new Set(rows.map(a => a.id))
+    const accountIds = accounts.value.filter(a => requested.has(a.id) && ready(a)).map(a => a.id)
+    if (!accountIds.length) return
+    const requestId = crypto.randomUUID()
     busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
     if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
     try {
       receiveJobs((await api.submit(accountIds, requestId)).jobs)
-      selected.value = selected.value.filter(id => !accountIds.includes(id)); showConfirm.value = false
+      selected.value = selected.value.filter(id => !accountIds.includes(id))
       await api.tick()
       if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts
     } catch (e) {
@@ -109,5 +110,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, showConfirm, targets, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, confirm, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

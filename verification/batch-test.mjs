@@ -12,7 +12,7 @@ const account = (id, overrides = {}) => ({ id, name: `${id}@example.com`, email:
 let accounts = [account('error'), account('missing', { notesValid: false, proxy: null }), account('paused', { enabled: false }), account('healthy', { status: 'normal' }), account('expired-access', { status: 'normal', accessTokenExpiresAt: '2020-01-01T00:00:00Z' }), account('quota', { status: 'quota_exhausted' }), account('limited', { status: 'rate_limited' })]
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
-let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, calls = [], latestBatch = null, checks = 0, mounted
+let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, submitGate = null, calls = [], latestBatch = null, checks = 0, mounted
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
@@ -23,6 +23,7 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
   if (input.path === 'api/submit') {
     latestBatch = body.requestId
     jobs.push(...body.accountIds.map(id => job(id, 'queued', latestBatch)))
+    if (submitGate) await submitGate.promise
     if (throwAfterSubmit) throw new Error('fixture response lost')
     return reply({ jobs })
   }
@@ -91,7 +92,8 @@ try {
   state.filter.value = 'all'; state.search.value = 'Shared Group'
   assert.deepEqual(state.filtered.value.map(a => a.id), ['error']); state.search.value = ''
   check('Group search matches any RS membership without excluding ungrouped accounts')
-  state.confirm([accounts[0], accounts[3]]); outcomes = { error: 'success', healthy: 'failed' }; await state.submit()
+  assert.equal('showConfirm' in state, false); assert.equal('targets' in state, false); assert.equal('confirm' in state, false)
+  outcomes = { error: 'success', healthy: 'failed' }; await state.submit([accounts[0], accounts[3]])
   assert.equal(state.success.value, 1); assert.equal(state.failed.value, 1); assert.equal(state.eligibleCount.value, 2)
   check('Only the submitted batch contributes outcomes and successful account recovery reduces the error count')
   state.plan.value = 'team'; state.search.value = 'not-found'; state.page.value = 4
@@ -106,10 +108,12 @@ try {
   check('Result filters and displayed errors remain bound to this batch even when later history exists')
   jobs = []; await state.load(); assert.equal(state.success.value, 1); assert.equal(state.failed.value, 1)
   check('Manual refresh and server history pruning cannot erase this page batch outcomes')
-  state.confirm([accounts[3]]); state.showConfirm.value = false
+  const noOpCount = calls.length
+  await state.submit([]); await state.submit([accounts[1], account('unknown')])
+  assert.equal(calls.length, noOpCount)
   assert.equal(state.success.value, 1); assert.equal(state.failed.value, 1)
-  check('Opening and cancelling confirmation does not reset the submitted batch results')
-  state.confirm([accounts[3]]); outcomes = { healthy: 'success' }; await state.submit()
+  check('Empty or ineligible direct submissions preserve batch outcomes without requests or dialogs')
+  outcomes = { healthy: 'success' }; await state.submit([accounts[3]])
   assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0); assert.equal(state.filter.value, 'all')
   check('Retrying a failed account in another batch replaces old totals instead of retaining its previous failure')
   jobs.push(job('error', 'failed', 'historical-after-success')); await state.load()
@@ -118,17 +122,29 @@ try {
   assert.equal(state.resultOf(accounts.find(a => a.id === 'error')).status, 'failed')
   state.showResults('failed'); assert.equal(state.filtered.value.length, 0)
   check('Reopening hides historical success as unexecuted while retaining the latest historical failure reason')
-  outcomes = { error: 'review', healthy: 'interrupted', paused: 'cancelled' }; state.confirm([accounts[0], accounts[3], accounts[2]]); await state.submit()
+  outcomes = { error: 'review', healthy: 'interrupted', paused: 'cancelled' }; await state.submit([accounts[0], accounts[3], accounts[2]])
   assert.equal(state.success.value, 0); assert.equal(state.failed.value, 2)
   check('Needs-review and interrupted count as unfinished, explicit cancellation does not')
-  throwAfterSubmit = true; state.confirm([accounts[1]]); const before = calls.filter(c => c.path === 'api/submit').length; await state.submit()
+  throwAfterSubmit = true; const before = calls.filter(c => c.path === 'api/submit').length; await state.submit([accounts[3]])
   assert.match(state.error.value, /fixture response lost/); assert.equal(state.active.value, 1)
   assert.equal(calls.filter(c => c.path === 'api/submit').length, before + 1)
   assert.equal(state.success.value, 0); assert.equal(state.failed.value, 0)
   check('A lost submission response is reconciled through read-only jobs lookup, never auto-resubmitted')
   await state.cancel(); assert.equal(state.active.value, 0); assert.equal(state.failed.value, 0)
   check('Cancelling updates live queue state without treating cancellation as a failed authorization')
-  throwAfterSubmit = false; outcomes = { error: 'free' }; state.confirm([accounts[0]]); await state.submit()
+  throwAfterSubmit = false
+  submitGate = Promise.withResolvers(); outcomes = { error: 'success' }
+  state.selected.value = ['error', 'missing']
+  const directCount = calls.filter(c => c.path === 'api/submit').length
+  const pendingSubmit = state.submit([accounts[0], accounts[0], accounts[1], account('unknown')])
+  assert.equal(state.busy.value, true)
+  await state.submit([accounts[3]])
+  assert.equal(calls.filter(c => c.path === 'api/submit').length, directCount + 1)
+  assert.deepEqual(JSON.parse(calls.findLast(c => c.path === 'api/submit').body).accountIds, ['error'])
+  submitGate.resolve(); await pendingSubmit; submitGate = null
+  assert.equal(state.busy.value, false); assert.deepEqual(state.selected.value, ['missing'])
+  check('Direct submission deduplicates current eligible accounts and blocks concurrent double clicks')
+  outcomes = { error: 'free' }; await state.submit([accounts[0]])
   assert.equal(state.success.value, 1); assert.equal(state.failed.value, 0)
   const recovered = state.accounts.value.find(a => a.id === 'error')
   assert.equal(recovered.enabled, false); assert.equal(recovered.planType, 'free'); assert.equal(recovered.status, 'normal')
