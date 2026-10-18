@@ -17,6 +17,7 @@ verification/*
 !verification/fake-worker.py
 !verification/test_protocol.py
 !verification/test_totp.py
+!verification/test_workspace_pages.py
 !verification/test_diagnostics.py
 !verification/test_tracing.py
 !verification/test_vendor_contract.py

@@ -35,6 +35,83 @@ class OfflineSession:
         pass
 
 
+class BoundWorkspacePageTests(unittest.TestCase):
+    def execute(self, cookie, html, *, selection_status=302, selection_error=False):
+        self.messages, self.calls = [], []
+        testcase = self
+        consent = 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent'
+        callback = 'http://127.0.0.1:1455/auth/callback?state=fixture&code=fixture-code'
+        class Session:
+            def __init__(self):
+                self.cookies, self.headers = RequestsCookieJar(), {}
+                self.cookies.set('oai-client-auth-session', json.dumps(cookie), domain='auth.openai.com')
+            def close(self):
+                pass
+            def request(self, method, url, **kwargs):
+                testcase.calls.append((method, url))
+                if method == 'GET' and url == URL:
+                    return types.SimpleNamespace(status_code=302, url=url, headers={'Location': consent}, text='')
+                if method == 'GET' and url == consent:
+                    return types.SimpleNamespace(status_code=200, url=url, headers={}, text=html, json=lambda: {})
+                if method == 'POST' and url.endswith('/workspace/select'):
+                    testcase.assertEqual(kwargs['json'], {'workspace_id': 'original-workspace'})
+                    body = {'continue_url': callback}
+                    if selection_error:
+                        body['error'] = {'code': 'private-error', 'message': 'private-body'}
+                    return types.SimpleNamespace(status_code=selection_status, url=url, headers={'Location': callback} if selection_status == 302 else {}, text=json.dumps(body), json=lambda: body)
+                raise AssertionError('Unexpected offline request')
+            def get(self, url, **kwargs):
+                testcase.calls.append(('GET', url))
+                testcase.assertTrue(url.endswith('/client_auth_session_dump'))
+                return types.SimpleNamespace(status_code=403, url=url, headers={}, text='', json=lambda: {})
+        data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': URL, 'accountId': 'original-workspace', 'userId': 'original-user'}
+        def session(**kwargs):
+            self.assertEqual(kwargs['proxy'], data['proxy'])
+            return Session()
+        with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **fields: self.messages.append({'event': event, **fields})):
+            runner.run(data)
+
+    def test_rejected_workspace_with_callback_cannot_become_binding_proof(self):
+        self.execute({'workspace_id': 'original-workspace'}, '{}', selection_status=403)
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'workspace', 'reason': 'http_rejected', 'httpStatus': 403})
+        self.assertFalse(any(m['event'] == 'complete' for m in self.messages))
+
+    def test_business_rejection_in_http_200_cannot_become_binding_proof(self):
+        self.execute({'workspace_id': 'original-workspace'}, '{}', selection_status=200, selection_error=True)
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'workspace_selection_failed')
+        self.assertNotIn('private-', json.dumps(self.messages))
+
+    def test_malformed_cookie_workspace_list_still_allows_valid_html(self):
+        for cookie in [{'workspaces': 17}, {'workspaces': None}]:
+            with self.subTest(cookie=cookie):
+                self.execute(cookie, '{"workspace_id":"original-workspace"}')
+                self.assertEqual(self.messages[-1]['event'], 'complete')
+                self.assertEqual(sum(url.endswith('/workspace/select') for _, url in self.calls), 1)
+
+    def test_existing_binding_does_not_require_redecoding_malformed_workspaces(self):
+        self.execute({'workspace_id': 'original-workspace', 'workspaces': None}, '{}')
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+
+    def test_personal_cookie_does_not_override_original_workspace_in_current_html(self):
+        self.execute({'workspaces': [{'id': 'personal-workspace', 'is_personal': True}]}, '{"workspace_id":"original-workspace"}')
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+        self.assertEqual(sum(url == URL for _, url in self.calls), 1)
+
+    def test_target_id_substring_or_unrelated_text_cannot_select_original(self):
+        self.execute({'workspaces': []}, '{"workspace_id":"original-workspace-suffix","message":"original-workspace"}')
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertFalse(any(url.endswith('/workspace/select') for _, url in self.calls))
+
+    def test_invalid_session_candidates_are_not_restored_from_cache(self):
+        for workspaces in [[{'id': 'duplicate'}, {'id': 'duplicate'}], [{'id': f'candidate-{i}'} for i in range(31)]]:
+            with self.subTest(count=len(workspaces)):
+                self.execute({'workspaces': workspaces}, '{}')
+                self.assertEqual(self.messages[-1], {'event': 'error', 'code': 'workspace', 'workspaces': []})
+                self.assertFalse(any(url.endswith('/workspace/select') for _, url in self.calls))
+
+
 class VendorContractTests(unittest.TestCase):
     def password_failure(self, first_code, *, next_status=200):
         messages, requests, sessions = [], [], []

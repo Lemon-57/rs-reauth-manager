@@ -30,7 +30,7 @@ class DiagnosticTests(unittest.TestCase):
     def test_free_selection_errors_are_workspace_errors_not_mfa_or_transport(self):
         for reason in ['free_workspace_missing', 'free_workspace_ambiguous']:
             value = describe_failure({'error': reason}, attempt={'stage': 'consent', 'httpStatus': 200})
-            self.assertEqual(value, {'code': 'protocol', 'diagnostic': {'stage': 'workspace', 'reason': reason, 'httpStatus': 200}})
+            self.assertEqual(value, {'code': 'protocol', 'diagnostic': {'stage': 'workspace', 'reason': reason, 'httpStatus': None}})
 
     def test_mfa_reasons_do_not_all_mean_wrong_secret(self):
         cases = {'mfa_totp_factor_not_available': 'mfa_factor_missing', 'mfa_totp_secret_required': 'mfa_secret_missing', 'mfa_totp_provider_invalid': 'mfa_provider_invalid', 'mfa_totp_code_unavailable': 'mfa_code_unavailable', 'mfa_totp_rejected_400': 'mfa_code_rejected', 'mfa_issue_challenge_http_403': 'mfa_issue_failed', 'mfa_primary_factor_required': 'primary_factor_required'}

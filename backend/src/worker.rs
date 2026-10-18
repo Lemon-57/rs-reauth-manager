@@ -241,7 +241,8 @@ impl Runtime {
                         .into();
                     }
                     Some(
-                        "complete" | "free_fallback" | "forced_workspace" | "forced_free" | "error",
+                        "complete" | "free_fallback" | "forced_workspace" | "forced_free"
+                        | "team_upgrade" | "error",
                     ) => {
                         data.result = Some(value);
                         break;

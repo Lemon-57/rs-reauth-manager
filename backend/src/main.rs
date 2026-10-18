@@ -364,15 +364,18 @@ impl Manager {
                 } else if output["event"] == "free_fallback"
                     || output["event"] == "forced_workspace"
                     || output["event"] == "forced_free"
+                    || output["event"] == "team_upgrade"
                 {
                     job.step = "saving".into();
                     let forced = output["event"] == "forced_workspace";
                     let forced_free = output["event"] == "forced_free";
+                    let upgraded = output["event"] == "team_upgrade";
                     if (forced
                         && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
                             || job.force_workspace_id.is_none()))
                         || (!forced && job.force_workspace_id.is_some())
                         || (forced_free && !job.free_fallback)
+                        || (upgraded && job.free_fallback)
                     {
                         job.finish("review", "工作区与管理员确认不一致，未写回");
                         host::save(host, &queue, version).await?;
@@ -381,7 +384,12 @@ impl Manager {
                     match recovery::commit(host, &job.account_id, &current.snapshot, &output).await
                     {
                         Ok(()) => {
-                            if forced {
+                            if upgraded {
+                                job.finish(
+                                    "success",
+                                    "已切换到同一用户的唯一 Team 工作区，已开启调度",
+                                );
+                            } else if forced {
                                 job.finish(
                                     "success",
                                     "管理员已确认，其他工作区授权已写回原账号，已停止调度",
@@ -453,7 +461,7 @@ impl Manager {
                 let proxy=proxy(host,&a).await?;
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback});
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback});
                 self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
             }.await;
             match result {

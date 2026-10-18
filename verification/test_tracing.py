@@ -12,6 +12,22 @@ from diagnostics import describe_failure, stage_for_url
 
 
 class TracingTests(unittest.TestCase):
+    def test_token_posts_never_follow_redirects_or_forward_code_to_another_origin(self):
+        for method in ['post', 'request']:
+            calls = []
+            response = types.SimpleNamespace(status_code=307, json=lambda: {}, headers={'Location': 'https://other.example/token'})
+            session = types.SimpleNamespace()
+            setattr(session, method, lambda *args, **kw: calls.append((args, kw)) or response)
+            wrapped = ObservedSession(session, lambda attempt: None)
+            args = ('POST', 'https://auth.openai.com/oauth/token') if method == 'request' else ('https://auth.openai.com/oauth/token',)
+            wrapped_method = getattr(wrapped, method)
+            self.assertIs(wrapped_method(*args, data={'code': 'private-code', 'code_verifier': 'private-verifier'}, allow_redirects=True), response)
+            self.assertEqual(len(calls), 1)
+            self.assertIs(calls[0][1]['allow_redirects'], False)
+
+    def test_session_dump_has_its_own_stage(self):
+        self.assertEqual(stage_for_url('https://auth.openai.com/api/accounts/client_auth_session_dump'), 'session_lookup')
+
     def test_page_and_direct_post_stages_are_distinct(self):
         cases = {
             'https://auth.openai.com/log-in': 'login_page',

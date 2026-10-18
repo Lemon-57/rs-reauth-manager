@@ -13,6 +13,61 @@ class WorkspaceUnavailable(ValueError):
         self.personal_id = personal_id
 
 
+class WorkspaceUpgrade(ValueError):
+    def __init__(self, workspace_id):
+        super().__init__('workspace')
+        self.workspace_id = workspace_id
+
+
+def team_candidate(session, original):
+    if not isinstance(session, dict):
+        return None
+    workspaces = session.get('workspaces')
+    if not isinstance(workspaces, list):
+        return None
+    if len(workspaces) > 30 or any(not isinstance(w, dict) or not isinstance(w.get('id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', w['id']) for w in workspaces):
+        raise ValueError('workspace_evidence_invalid')
+    if len({w['id'] for w in workspaces}) != len(workspaces):
+        raise ValueError('workspace_evidence_invalid')
+    candidates = []
+    for workspace in workspaces:
+        if workspace['id'] == original:
+            continue
+        kinds = {str(workspace.get(k) or '').strip().lower() for k in ['type', 'account_type', 'kind']}
+        plan = str(workspace.get('plan_type') or '').strip().lower()
+        if (kinds & {'team', 'business'} or plan in {'team', 'business'}) and not (workspace.get('is_personal') is True or kinds & {'personal', 'individual'} or plan not in {'', 'team', 'business'}):
+            candidates.append(workspace['id'])
+    if len(candidates) > 1:
+        raise ValueError('workspace')
+    return candidates[0] if candidates else None
+
+
+def merge_workspace_evidence(*sources):
+    merged = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        entries = source.get('workspaces', [])
+        if not isinstance(entries, list):
+            continue
+        if any(not isinstance(w, dict) or not isinstance(w.get('id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', w['id']) for w in entries):
+            raise ValueError('workspace_evidence_invalid')
+        if len({w['id'] for w in entries}) != len(entries):
+            raise ValueError('workspace_evidence_invalid')
+        for entry in entries:
+            record = merged.setdefault(entry['id'], {'id': entry['id']})
+            for key in ['type', 'account_type', 'kind', 'plan_type', 'is_personal']:
+                value = entry.get(key)
+                if value is None or value == '':
+                    continue
+                if key in record and record[key] != value:
+                    raise ValueError('workspace_evidence_invalid')
+                record[key] = value
+        if len(merged) > 30:
+            raise ValueError('workspace_evidence_invalid')
+    return {'workspaces': list(merged.values())}
+
+
 def free_workspace_candidate(session, original):
     """Choose only an unambiguous candidate; issued tokens must still prove Free."""
     if not isinstance(session, dict):
@@ -70,6 +125,13 @@ def personal_candidate(session, original):
     if len({w["id"] for w in workspaces}) != len(workspaces) or len(candidates) != 1:
         raise ValueError("workspace")
     return candidates[0]
+
+
+def automatic_free_candidate(session, original):
+    personal = personal_candidate(session, original)
+    if len(session['workspaces']) != 1:
+        raise ValueError('workspace')
+    return personal
 
 
 def claims(token):
@@ -139,6 +201,14 @@ def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, fo
         raise ValueError("fallback_identity")
     tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
     return verify_free_tokens(tokens, data["email"], data.get("userId"), personal_id, force=force)
+
+
+def recover_team(oauth, chat, authorize_url, data, workspace, authorize):
+    tokens = recover_free(oauth, chat, authorize_url, data, workspace, authorize, force=True)
+    _, _, plan = verify_tokens(tokens, data['email'], data.get('userId'), workspace, force=True)
+    if plan not in {'team', 'business'}:
+        raise ValueError('fallback_identity')
+    return tokens
 
 
 def recover_unbound_free(oauth, chat, authorize_url, data, authorize):

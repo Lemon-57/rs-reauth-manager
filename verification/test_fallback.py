@@ -95,6 +95,126 @@ class FallbackGuards(unittest.TestCase):
                 verify_free_tokens(original, EMAIL, "original-user", "personal-workspace")
 
 
+class AutomaticWorkspaceTransitions(unittest.TestCase):
+    def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None):
+        self.messages, self.calls = [], []
+        source = 'personal-workspace' if plan == 'free' else 'old-team'
+        target = 'new-team' if plan == 'free' else 'personal-workspace'
+        workspaces = workspaces if workspaces is not None else [
+            {'id': 'personal-workspace', 'type': 'personal', 'plan_type': 'free'},
+            *([{'id': 'new-team', 'type': 'team', 'plan_type': 'team'}] if plan == 'free' else []),
+        ]
+        cookie = {} if html_only else {'workspaces': workspaces}
+        data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': desktop_url(), 'accountId': source, 'userId': 'original-user', 'planType': plan}
+        query = {}
+        testcase = self
+        consent = 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent'
+        value = tokens()
+        for key in ['access_token', 'id_token']:
+            payload = json.loads(base64.urlsafe_b64decode(value[key].split('.')[1] + '=='))
+            payload[AUTH].update(chatgpt_account_id=target, chatgpt_plan_type=token_plan, chatgpt_user_id='wrong-user' if wrong_user else 'original-user')
+            value[key] = jwt(payload)
+        def response(url, status=200, body=None, location=None):
+            return types.SimpleNamespace(url=url, status_code=status, headers={'Location': location} if location else {}, text=json.dumps(body or {}), json=lambda: body or {})
+        class Session:
+            def __init__(self):
+                self.headers, self.cookies = {}, RequestsCookieJar()
+                self.cookies.set('oai-client-auth-session', json.dumps(cookie), domain='auth.openai.com')
+            def close(self):
+                pass
+            def request(self, method, url, **kwargs):
+                testcase.calls.append((method, url, kwargs.get('json')))
+                if method == 'GET' and urlsplit(url).path == '/oauth/authorize':
+                    query.update(parse_qs(urlsplit(url).query))
+                    return response(url, 302, location=consent)
+                if method == 'GET' and url == consent:
+                    return response(url, body={'workspaces': page_workspaces if page_workspaces is not None else workspaces})
+                if method == 'POST' and url.endswith('/workspace/select'):
+                    selected = kwargs['json']['workspace_id']
+                    testcase.assertIn(selected, {source, target})
+                    return response(url, 302, location=f'http://127.0.0.1:1455/auth/callback?state={query["state"][0]}&code=fixture-code')
+                raise AssertionError('Unexpected offline request')
+            def get(self, url, **kwargs):
+                testcase.assertTrue(url.endswith('/client_auth_session_dump'))
+                return response(url, 403)
+            def post(self, url, **kwargs):
+                testcase.assertTrue(url.endswith('/oauth/token'))
+                testcase.assertFalse(kwargs['allow_redirects'])
+                testcase.assertNotEqual(query['state'], ['fixture'])
+                verifier = kwargs['data']['code_verifier']
+                challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
+                testcase.assertEqual(query['code_challenge'], [challenge])
+                testcase.calls.append(('POST', url, None))
+                return response(url, body=value)
+        def session(**kwargs):
+            self.assertEqual(kwargs['proxy'], data['proxy'])
+            return Session()
+        with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **kw: self.messages.append({'event': event, **kw})):
+            runner.run(data)
+
+    def test_free_with_unique_team_switches_using_fresh_pkce(self):
+        for html_only in [False, True]:
+            with self.subTest(html_only=html_only):
+                self.execute(html_only=html_only)
+                self.assertEqual(self.messages[-1]['event'], 'team_upgrade')
+                self.assertEqual(self.messages[-1]['workspaceId'], 'new-team')
+                self.assertTrue(self.messages[-1]['uniqueTeamConfirmed'])
+                selected = [body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')]
+                self.assertEqual(selected, ['new-team'])
+
+    def test_team_only_free_remaining_automatically_falls_back(self):
+        self.execute(plan='team', token_plan='free')
+        self.assertEqual(self.messages[-1]['event'], 'free_fallback')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
+
+    def test_existing_team_remains_bound_even_with_other_teams(self):
+        self.execute(plan='team', workspaces=[{'id': 'old-team', 'type': 'team'}, {'id': 'another-team', 'type': 'team'}])
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+        self.assertFalse(any(url.endswith('/oauth/token') for _, url, _ in self.calls))
+
+    def test_multiple_team_candidates_require_manual_choice(self):
+        self.execute(workspaces=[{'id': 'personal-workspace', 'type': 'personal'}, {'id': 'one-team', 'type': 'team'}, {'id': 'two-team', 'type': 'team'}])
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+        self.assertEqual({w['id'] for w in self.messages[-1]['workspaces']}, {'one-team', 'two-team'})
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.calls))
+
+    def test_cookie_single_team_cannot_override_two_teams_on_current_page(self):
+        self.execute(page_workspaces=[{'id': 'new-team', 'type': 'team'}, {'id': 'second-team', 'type': 'team'}])
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.calls))
+
+    def test_cookie_only_original_free_can_still_select_it_on_plain_consent_page(self):
+        self.execute(workspaces=[{'id': 'personal-workspace', 'type': 'personal'}], page_workspaces=[])
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+
+    def test_conflicting_team_metadata_is_not_accepted_as_unique(self):
+        self.execute(page_workspaces=[{'id': 'new-team', 'type': 'personal'}])
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'workspace_evidence_invalid')
+
+    def test_free_without_team_keeps_personal_workspace(self):
+        self.execute(workspaces=[{'id': 'personal-workspace', 'type': 'personal', 'plan_type': 'free'}])
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+
+    def test_unknown_membership_is_not_automatically_promoted(self):
+        self.execute(workspaces=[{'id': 'personal-workspace', 'type': 'personal'}, {'id': 'new-team'}])
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+
+    def test_team_upgrade_rejects_nonteam_or_changed_identity(self):
+        for token_plan, wrong_user in [('free', False), ('plus', False), ('team', True)]:
+            with self.subTest(plan=token_plan, wrong_user=wrong_user):
+                self.execute(token_plan=token_plan, wrong_user=wrong_user)
+                self.assertEqual(self.messages[-1]['event'], 'error')
+                self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+
+    def test_other_team_remaining_does_not_trigger_automatic_free_downgrade(self):
+        self.execute(plan='team', token_plan='free', workspaces=[{'id': 'personal-workspace', 'type': 'personal'}, {'id': 'other-team', 'type': 'team'}])
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+
+
 class RealVendorFreeRecovery(unittest.TestCase):
     def execute(self, selection_page=False, bad_state=False, bad_tokens=False, user="original-user", force=False, token_status=200, token_json_invalid=False, invalid_mfa_once=False):
         messages, calls = [], []
@@ -231,6 +351,11 @@ class RealVendorFreeRecovery(unittest.TestCase):
         self.assertNotIn('private-response', json.dumps(self.messages))
         self.assertFalse(any(message['event'] == 'free_fallback' for message in self.messages))
 
+    def test_token_redirect_is_rejected_with_specific_reason(self):
+        self.execute(token_status=307)
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'token_redirect_rejected', 'httpStatus': 307})
+        self.assertFalse(any(message['event'] == 'free_fallback' for message in self.messages))
+
     def test_token_exchange_parse_failure_is_not_reported_as_proxy_or_identity(self):
         self.execute(token_json_invalid=True)
         self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'response_invalid_json', 'httpStatus': 200})
@@ -238,7 +363,7 @@ class RealVendorFreeRecovery(unittest.TestCase):
 
 
 class RealVendorForcedFreeConsent(unittest.TestCase):
-    def execute(self, workspaces=None, *, cookie=None, changed_tokens=None, bad_state=False, direct=False, selection_status=302):
+    def execute(self, workspaces=None, *, cookie=None, changed_tokens=None, bad_state=False, direct=False, selection_status=302, html_text=None, dump_status=200, dump_timeout=False, intermediate=False, intermediate_status=200):
         self.messages, self.calls = [], []
         exchanged = changed_tokens or tokens()
         if cookie is None:
@@ -273,7 +398,15 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
                     authorization.update(parse_qs(urlsplit(url).query))
                     return response(url, 302, location=callback() if direct else consent)
                 if method == 'GET' and url == consent:
+                    if intermediate:
+                        return response(url, 200, body={'continue_url': 'https://auth.openai.com/next-consent'})
+                    if html_text is not None:
+                        return types.SimpleNamespace(status_code=200, url=url, headers={}, text=html_text, json=lambda: {})
                     return response(url, 200, body={'page': {'type': 'codex_consent'}})
+                if method == 'GET' and url == 'https://auth.openai.com/next-consent':
+                    if intermediate_status != 200:
+                        return response(url, intermediate_status)
+                    return types.SimpleNamespace(status_code=200, url=url, headers={}, text=html_text or '{"workspace_id":"personal-workspace"}', json=lambda: {})
                 if method == 'POST' and url == 'https://auth.openai.com/api/accounts/workspace/select':
                     testcase.assertEqual(kwargs['json'], {'workspace_id': 'personal-workspace'})
                     if selection_status != 302:
@@ -294,7 +427,9 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
             def get(self, url, **kwargs):
                 testcase.assertEqual(url, 'https://auth.openai.com/api/accounts/client_auth_session_dump')
                 testcase.calls.append(('GET', url))
-                return response(url, 200, body=cookie)
+                if dump_timeout:
+                    raise TimeoutError('private-proxy')
+                return response(url, dump_status, body=cookie if dump_status == 200 else {})
 
             def close(self):
                 pass
@@ -319,6 +454,66 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         self.assertTrue(self.messages[-1]['administratorConfirmed'])
         self.assertEqual([method for method, _ in self.calls], ['GET', 'GET', 'POST', 'POST'])
         self.assertNotIn('fixture-private-rt', json.dumps(self.messages[:-1]))
+
+    def test_cookie_dump_403_does_not_block_html_workspace_fallback(self):
+        self.execute(cookie={}, dump_status=403, html_text='<script type="application/json">{"workspace_id":"personal-workspace"}</script>')
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
+        self.assertEqual(sum(url.endswith('/workspace/select') for _, url in self.calls), 1)
+
+    def test_cookie_dump_timeout_does_not_block_html_workspace_fallback(self):
+        self.execute(cookie={}, dump_timeout=True, html_text='{"workspace_id":"personal-workspace"}')
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+
+    def test_intermediate_consent_without_ids_can_continue_to_workspace_page(self):
+        self.execute(cookie={}, dump_status=403, intermediate=True)
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+        self.assertTrue(any(url.endswith('/next-consent') for _, url in self.calls))
+
+    def test_later_http_failure_is_not_overwritten_by_earlier_dump_failure(self):
+        self.execute(cookie={}, dump_status=403, intermediate=True, intermediate_status=429)
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'rate_limited')
+        self.assertEqual(self.messages[-1]['diagnostic']['httpStatus'], 429)
+
+    def test_missing_html_and_denied_session_reports_lookup_not_free_absence(self):
+        self.execute(cookie={}, dump_status=403, html_text='<html>consent</html>')
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'session_lookup', 'reason': 'http_rejected', 'httpStatus': 403})
+
+    def test_multiple_html_candidates_are_not_arbitrarily_selected(self):
+        self.execute(cookie={}, dump_status=403, html_text='{"workspace_id":"personal-workspace","nested":{"workspace_id":"another-workspace"}}')
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'free_workspace_ambiguous')
+        self.assertIsNone(self.messages[-1]['diagnostic']['httpStatus'])
+        self.assertFalse(any(url.endswith('/workspace/select') for _, url in self.calls))
+
+    def test_dump_timeout_does_not_mask_local_html_ambiguity(self):
+        self.execute(cookie={}, dump_timeout=True, html_text='{"workspace_id":"personal-workspace","nested":{"workspace_id":"another-workspace"}}')
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'workspace', 'reason': 'free_workspace_ambiguous', 'httpStatus': None})
+
+    def test_referenced_router_metadata_selects_personal_not_first_team(self):
+        table = [{'_1': 2}, 'workspaces', [3, 8], {'_4': 5, '_6': 7}, 'id', 'team-workspace', 'type', 'team', {'_4': 9, '_6': 10}, 'personal-workspace', 'personal']
+        html = '<script>window.stream.enqueue('+json.dumps(json.dumps(table))+');</script>'
+        self.execute(cookie={}, dump_status=403, html_text=html)
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
+
+    def test_ambiguous_cookie_cannot_be_bypassed_by_a_single_html_candidate(self):
+        self.execute([{'id': 'personal-workspace'}, {'id': 'second'}], html_text='{"workspace_id":"personal-workspace"}')
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'free_workspace_ambiguous')
+
+    def test_html_candidate_does_not_relax_final_free_identity_checks(self):
+        changed = tokens()
+        for key in ['id_token', 'access_token']:
+            payload = json.loads(base64.urlsafe_b64decode(changed[key].split('.')[1] + '=='))
+            payload[AUTH]['chatgpt_plan_type'] = 'team'
+            changed[key] = jwt(payload)
+        self.execute(cookie={}, dump_status=403, html_text='{"workspace_id":"personal-workspace"}', changed_tokens=changed)
+        self.assert_no_writeback()
+        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
 
     def test_explicit_free_can_select_personal_even_if_original_team_is_listed(self):
         self.execute([{'id': 'original-workspace', 'type': 'team'}, {'id': 'personal-workspace', 'type': 'personal'}])
@@ -361,7 +556,7 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
             with self.subTest(cookie=cookie):
                 self.execute(cookie=cookie)
                 self.assert_no_writeback()
-                self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'workspace', 'reason': reason, 'httpStatus': 200})
+                self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'workspace', 'reason': reason, 'httpStatus': None})
                 self.assertFalse(any(method == 'POST' for method, _ in self.calls))
 
     def test_wrong_state_never_exchanges_tokens(self):

@@ -13,6 +13,7 @@ STAGES = {
     '/api/accounts/passwordless/send-otp': 'email_send',
     '/api/accounts/workspace/select': 'workspace',
     '/api/accounts/organization/select': 'organization',
+    '/api/accounts/client_auth_session_dump': 'session_lookup',
     '/oauth/token': 'token_exchange',
     '/log-in/password': 'password_page',
     '/log-in': 'login_page',
@@ -62,6 +63,8 @@ REASONS = {
     'fallback_identity': ('fallback_identity', 'identity_unconfirmed'),
     'free_workspace_missing': ('protocol', 'free_workspace_missing'),
     'free_workspace_ambiguous': ('protocol', 'free_workspace_ambiguous'),
+    'workspace_evidence_invalid': ('protocol', 'workspace_evidence_invalid'),
+    'workspace_selection_failed': ('protocol', 'workspace_selection_failed'),
 }
 
 MFA_ERRORS = {
@@ -172,7 +175,7 @@ def describe_failure(result=None, *, attempt=None, exception=None):
             final_url = protocol.get('final_url') if isinstance(protocol, dict) else result.get('final_url')
             stage = stage_for_url(final_url)
     observed_error = attempt.get('upstreamError')
-    if (reason not in REASONS or reason in {'token_exchange_failed', 'login_continue_failed', 'oauth_callback_not_found', 'oauth_callback_timeout', 'mfa_totp_verification_failed'}) and isinstance(observed_error, str) and observed_error in (REASONS.keys() | MFA_ERRORS.keys()):
+    if (reason not in REASONS or reason in {'token_exchange_failed', 'login_continue_failed', 'oauth_callback_not_found', 'oauth_callback_timeout', 'mfa_totp_verification_failed', 'workspace_selection_failed'}) and isinstance(observed_error, str) and observed_error in (REASONS.keys() | MFA_ERRORS.keys()):
         reason = observed_error
     # 旧上游会用通用失败覆盖具体 HTTP 原因，优先读取该次响应的已知 MFA 码
     observed_mfa = attempt.get('mfaError')
@@ -180,8 +183,11 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         reason = observed_mfa
     if reason == 'mfa_totp_code_unavailable':
         return mfa_generation_failure('mfa_code_unavailable')
-    if reason in {'free_workspace_missing', 'free_workspace_ambiguous'}:
+    if reason in {'free_workspace_missing', 'free_workspace_ambiguous', 'workspace_evidence_invalid'}:
         stage = 'workspace'
+        status = None
+        attempt = {}
+        exception = None
     login_state_invalid = reason == 'invalid_state' and stage in {'login', 'password'} and status in {400, 409}
     if reason in {'fallback_identity', 'state', 'invalid_state'} and not (reason == 'invalid_state' and (stage in {'mfa_verify', 'mfa_issue'} or login_state_invalid)):
         stage = 'identity' if reason == 'fallback_identity' else 'callback'
@@ -197,9 +203,11 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         code, detail = 'proxy', transport_reason(exception) if exception is not None else safe_transport
     elif exception is not None:
         detail = 'protocol_processing_failed'
+    elif stage == 'token_exchange' and status is not None and 300 <= status < 400:
+        detail = 'token_redirect_rejected'
     elif status is not None and 200 <= status < 300 and attempt.get('responseState') in ('invalid_json', 'invalid_shape'):
         detail = 'response_invalid_json' if attempt['responseState'] == 'invalid_json' else 'response_invalid_shape'
-    elif reason in {'login_continue_failed', 'token_exchange_failed', 'oauth_callback_not_found', 'oauth_callback_timeout'} and status is not None and status >= 400:
+    elif reason in {'login_continue_failed', 'token_exchange_failed', 'oauth_callback_not_found', 'oauth_callback_timeout', 'workspace_selection_failed'} and status is not None and status >= 400:
         detail = 'upstream_unavailable' if status >= 500 else 'http_rejected'
     elif stage in {'mfa_verify', 'mfa_issue'} and reason in MFA_ERRORS:
         code, detail = 'mfa', MFA_ERRORS[reason]

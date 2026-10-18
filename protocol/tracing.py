@@ -12,6 +12,12 @@ class ObservedSession:
         return getattr(self._session, name)
 
     def _call(self, invoke, url, **kwargs):
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed and parsed.scheme == 'https' and parsed.netloc == 'auth.openai.com' and parsed.path == '/oauth/token':
+            kwargs['allow_redirects'] = False
         attempt = {'stage': stage_for_url(url), 'httpStatus': None}
         self._record(attempt)
         try:
@@ -35,6 +41,8 @@ class ObservedSession:
                     attempt['responseState'] = 'invalid_shape'
                 else:
                     error = body.get('error')
+                    if error and attempt['stage'] in {'workspace', 'organization'}:
+                        attempt['hasError'] = True
                     codes = [error.get('code'), error.get('type')] if isinstance(error, dict) else [error]
                     for code in codes:
                         if isinstance(code, str) and code.lower() in (REASONS.keys() | MFA_ERRORS.keys()):

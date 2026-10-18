@@ -21,7 +21,7 @@ accounts[0].groups.push({ id: 'g2', name: 'Shared Group', privateField: 'fixture
 free.groups = []
 const revisions = new Map(accounts.map(a => [a.id, 1]))
 const records = new Map(), handles = new Map(), starts = [], completes = []
-const disables = [], saves = [], credentials = new Map()
+const disables = [], enables = [], saves = [], credentials = new Map()
 function credential(a) {
   return { account_id: a.id, provider_id: 'openai', credential_revision: revisions.get(a.id), facts: { name: a.name, authentication_kind: 'oauth', material: { schema_version: 1, installation_id: '3d07c9c6-3b57-4a12-a51d-1e21df254477', transport: 'http', principal: { oauth_subject: 'original-subject', poid: null }, access_token: 'old-access', refresh_token: 'old-secret-rt', id_token: 'old-id', oauth_client_id: 'fixture', oauth_scope: 'openid', cookies: [{ name: 'fixture', value: 'fixture-cookie' }] }, email: a.email, upstream_user_id: a.userId, upstream_account_id: a.accountId, plan_type: a.planType, has_refresh_token: true, access_token_expires_at_ms: null, next_refresh_at_ms: null } }
 }
@@ -54,7 +54,7 @@ async function callback(meta, payload) {
     assert.equal(a.enabled, false); assert.equal(a.capacity.usedSlots, 0); assert.equal(data.credential_revision, revisions.get(a.id))
     for (const key of ['installation_id', 'transport', 'cookies', 'oauth_client_id', 'oauth_scope']) assert.deepEqual(data.facts.material[key], old.facts.material[key])
     assert.equal(data.facts.email, old.facts.email); assert.equal(data.facts.upstream_user_id, old.facts.upstream_user_id); assert.equal(data.facts.name, old.facts.name)
-    assert.equal(data.facts.plan_type, a.id.startsWith('force_') ? 'plus' : 'free'); assert.equal(data.facts.upstream_account_id, a.id.startsWith('force_') ? 'alternate-workspace' : 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
+    assert.equal(data.facts.plan_type, a.id.startsWith('up_') ? 'team' : a.id.startsWith('force_') ? 'plus' : 'free'); assert.equal(data.facts.upstream_account_id, a.id.startsWith('up_') ? 'team-workspace' : a.id.startsWith('force_') ? 'alternate-workspace' : 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
     saves.push(a.id)
     if (a.id === 'fb_save_failure') return result(meta.id, {}, {})
     a.accountId = data.facts.upstream_account_id; a.planType = data.facts.plan_type; a.status = 'normal'
@@ -86,11 +86,22 @@ async function callback(meta, payload) {
     }
     else if (url.pathname === '/api/admin/accounts/oauth/start') { assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountId', 'name', 'provider']); starts.push(structuredClone(data)); dataReply = { flowId: `flow_${data.accountId}`, authorizationUrl: nativeAuthorization }; status = 201 }
     else if (url.pathname === '/api/admin/accounts/batch-update') {
-      assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountIds', 'enabled']); assert.equal(data.accountIds.length, 1); assert.equal(data.enabled, false)
+      assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountIds', 'enabled']); assert.equal(data.accountIds.length, 1)
       const a = accounts.find(a => a.id === data.accountIds[0]); assert.equal(a.capacity.usedSlots, 0)
+      if (data.enabled === true) {
+        assert.ok(a.id.startsWith('up_')); assert.ok(saves.includes(a.id)); assert.equal(a.planType, 'team'); assert.equal(a.enabled, false)
+        enables.push(a.id)
+        if (a.id === 'up_enable_fail') { status = 502; code = 50201 } else {
+          a.enabled = true
+          if (a.id === 'up_enable_uncertain') { status = 502; code = 50201 }
+        }
+        dataReply = {}
+      } else {
+      assert.equal(data.enabled, false)
       disables.push(a.id); dataReply = {}
       if (a.id === 'fb_disable_failure') { status = 502; code = 50201 }
       else { a.enabled = false; if (a.id === 'fb_disable_race') revisions.set(a.id, revisions.get(a.id) + 1); if (a.id === 'fb_inflight_race') a.capacity.usedSlots = 1 }
+      }
     }
     else if (url.pathname === '/api/admin/accounts/oauth/complete') {
       assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['callbackUrl', 'flowId', 'provider']); completes.push(structuredClone(data)); const a = accounts.find(a => `flow_${a.id}` === data.flowId)
@@ -166,6 +177,26 @@ try {
   failComplete = true; await submit(['uncertain']); assert.equal((await finish('uncertain')).status, 'review'); const committed = completes.length; await tick(); await tick(); assert.equal(completes.length, committed); failComplete = false; check('Uncertain native commit is never automatically replayed')
   await submit(['slow', 'good']); await tick(); await stop(); await start(); await request('jobs'); assert.equal(job('slow').status, 'interrupted'); assert.equal(job('good').status, 'interrupted'); const prior = starts.length; await tick(); assert.equal(starts.length, prior); check('Restart interrupts all queued/running tasks without automatic credential submission')
   function fallbackAccount(id) { const a = make(id); a.userId = 'original-user'; accounts.push(a); revisions.set(id, 1); return a }
+  for (const id of ['up_good', 'up_disabled', 'up_wrong_plan', 'up_wrong_user', 'up_no_proof', 'up_nonfree_source', 'up_enable_fail', 'up_enable_uncertain', 'up_changed', 'up_active']) {
+    const a = fallbackAccount(id); a.planType = id === 'up_nonfree_source' ? 'team' : 'free'; a.enabled = id !== 'up_disabled'
+    const old = structuredClone(a), saved = saves.length, enabled = enables.length, disabled = disables.length
+    await submit([id]); await tick()
+    if (id === 'up_changed') a.weight = 6
+    if (id === 'up_active') a.capacity.usedSlots = 1
+    const done = await finish(id)
+    if (['up_good', 'up_disabled'].includes(id)) {
+      assert.equal(done.status, 'success'); assert.match(done.message, /唯一 Team.*已开启调度/)
+      assert.equal(a.planType, 'team'); assert.equal(a.accountId, 'team-workspace'); assert.equal(a.enabled, true)
+      assert.equal(enables.length, enabled + 1); assert.equal(saves.length, saved + 1)
+      for (const k of ['id', 'email', 'userId', 'name', 'groups', 'notes', 'outboundProxyEndpoint', 'weight', 'concurrencyLimit', 'modelAccess']) assert.deepEqual(a[k], old[k])
+    } else {
+      assert.equal(done.status, 'review')
+      if (['up_enable_fail', 'up_enable_uncertain'].includes(id)) { assert.equal(a.enabled, id === 'up_enable_uncertain'); assert.equal(saves.length, saved + 1) }
+      else { assert.equal(saves.length, saved); assert.equal(enables.length, enabled); assert.equal(disables.length, disabled) }
+    }
+    const committed = saves.length, started = enables.length; await tick(); assert.equal(saves.length, committed); assert.equal(enables.length, started)
+    check(`${id}: automatic Free-to-Team validates identity and CAS, enables only after verified save, never replays uncertainty`)
+  }
   for (const id of ['fb_good', 'fb_disabled', 'fb_already_free']) {
     const a = fallbackAccount(id)
     if (id === 'fb_disabled') a.enabled = false

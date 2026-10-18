@@ -31,10 +31,15 @@ elif data["email"].startswith("force_") and not data.get("forceWorkspaceId"):
     print(json.dumps({"event": "error", "code": "workspace", "workspaces": [{"id": "alternate-workspace"}, {"id": "second-workspace"}]}), flush=True)
 elif data["email"].startswith("free_fallback_no_candidates") and not data.get("forceFree"):
     print(json.dumps({"event": "error", "code": "workspace", "workspaces": []}), flush=True)
-elif data["email"].startswith(("fb_", "force_", "free_fallback_no_candidates")):
+elif data["email"].startswith(("fb_", "force_", "up_", "free_fallback_no_candidates")):
     name = data["email"].split('@')[0]
     auth = {"chatgpt_account_id": "personal-workspace", "chatgpt_user_id": data.get("userId"), "chatgpt_plan_type": "free"}
     forced = bool(data.get("forceWorkspaceId"))
+    upgraded = name.startswith('up_')
+    if upgraded:
+        auth.update(chatgpt_account_id='team-workspace', chatgpt_plan_type='team')
+        if name == 'up_wrong_plan': auth['chatgpt_plan_type'] = 'free'
+        if name == 'up_wrong_user': auth['chatgpt_user_id'] = 'wrong-user'
     if forced:
         auth["chatgpt_account_id"] = data["forceWorkspaceId"]
         auth["chatgpt_plan_type"] = "plus"
@@ -55,6 +60,8 @@ elif data["email"].startswith(("fb_", "force_", "free_fallback_no_candidates")):
         claims["exp"] = 1
     token = "fixture." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=') + ".signature"
     output = {"event": "free_fallback", "workspaceId": "personal-workspace", "originalWorkspaceId": data["accountId"], "originalWorkspaceUnavailable": name != "fb_proof", "tokens": {"access_token": token, "id_token": token, "refresh_token": "fallback-private-rt"}}
+    if upgraded:
+        output.update(event='team_upgrade', workspaceId='team-workspace', uniqueTeamConfirmed=name != 'up_no_proof')
     if forced:
         output.update(event="forced_workspace", workspaceId=data["forceWorkspaceId"], administratorConfirmed=True)
         if name == "force_no_confirmation":

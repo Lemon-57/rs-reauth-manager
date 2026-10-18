@@ -35,6 +35,7 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "phone_send" => "发送手机验证码",
         "phone_verify" => "提交手机验证码",
         "session" => "初始化登录会话",
+        "session_lookup" => "读取登录会话及工作区",
         "login" => "提交登录身份",
         "password" => "密码验证",
         "mfa_factor" => "识别 2FA 验证器",
@@ -102,8 +103,15 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "callback_hops_exhausted" => "授权跳转达到上限，未取得回调",
         "login_continue_failed" => "上游登录步骤未返回可继续的授权地址",
         "token_exchange_failed" => "授权码换取令牌未成功，未写回",
+        "token_redirect_rejected" => {
+            "令牌交换接口返回重定向，已拒绝跟随，不向其他地址转发授权码或 PKCE verifier"
+        }
         "state_mismatch" => "授权回调 state 校验未通过，未写回",
         "workspace_unmatched" => "无法匹配原账号工作区，已停止写回",
+        "workspace_evidence_invalid" => {
+            "授权页的工作区数据格式无效、相互冲突或超出数量限制，未自动选择或写回"
+        }
+        "workspace_selection_failed" => "上游未接受工作区或组织选择，未继续授权或写回",
         "free_workspace_missing" => "授权页面未提供可安全选择的个人 Free 候选工作区，未写回",
         "free_workspace_ambiguous" => {
             "授权页面存在多个候选工作区，无法唯一确定个人 Free 工作区，未自动选择或写回"
@@ -220,6 +228,24 @@ mod tests {
             "fallback",
         );
         assert!(!unknown.contains("private-secret"));
+    }
+
+    #[test]
+    fn lookup_and_redirect_errors_do_not_claim_no_free_account() {
+        let lookup = message(
+            &json!({"diagnostic":{"stage":"session_lookup","reason":"http_rejected","httpStatus":403}}),
+            "fallback",
+        );
+        assert!(lookup.starts_with("读取登录会话及工作区"));
+        assert!(lookup.contains("HTTP 403"));
+        assert!(!lookup.contains("Free"));
+        let redirect = message(
+            &json!({"diagnostic":{"stage":"token_exchange","reason":"token_redirect_rejected","httpStatus":307,"location":"private-url"}}),
+            "fallback",
+        );
+        assert!(redirect.contains("已拒绝跟随"));
+        assert!(redirect.contains("HTTP 307"));
+        assert!(!redirect.contains("private-url"));
     }
 
     #[test]

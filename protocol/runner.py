@@ -13,6 +13,7 @@ import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from diagnostics import describe_failure, mfa_generation_failure, response_mfa_error, retry_action, stage_for_url, transport_reason
 from tracing import ObservedSession
+from workspace_pages import workspace_page
 
 
 def emit(event, **fields):
@@ -70,11 +71,7 @@ def error_code(result):
 
 
 def workspace_ids_from_text(text, original):
-    values = []
-    for value in re.findall(r'(?i)(?:workspace_id|workspaceId)[^A-Za-z0-9_-]{0,8}([A-Za-z0-9_-]{8,128})', str(text)):
-        if value != original and value not in values:
-            values.append(value)
-    return values
+    return [w['id'] for w in workspace_page(text)['workspaces'] if w['id'] != original]
 
 
 def run(data):
@@ -108,11 +105,12 @@ def _run_once(data, used_codes):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
-    from fallback import WorkspaceUnavailable, free_workspace_candidate, personal_candidate, recover_free, recover_unbound_free, workspace_choices
+    from fallback import WorkspaceUnavailable, WorkspaceUpgrade, automatic_free_candidate, free_workspace_candidate, merge_workspace_evidence, recover_free, recover_team, recover_unbound_free, team_candidate, workspace_choices
 
     target = str(data.get("accountId") or "")
     forced = data.get("forceWorkspaceId")
     forced_free = data.get("forceFree") is True
+    auto_team = str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
     if forced is not None and (not isinstance(forced, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", forced) or forced == target):
         raise ValueError("workspace")
 
@@ -125,6 +123,9 @@ def _run_once(data, used_codes):
         failed_authorization = None
         last_mfa_verification = None
         local_mfa_failure = None
+        session_evidence = None
+        session_lookup_failure = None
+        unresolved_workspace = None
 
         def _oauth_request(self, method, url, **kwargs):
             self.last_attempt = {'stage': stage_for_url(url), 'httpStatus': None}
@@ -144,6 +145,13 @@ def _run_once(data, used_codes):
                 self.last_attempt['mfaError'] = response_mfa_error(response)
             if self.last_attempt['stage'] == 'mfa_verify':
                 self.last_mfa_verification = describe_failure(attempt=self.last_attempt)
+            if self.last_attempt['stage'] in {'workspace', 'organization'}:
+                status = self.last_attempt['httpStatus']
+                if status not in {200, 201, 204, 301, 302, 303, 307, 308} or self.last_attempt.get('hasError') or (status in {200, 201} and self.last_attempt.get('responseState')):
+                    self.failed_authorization = describe_failure({'error': 'workspace_selection_failed'}, attempt=self.last_attempt)
+                    raise ValueError('workspace_selection_failed')
+                if self.last_attempt['stage'] == 'workspace' and kwargs.get('json', {}).get('workspace_id') == self.selected_workspace:
+                    self.bound_workspace = True
             return response
 
         def _exchange_code_for_tokens(self, *args, **kwargs):
@@ -165,49 +173,89 @@ def _run_once(data, used_codes):
 
         def _extract_workspace_id_from_session(self):
             selected = self.selected_workspace
+            session = self._decode_oauth_session_cookie()
+            self.session_evidence = session
+            self.session_lookup_failure = None
+            if session is None and self.last_attempt and self.last_attempt.get('stage') == 'session_lookup' and (self.last_attempt.get('transport') or self.last_attempt.get('responseState') or (self.last_attempt.get('httpStatus') or 0) >= 400):
+                self.session_lookup_failure = describe_failure(attempt=self.last_attempt)
+            for choice in workspace_choices(session, target):
+                self._remember_workspace(choice['id'])
+            if auto_team and selected == target:
+                return ''
             if not selected:
                 if self.unbound_workspace:
-                    selected = free_workspace_candidate(self._decode_oauth_session_cookie(), target)
+                    try:
+                        selected = free_workspace_candidate(session, target)
+                    except ValueError as exc:
+                        if str(exc) == 'free_workspace_missing':
+                            return ''
+                        raise
                     self.selected_workspace = selected
                     return selected
                 raise ValueError("workspace")
-            session = self._decode_oauth_session_cookie() or {}
-            workspaces = session.get("workspaces") or []
-            if isinstance(session.get("workspace_id"), str):
-                self._remember_workspace(session.get("workspace_id"))
-            if isinstance(workspaces, list):
-                for item in workspaces:
-                    if isinstance(item, dict):
-                        self._remember_workspace(item.get("id"))
+            session = session if isinstance(session, dict) else {}
+            workspaces = session.get("workspaces")
+            workspaces = workspaces if isinstance(workspaces, list) else []
             if session.get("workspace_id") == selected or any(isinstance(w, dict) and w.get("id") == selected for w in workspaces):
                 return selected
-            if selected == target:
-                try:
-                    personal = personal_candidate(session, target)
-                except ValueError:
-                    return ""
-                raise WorkspaceUnavailable(personal)
             return ""
 
         def _extract_workspace_id_from_html(self, html_text):
-            text = str(html_text)
-            for value in workspace_ids_from_text(text, target):
-                self._remember_workspace(value)
-            if self.selected_workspace and self.selected_workspace in text:
+            evidence = workspace_page(html_text)
+            for choice in workspace_choices(evidence, target):
+                self._remember_workspace(choice['id'])
+            ids = {workspace['id'] for workspace in evidence['workspaces']}
+            if auto_team and self.selected_workspace == target:
+                combined = merge_workspace_evidence(self.session_evidence, evidence)
+                team = team_candidate(combined, target)
+                if team:
+                    raise WorkspaceUpgrade(team)
+                session = self.session_evidence if isinstance(self.session_evidence, dict) else {}
+                if any(w['id'] == target for w in combined['workspaces']) or session.get('workspace_id') == target:
+                    return target
+            if self.selected_workspace and self.selected_workspace in ids:
                 return self._remember_workspace(self.selected_workspace)
+            if not ids:
+                personal = None
+                if self.selected_workspace == target:
+                    try:
+                        personal = automatic_free_candidate(self.session_evidence, target)
+                    except ValueError:
+                        pass
+                failure = self.session_lookup_failure
+                if failure is None:
+                    failure = describe_failure({'error': 'free_workspace_missing'}) if self.unbound_workspace else {'code': 'workspace', 'workspaces': []}
+                self.unresolved_workspace = {'attempt': self.last_attempt, 'failure': failure, 'personal': personal}
+                # 让原库继续处理 continue_url / 嵌入跳转，不能把中间页当作最终失败。
+                return ''
             if self.unbound_workspace:
-                return ""
+                try:
+                    selected = free_workspace_candidate(evidence, target)
+                except ValueError as exc:
+                    if str(exc) == 'free_workspace_missing' and not ids and self.session_lookup_failure:
+                        self.failed_authorization = self.session_lookup_failure
+                    raise
+                self.selected_workspace = selected
+                return selected
+            if self.selected_workspace == target:
+                for source in [evidence, self.session_evidence]:
+                    try:
+                        personal = automatic_free_candidate(source, target)
+                    except ValueError:
+                        continue
+                    if personal in ids:
+                        raise WorkspaceUnavailable(personal)
+            if not ids and self.session_lookup_failure:
+                self.failed_authorization = self.session_lookup_failure
             raise ValueError("workspace")
 
-        def _select_workspace_for_callback(self, *args, **kwargs):
-            result = super()._select_workspace_for_callback(*args, **kwargs)
-            if result and any(result):
-                self.bound_workspace = True
-            return result
-
         def workspace_matches(self):
+            if self.bound_workspace:
+                return bool(self.selected_workspace)
             session = self._decode_oauth_session_cookie() or {}
-            ids = [w.get("id") for w in session.get("workspaces", []) if isinstance(w, dict)]
+            self.session_evidence = session
+            workspaces = session.get('workspaces')
+            ids = [w.get("id") for w in workspaces if isinstance(w, dict)] if isinstance(workspaces, list) else []
             selected = self.selected_workspace
             return bool(selected) and (self.bound_workspace or session.get("workspace_id") == selected or ids == [selected])
 
@@ -258,8 +306,20 @@ def _run_once(data, used_codes):
             oauth.failed_authorization = None
             oauth.last_mfa_verification = None
             oauth.local_mfa_failure = None
+            oauth.bound_workspace = False
+            oauth.workspace_candidates = []
+            oauth.session_evidence = None
+            oauth.session_lookup_failure = None
+            oauth.unresolved_workspace = None
             result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
             if not isinstance(result, dict) or result.get('ok') is not True:
+                pending = oauth.unresolved_workspace
+                if isinstance(result, dict) and result.get('error') in {'oauth_callback_not_found', 'oauth_callback_timeout'} and pending and pending['attempt'] is oauth.last_attempt:
+                    if pending['personal']:
+                        raise WorkspaceUnavailable(pending['personal'])
+                    if pending['failure']['code'] == 'workspace':
+                        raise ValueError('workspace')
+                    oauth.failed_authorization = pending['failure']
                 oauth.failed_authorization = oauth.failed_authorization or oauth.local_mfa_failure or describe_failure(result, attempt=oauth.last_attempt)
             return result
 
@@ -281,6 +341,10 @@ def _run_once(data, used_codes):
                 return
             try:
                 result = authorize(authorize_url, state)
+            except WorkspaceUpgrade as upgrade:
+                tokens = recover_team(oauth, chat, authorize_url, data, upgrade.workspace_id, authorize)
+                emit('team_upgrade', workspaceId=upgrade.workspace_id, originalWorkspaceId=target, uniqueTeamConfirmed=True, tokens=tokens)
+                return
             except WorkspaceUnavailable as unavailable:
                 fallback(unavailable.personal_id)
                 return
@@ -288,8 +352,18 @@ def _run_once(data, used_codes):
                 return oauth.failed_authorization
             if result.get("state") != state or not result.get("code"):
                 raise ValueError("state")
+            if auto_team:
+                session = oauth._decode_oauth_session_cookie()
+                oauth.session_evidence = session
+                for choice in workspace_choices(session, target):
+                    oauth._remember_workspace(choice['id'])
+                team = team_candidate(session, target)
+                if team:
+                    tokens = recover_team(oauth, chat, authorize_url, data, team, authorize)
+                    emit('team_upgrade', workspaceId=team, originalWorkspaceId=target, uniqueTeamConfirmed=True, tokens=tokens)
+                    return
             if not oauth.workspace_matches():
-                fallback(personal_candidate(oauth._decode_oauth_session_cookie(), target))
+                fallback(automatic_free_candidate(oauth._decode_oauth_session_cookie(), target))
                 return
             callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
             emit("complete", callbackUrl=callback)
@@ -299,13 +373,15 @@ def _run_once(data, used_codes):
             if oauth.failed_authorization is not None:
                 return oauth.failed_authorization
             if str(exc) != "workspace":
-                return describe_failure({'error': str(exc)}, attempt=oauth.last_attempt, exception=None if str(exc) in {'state', 'fallback_identity', 'free_workspace_missing', 'free_workspace_ambiguous'} else exc)
-            choices = workspace_choices(oauth._decode_oauth_session_cookie(), target)
+                return describe_failure({'error': str(exc)}, attempt=oauth.last_attempt, exception=None if str(exc) in {'state', 'fallback_identity', 'free_workspace_missing', 'free_workspace_ambiguous', 'workspace_evidence_invalid'} else exc)
+            choices = workspace_choices(oauth.session_evidence, target)
             known = {item["id"] for item in choices}
             for value in getattr(oauth, "workspace_candidates", []):
-                if value not in known and len(choices) < 30:
+                if value not in known:
                     choices.append({"id": value})
                     known.add(value)
+            if len(choices) > 30:
+                choices = []
             return {'code': 'workspace', 'workspaces': choices}
         except Exception as exc:
             return oauth.local_mfa_failure or describe_failure(attempt=oauth.last_attempt, exception=exc)

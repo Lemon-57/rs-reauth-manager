@@ -53,8 +53,14 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
     let email = text(original, "email")?;
     let forced = output["event"] == "forced_workspace" && output["administratorConfirmed"] == true;
     let forced_free = output["event"] == "forced_free" && output["administratorConfirmed"] == true;
+    let upgraded = output["event"] == "team_upgrade"
+        && output["uniqueTeamConfirmed"] == true
+        && original["planType"]
+            .as_str()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"));
     if (!forced
         && !forced_free
+        && !upgraded
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
         || workspace == text(original, "accountId")?
@@ -79,9 +85,13 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
                 .as_str()
                 .or_else(|| auth["user_id"].as_str())
                 != Some(user)
-            || !auth["chatgpt_plan_type"]
-                .as_str()
-                .is_some_and(|p| !p.trim().is_empty() && (forced || p.eq_ignore_ascii_case("free")))
+            || !auth["chatgpt_plan_type"].as_str().is_some_and(|p| {
+                !p.trim().is_empty()
+                    && (forced
+                        || (upgraded
+                            && matches!(p.to_ascii_lowercase().as_str(), "team" | "business"))
+                        || (!upgraded && p.eq_ignore_ascii_case("free")))
+            })
         {
             return Err(fault(IDENTITY_ERROR));
         }
@@ -234,10 +244,32 @@ pub async fn commit(
         {
             return Err(fault("工作区授权凭据写回未确认"));
         }
+        if output["event"] == "team_upgrade" {
+            let pending_enable = detail(host, id).await?;
+            require_idle(&pending_enable)?;
+            if settings(&pending_enable) != expected
+                || pending_enable["_credentialRevision"] != result.credential_revision
+            {
+                return Err(fault("Team 调度开启前账号配置或凭据已变化"));
+            }
+            admin(
+                host,
+                "POST",
+                "/api/admin/accounts/batch-update",
+                Some(json!({"accountIds":[id],"enabled":true})),
+            )
+            .await?;
+            expected["enabled"] = json!(true);
+            let enabled = detail(host, id).await?;
+            if settings(&enabled) != expected
+                || enabled["_credentialRevision"] != result.credential_revision
+                || enabled["status"] != "normal"
+            {
+                return Err(fault("Team 调度开启结果未确认"));
+            }
+        }
         Ok(())
     }
     .await;
-    result.map_err(|_: PluginFault| {
-        fault("已执行停止调度，但工作区授权写回未确认，请人工核对；不会自动重试")
-    })
+    result.map_err(|_: PluginFault| fault("工作区授权或调度状态未确认，请人工核对；不会自动重试"))
 }
