@@ -32,3 +32,10 @@ export function parseTick(value: unknown): { ok: true } {
   if (!isRecord(value) || value.ok !== true) throw new Error('插件任务推进结果无效')
   return { ok: true }
 }
+export function parseDeletion(value: unknown): { deletedAccountIds: string[]; jobs: Job[] } {
+  if (!isRecord(value) || !Array.isArray(value.deletedAccountIds) || !value.deletedAccountIds.length
+    || !value.deletedAccountIds.every(id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id))
+    || new Set(value.deletedAccountIds).size !== value.deletedAccountIds.length)
+    throw new Error('插件删除结果格式无效，请刷新账号列表核对')
+  return { deletedAccountIds: value.deletedAccountIds, ...parseJobs(value) }
+}

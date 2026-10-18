@@ -33,6 +33,15 @@ try {
   handler = () => json({ accounts: [] }, 200, ' Application/JSON ; charset=utf-8')
   assert.deepEqual(await api.accounts(), { accounts: [] }); assert.deepEqual(calls.at(-1), { method: 'GET', path: 'api/accounts' }); check('Public bridge GET has no JSON declaration or body, MIME normalization matches workbench')
   handler = () => json({ jobs: [] })
+  handler = () => json({ deletedAccountIds: ['fixture'], jobs: [] })
+  assert.deepEqual(await api.deleteAccounts(['fixture']), { deletedAccountIds: ['fixture'], jobs: [] })
+  assert.deepEqual(calls.at(-1), { method: 'POST', path: 'api/delete', contentType: 'application/json', body: JSON.stringify({ accountIds: ['fixture'] }) })
+  for (const deletedAccountIds of [[], ['fixture','fixture'], [null]]) {
+    handler = () => json({ deletedAccountIds, jobs: [] })
+    await assert.rejects(api.deleteAccounts(['fixture']), /删除结果格式无效/)
+  }
+  check('Native-account deletion uses a single scoped POST without confirmation fields and validates business results')
+  handler = () => json({ jobs: [] })
   await api.forceSubmit('source-job', 'alternate-workspace', 'request-key')
   assert.deepEqual(JSON.parse(calls.at(-1).body), { sourceRequestId: 'source-job', workspaceId: 'alternate-workspace', requestId: 'request-key', confirmation: 'replace_workspace_and_disable' })
   assert.equal(calls.at(-1).path, 'api/force-submit')

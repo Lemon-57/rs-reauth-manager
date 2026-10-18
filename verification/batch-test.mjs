@@ -13,6 +13,7 @@ let accounts = [account('error'), account('missing', { notesValid: false, proxy:
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
 let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, submitGate = null, calls = [], latestBatch = null, checks = 0, mounted
+let deleteGate = null, throwAfterDelete = false, wrongDeleteResult = false
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
@@ -20,6 +21,14 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
   if (input.path === 'api/accounts') return reply({ accounts })
   if (input.path === 'api/jobs') return reply({ jobs })
   const body = input.body ? JSON.parse(input.body) : {}
+  if (input.path === 'api/delete') {
+    assert.deepEqual(Object.keys(body), ['accountIds'])
+    if (deleteGate) await deleteGate.promise
+    if (wrongDeleteResult) return reply({ deletedAccountIds: ['unexpected'], jobs })
+    accounts = accounts.filter(a => !body.accountIds.includes(a.id)); jobs = jobs.filter(j => !body.accountIds.includes(j.accountId))
+    if (throwAfterDelete) throw new Error('fixture deletion response lost')
+    return reply({ deletedAccountIds: body.accountIds, jobs })
+  }
   if (input.path === 'api/submit') {
     latestBatch = body.requestId
     jobs.push(...body.accountIds.map(id => job(id, 'queued', latestBatch)))
@@ -207,5 +216,39 @@ try {
   await state.submitFreeFallback(target)
   assert.equal(calls.filter(c => c.path === 'api/free-fallback').length, guardedCount + 1)
   check('Lost Free submission response is reconciled with the current batch and never automatically resubmitted')
+  state.filter.value = 'all'; state.search.value = ''; state.plan.value = 'all'; state.page.value = 1
+  state.selected.value = []; state.selectPage(true)
+  assert.equal(state.chosen.value.length, state.visible.value.length)
+  assert.ok(state.chosen.value.some(a => a.id === 'missing')); assert.ok(state.chosen.value.some(a => a.id === 'error'))
+  assert.ok(!state.reauthChosen.value.some(a => ['missing', 'error'].includes(a.id)))
+  assert.equal(state.pageSelected.value, true); assert.equal(state.pageIndeterminate.value, false)
+  state.selectOne('missing', false); assert.equal(state.pageSelected.value, false); assert.equal(state.pageIndeterminate.value, true)
+  check('Selection includes incomplete and queued accounts for deletion, while reauthorization keeps its own eligibility checks and partial state')
+  state.selected.value = ['missing', 'error']; deleteGate = Promise.withResolvers()
+  const deleteCount = calls.filter(c => c.path === 'api/delete').length
+  const deleting = state.deleteSelected()
+  assert.equal(state.deleting.value, true); await state.deleteSelected()
+  assert.equal(calls.filter(c => c.path === 'api/delete').length, deleteCount + 1)
+  assert.deepEqual(JSON.parse(calls.findLast(c => c.path === 'api/delete').body), { accountIds: ['error', 'missing'] })
+  deleteGate.resolve(); await deleting; deleteGate = null
+  assert.equal(state.busy.value, false); assert.equal(state.deleting.value, false); assert.deepEqual(state.selected.value, [])
+  assert.ok(!state.accounts.value.some(a => ['error', 'missing'].includes(a.id)))
+  assert.ok(!state.jobs.value.some(j => ['error', 'missing'].includes(j.accountId)))
+  assert.equal(state.active.value, 0); assert.match(state.notice.value, /删除 2 个账号/)
+  check('Delete submits immediately once without a dialog, removes accounts and queued jobs, and refreshes the directory')
+  const emptyCount = calls.filter(c => c.path === 'api/delete').length
+  await state.deleteSelected(); assert.equal(calls.filter(c => c.path === 'api/delete').length, emptyCount)
+  check('An empty selection never sends a deletion request')
+  state.selected.value = ['healthy']; wrongDeleteResult = true
+  await state.deleteSelected(); assert.match(state.error.value, /不一致/)
+  assert.ok(state.accounts.value.some(a => a.id === 'healthy')); assert.deepEqual(state.selected.value, ['healthy'])
+  wrongDeleteResult = false
+  check('A deletion response for different IDs does not remove local rows or report success')
+  throwAfterDelete = true
+  const lostDeleteCount = calls.filter(c => c.path === 'api/delete').length
+  await state.deleteSelected(); assert.equal(calls.filter(c => c.path === 'api/delete').length, lostDeleteCount + 1)
+  assert.match(state.error.value, /deletion response lost.*未自动重复删除/)
+  assert.ok(!state.accounts.value.some(a => a.id === 'healthy')); assert.deepEqual(state.selected.value, [])
+  check('A lost delete response refreshes actual account absence without replaying the destructive request')
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }

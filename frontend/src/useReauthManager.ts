@@ -6,6 +6,7 @@ import type { Account, Job } from './types'
 export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
+  const deleting = ref(false), notice = ref('')
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
   const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
@@ -60,9 +61,11 @@ export function useReauthManager() {
     return filter.value === 'all' || filter.value === 'error' && needsReauth(a) || filter.value === 'ready' && ready(a) || filter.value === 'active' && isActive(job) || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success' || filter.value === 'invalid' && (!a.notesValid || !a.proxy) || filter.value === 'disabled' && !a.enabled
   }))
   const visible = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
-  const pageCandidates = computed(() => visible.value.filter(ready))
+  const pageCandidates = computed(() => visible.value)
   const pageSelected = computed(() => !!pageCandidates.value.length && pageCandidates.value.every(a => selected.value.includes(a.id)))
-  const chosen = computed(() => accounts.value.filter(a => selected.value.includes(a.id) && ready(a)))
+  const pageIndeterminate = computed(() => !pageSelected.value && pageCandidates.value.some(a => selected.value.includes(a.id)))
+  const chosen = computed(() => accounts.value.filter(a => selected.value.includes(a.id)))
+  const reauthChosen = computed(() => chosen.value.filter(ready))
   watch([search, plan, filter, pageSize], () => page.value = 1)
   watch(() => filtered.value.length, n => { page.value = Math.min(page.value, Math.max(1, Math.ceil(n / pageSize.value))) })
   function selectOne(id: string, checked: boolean) { selected.value = checked ? [...new Set([...selected.value, id])] : selected.value.filter(v => v !== id) }
@@ -80,6 +83,34 @@ export function useReauthManager() {
   }
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
   async function load() { loading.value = true; error.value = ''; try { accounts.value = (await api.accounts()).accounts; receiveJobs((await api.jobs()).jobs) } catch (e) { error.value = (e as Error).message } finally { loading.value = false } }
+  async function deleteSelected() {
+    if (busy.value || !chosen.value.length) return
+    const ids = chosen.value.map(a => a.id)
+    busy.value = true; deleting.value = true; error.value = ''; notice.value = ''
+    try {
+      const result = await api.deleteAccounts(ids)
+      if (result.deletedAccountIds.length !== ids.length || result.deletedAccountIds.some(id => !ids.includes(id)))
+        throw new Error('删除结果与所选账号不一致，请刷新核对')
+      accounts.value = accounts.value.filter(a => !ids.includes(a.id))
+      selected.value = selected.value.filter(id => !ids.includes(id))
+      batchJobs.value = batchJobs.value.filter(j => !ids.includes(j.accountId))
+      receiveJobs(result.jobs)
+      if (forceTarget.value && ids.includes(forceTarget.value.id)) showForce.value = false
+      notice.value = `已从 RS 网关删除 ${ids.length} 个账号`
+    } catch (e) {
+      error.value = `${(e as Error).message}，请核对当前列表，未自动重复删除`
+    } finally {
+      try {
+        accounts.value = (await api.accounts()).accounts
+        selected.value = selected.value.filter(id => accounts.value.some(a => a.id === id))
+        receiveJobs((await api.jobs()).jobs)
+        batchJobs.value = batchJobs.value.filter(j => accounts.value.some(a => a.id === j.accountId))
+      } catch {
+        error.value ||= '删除请求已结束，但最新列表读取失败，请手动刷新核对'
+      }
+      busy.value = false; deleting.value = false
+    }
+  }
   async function submit(rows: Account[]) {
     if (busy.value) return
     const requested = new Set(rows.map(a => a.id))
@@ -110,5 +141,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, chosen, selectOne, selectPage, showResults, load, submit, cancel, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

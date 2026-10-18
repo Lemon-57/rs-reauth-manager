@@ -1,5 +1,6 @@
 //! 管理接口、授权队列与宿主生命周期的组合
 
+mod deletion;
 mod diagnostics;
 mod host;
 mod recovery;
@@ -121,6 +122,7 @@ fn registration() -> ManagementRegistration {
             ("GET", "api/jobs"),
             ("POST", "api/submit"),
             ("POST", "api/cancel"),
+            ("POST", "api/delete"),
             ("POST", "api/tick"),
             ("POST", "api/runtime-check"),
             ("POST", "api/force-submit"),
@@ -514,6 +516,27 @@ async fn handle(
     }
     let (mut queue, version) = host::load(&call.host).await?;
     match call.request.path.as_str() {
+        "api/delete" => {
+            let ids = deletion::remove(&call.host, &call.payload).await?;
+            let removed = queue
+                .jobs
+                .iter()
+                .filter(|j| ids.contains(&j.account_id))
+                .map(|j| j.request_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if manager
+                .worker
+                .as_ref()
+                .is_some_and(|w| removed.contains(w.request_id.as_str()))
+            {
+                manager.worker.take();
+            }
+            queue.jobs.retain(|j| !ids.contains(&j.account_id));
+            host::save(&call.host, &queue, version).await.map_err(|_| {
+                fault("账号已从 RS 网关删除，但插件任务列表同步失败，请刷新核对；不会自动重复删除")
+            })?;
+            return Ok(json!({"deletedAccountIds":ids,"jobs":queue.jobs}));
+        }
         "api/submit" => {
             let request: Submit =
                 serde_json::from_slice(&call.payload).map_err(|_| fault("提交格式无效"))?;

@@ -24,5 +24,6 @@ verification/*
 !verification/test_fallback.py
 !verification/test_page_resources.py
 !verification/bridge-test.mjs
+!verification/checkbox-test.mjs
 !verification/batch-test.mjs
 !verification/conventions.mjs

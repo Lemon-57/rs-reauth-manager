@@ -67,6 +67,45 @@ class WorkspacePageTests(unittest.TestCase):
         page = '<div class="x">text</div>' * 100 + '<script>'+json.dumps({'workspace_id': WID})+'</script>'
         self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
 
+    def test_many_ordinary_script_assignments_do_not_exhaust_json_document_budget(self):
+        bootstrap = '<script>'+''.join(f'var value{i}={i};' for i in range(200))+'</script>'
+        hydration = '<script>window.stream.enqueue('+json.dumps(json.dumps({'workspace_id': WID}))+');</script>'
+        for page in [bootstrap+hydration, hydration+bootstrap]:
+            self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
+    def test_json_documents_have_their_own_bounded_budget(self):
+        page = '<script>'+''.join(f'window.item{i}={{"unrelated":{i}}};' for i in range(65))+'</script>'
+        with self.assertRaisesRegex(ValueError, '^workspace_evidence_invalid$'):
+            workspace_page(page)
+
+    def test_many_ordinary_string_and_comparison_assignments_are_ignored(self):
+        bootstrap = ''.join(f'var item{i}="ordinary-value"; if(item{i}==="test"){{}};' for i in range(100))
+        page = '<script>'+bootstrap+'window.data='+json.dumps({'workspace_id': WID})+';</script>'
+        self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
+    def test_json_looking_content_inside_strings_and_comments_is_not_executed(self):
+        embedded = 'window.data = '+json.dumps({'workspace_id': 'unrelated-workspace'})+';'
+        bootstrap = '<script>var text='+json.dumps(embedded)+'; /* '+embedded+' */\n// '+embedded+'\n</script>'
+        page = bootstrap+'<script>'+json.dumps({'workspace_id': WID})+'</script>'
+        self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
+    def test_equality_operators_are_not_hydration_assignments(self):
+        page = '<script>if (value === '+json.dumps({'workspace_id': WID})+') {}</script>'
+        self.assertEqual(workspace_page(page), {'workspaces': []})
+
+    def test_regex_quotes_escapes_and_character_classes_do_not_swallow_hydration(self):
+        for expression in [r'''/["']/g''', r'''/[\\/"']/g''', r'''/a\\b/''', r'''/[a/]/g''']:
+            page = '<script>const pattern='+expression+'; window.data='+json.dumps({'workspace_id': WID})+';</script>'
+            self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
+    def test_regex_content_is_not_treated_as_an_assignment(self):
+        page = '<script>const pattern = /window.data = {"workspace_id":"wrong-workspace"}/; window.data='+json.dumps({'workspace_id': WID})+';</script>'
+        self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
+    def test_division_does_not_hide_following_hydration(self):
+        page = '<script>const ratio=10 / 2; window.data='+json.dumps({'workspace_id': WID})+';</script>'
+        self.assertEqual(workspace_page(page), {'workspaces': [{'id': WID}]})
+
     def test_duplicate_conflicting_malformed_and_oversized_evidence_is_rejected(self):
         for data in [
             {'workspaces': [{'id': WID}, {'id': WID}]},

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Search, RefreshCw, KeyRound, Square, X, AlertTriangle, CircleCheck } from '@lucide/vue'
+import { Search, RefreshCw, KeyRound, Square, X, AlertTriangle, CircleCheck, Trash2 } from '@lucide/vue'
 import { ZButton } from '@codex-proxy/ui/button'
 import { ZCheckbox } from '@codex-proxy/ui/checkbox'
 import { ZDialog } from '@codex-proxy/ui/dialog'
@@ -13,9 +13,9 @@ import { displayTime, isActive, planLabel, planType, progress, resultMessage, st
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
 
-const { accounts, selected, loading, busy, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, chosen, selectOne, selectPage, showResults, load, submit, cancel, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
+const { accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
 const statusOptions = [{ value: 'all', label: '全部状态' }, { value: 'error', label: '账号异常' }, { value: 'ready', label: '可重新授权' }, { value: 'active', label: '处理中' }, { value: 'failed', label: '本次未完成' }, { value: 'success', label: '本次成功' }, { value: 'invalid', label: '备注或代理缺失' }, { value: 'disabled', label: '已停用' }]
-const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }, { key: 'identity', label: '账号', kind: 'identity', width: 300 }, { key: 'groups', label: '分组', kind: 'meta', width: 160 }, { key: 'plan', label: '订阅', width: 85 }, { key: 'status', label: '账号状态', width: 110 }, { key: 'credentials', label: '登录资料', width: 112 }, { key: 'proxy', label: '账号代理', minWidth: 165 }, { key: 'expiry', label: '访问令牌到期', width: 170 }, { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210 }, { key: 'actions', label: '操作', kind: 'actions', width: 86 }]
+const columns: TableColumn<Account>[] = [{ key: 'select', label: '', kind: 'selection' }, { key: 'identity', label: '账号', kind: 'identity', width: 300 }, { key: 'groups', label: '分组', kind: 'meta', width: 160 }, { key: 'plan', label: '订阅', width: 85 }, { key: 'status', label: '账号状态', width: 110 }, { key: 'credentials', label: '登录资料', width: 112 }, { key: 'proxy', label: '账号代理', minWidth: 165 }, { key: 'expiry', label: '访问令牌到期', width: 170 }, { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210 }, { key: 'actions', label: '操作', kind: 'actions', width: 86 }]
 </script>
 
 <template>
@@ -30,12 +30,13 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
       <ZInput v-model="search" class="search" placeholder="搜索邮箱、分组或代理" clearable aria-label="搜索账号"><template #prefix><Search :size="16" /></template></ZInput>
       <ZSelect v-model="plan" class="filter" :options="planOptions" aria-label="会员标识筛选" />
       <ZSelect v-model="filter" class="filter" :options="statusOptions" aria-label="状态筛选" />
-      <div class="commands"><ZIconButton title="读取最新账号" aria-label="读取最新账号" :disabled="loading || busy" @click="load"><RefreshCw :size="17" :class="{ spin: loading }" /></ZIconButton><ZButton v-if="active" :disabled="busy" @click="cancel()"><template #icon><Square :size="14" /></template>停止队列</ZButton><ZButton type="primary" :disabled="busy || !chosen.length" @click="submit(chosen)"><template #icon><KeyRound :size="16" /></template>重新授权所选<span v-if="chosen.length">（{{ chosen.length }}）</span></ZButton></div>
+      <div class="commands"><ZIconButton title="读取最新账号" aria-label="读取最新账号" :disabled="loading || busy" @click="load"><RefreshCw :size="17" :class="{ spin: loading }" /></ZIconButton><ZButton v-if="active" :disabled="busy" @click="cancel()"><template #icon><Square :size="14" /></template>停止队列</ZButton><ZButton type="danger" :loading="deleting" :disabled="busy || !chosen.length" title="直接从 RS 网关删除所选账号" @click="deleteSelected"><template #icon><Trash2 :size="16" /></template>删除所选<span v-if="chosen.length">（{{ chosen.length }}）</span></ZButton><ZButton type="primary" :disabled="busy || !reauthChosen.length" @click="submit(reauthChosen)"><template #icon><KeyRound :size="16" /></template>重新授权所选<span v-if="reauthChosen.length">（{{ reauthChosen.length }}）</span></ZButton></div>
     </div>
-    <div class="selection"><ZCheckbox :model-value="pageSelected" :disabled="!pageCandidates.length || busy" label="选择当前页" @change="selectPage" /><span>已选 {{ chosen.length }} / {{ filtered.length }} 个账号</span><ZIconButton v-if="selected.length" size="small" title="清空选择" aria-label="清空选择" @click="selected = []"><X :size="14" /></ZIconButton></div>
+    <div class="selection"><ZCheckbox class="account-checkbox" :model-value="pageSelected" :indeterminate="pageIndeterminate" :disabled="!pageCandidates.length || busy" label="选择当前页" @change="selectPage" /><span>已选 {{ chosen.length }} / {{ filtered.length }} 个账号</span><ZIconButton v-if="selected.length" size="small" title="清空选择" aria-label="清空选择" :disabled="busy" @click="selected = []"><X :size="14" /></ZIconButton></div>
+    <div v-if="notice" class="message success" role="status"><CircleCheck :size="16" /><span>{{ notice }}</span><ZIconButton title="关闭提示" aria-label="关闭成功提示" @click="notice = ''"><X :size="14" /></ZIconButton></div>
     <div v-if="error" class="message danger" role="alert"><AlertTriangle :size="16" /><span>{{ error }}</span><ZIconButton title="关闭提示" aria-label="关闭提示" @click="error = ''"><X :size="14" /></ZIconButton></div>
     <ZTable :columns="columns" :data="visible" :row-key="a => a.id" :loading="loading && !accounts.length" :empty-text="loading ? '正在读取账号' : '没有匹配的 OAuth 账号'">
-      <template #select="{ row }"><ZCheckbox :model-value="selected.includes(row.id)" :disabled="!ready(row) || busy" :aria-label="`选择 ${row.email || row.name}`" @change="selectOne(row.id, $event)" /></template>
+      <template #select="{ row }"><ZCheckbox class="account-checkbox" :model-value="selected.includes(row.id)" :disabled="busy" :aria-label="`选择 ${row.email || row.name}`" @change="selectOne(row.id, $event)" /></template>
       <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> {{ statusText(row) }}</span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }">{{ progress(resultOf(row)) }}<span v-if="resultOf(row)?.message"> · {{ resultMessage(resultOf(row)) }}</span></span></div></div></div></template>
       <template #plan="{ row }"><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag></template>
       <template #groups="{ row }"><div v-if="row.groups.length" class="group-tags"><ZTag v-for="group in row.groups" :key="group.id" size="small" :title="group.name">{{ group.name }}</ZTag></div><span v-else class="muted">未分组</span></template>
@@ -54,7 +55,7 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', width: 44 }
         <ZSelect v-model="forceWorkspace" :options="forceSource.workspaceChoices.map(w => ({ value: w.id, label: w.id }))" aria-label="目标工作区" />
         <p class="danger">将重新登录并替换原账号的工作区及授权，套餐以新授权为准，写回前会停止该账号调度</p>
         <p class="muted">仍需验证同一邮箱和用户，保留分组、代理、备注及其他配置，不显示 RT</p>
-        <ZCheckbox v-model="forceConfirmed" class="force-confirm" :disabled="busy" label="我确认使用所选工作区的 RT 替换原授权，并停止该账号调度" />
+        <ZCheckbox v-model="forceConfirmed" class="account-checkbox force-confirm" :disabled="busy" label="我确认使用所选工作区的 RT 替换原授权，并停止该账号调度" />
       </template>
       <p v-else class="muted">旧任务未记录可用工作区，请先重新检测，取得工作区列表后再选择并确认强制写回</p>
       <p v-if="error" class="danger" role="alert">{{ error }}</p>

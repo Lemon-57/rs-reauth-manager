@@ -63,7 +63,11 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
         && !upgraded
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
-        || workspace == text(original, "accountId")?
+        || (workspace == text(original, "accountId")?
+            && !(forced_free
+                && original["planType"]
+                    .as_str()
+                    .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"))))
     {
         return Err(fault(IDENTITY_ERROR));
     }
@@ -220,7 +224,7 @@ pub async fn commit(
         expected["planType"] = json!(plan);
         if settings(&after) != expected
             || after["_credentialRevision"] != result.credential_revision
-            || after["status"] != "normal"
+            || !matches!(after["status"].as_str(), Some("normal" | "disabled"))
             || after["hasRefreshToken"] != true
         {
             return Err(fault("工作区授权写回后的账号状态未确认"));

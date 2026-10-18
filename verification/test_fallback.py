@@ -363,7 +363,7 @@ class RealVendorFreeRecovery(unittest.TestCase):
 
 
 class RealVendorForcedFreeConsent(unittest.TestCase):
-    def execute(self, workspaces=None, *, cookie=None, changed_tokens=None, bad_state=False, direct=False, selection_status=302, html_text=None, dump_status=200, dump_timeout=False, intermediate=False, intermediate_status=200):
+    def execute(self, workspaces=None, *, cookie=None, changed_tokens=None, bad_state=False, direct=False, selection_status=302, html_text=None, dump_status=200, dump_timeout=False, intermediate=False, intermediate_status=200, source_plan=None):
         self.messages, self.calls = [], []
         exchanged = changed_tokens or tokens()
         if cookie is None:
@@ -373,6 +373,8 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL,
                 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': desktop_url(),
                 'accountId': 'original-workspace', 'userId': 'original-user', 'forceFree': True}
+        if source_plan is not None:
+            data['planType'] = source_plan
         testcase = self
         authorization = {}
         consent = 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent'
@@ -408,7 +410,7 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
                         return response(url, intermediate_status)
                     return types.SimpleNamespace(status_code=200, url=url, headers={}, text=html_text or '{"workspace_id":"personal-workspace"}', json=lambda: {})
                 if method == 'POST' and url == 'https://auth.openai.com/api/accounts/workspace/select':
-                    testcase.assertEqual(kwargs['json'], {'workspace_id': 'personal-workspace'})
+                    testcase.assertEqual(kwargs['json'], {'workspace_id': 'original-workspace' if source_plan == 'free' else 'personal-workspace'})
                     if selection_status != 302:
                         return response(url, selection_status, body={'error': {'code': 'private-error'}})
                     return response(url, 302, location=callback())
@@ -455,8 +457,26 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         self.assertEqual([method for method, _ in self.calls], ['GET', 'GET', 'POST', 'POST'])
         self.assertNotIn('fixture-private-rt', json.dumps(self.messages[:-1]))
 
+    def test_explicit_free_verification_can_refresh_same_original_free_workspace(self):
+        changed = tokens()
+        for key in ['id_token', 'access_token']:
+            payload = json.loads(base64.urlsafe_b64decode(changed[key].split('.')[1] + '=='))
+            payload[AUTH]['chatgpt_account_id'] = 'original-workspace'
+            changed[key] = jwt(payload)
+        self.execute([{'id': 'original-workspace', 'type': 'personal', 'plan_type': 'free'}], changed_tokens=changed, source_plan='free')
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'original-workspace')
+
     def test_cookie_dump_403_does_not_block_html_workspace_fallback(self):
         self.execute(cookie={}, dump_status=403, html_text='<script type="application/json">{"workspace_id":"personal-workspace"}</script>')
+        self.assertEqual(self.messages[-1]['event'], 'forced_free')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
+        self.assertEqual(sum(url.endswith('/workspace/select') for _, url in self.calls), 1)
+
+    def test_bootstrap_assignments_do_not_block_real_vendor_free_recovery(self):
+        bootstrap = '<script>'+''.join(f'var bootstrap{i}={i};' for i in range(200))+'</script>'
+        html = bootstrap+'<script type="application/json">{"workspace_id":"personal-workspace"}</script>'
+        self.execute(cookie={}, dump_status=403, html_text=html)
         self.assertEqual(self.messages[-1]['event'], 'forced_free')
         self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
         self.assertEqual(sum(url.endswith('/workspace/select') for _, url in self.calls), 1)

@@ -68,7 +68,7 @@ def merge_workspace_evidence(*sources):
     return {'workspaces': list(merged.values())}
 
 
-def free_workspace_candidate(session, original):
+def free_workspace_candidate(session, original, *, allow_original=False):
     """Choose only an unambiguous candidate; issued tokens must still prove Free."""
     if not isinstance(session, dict):
         raise ValueError('free_workspace_missing')
@@ -87,7 +87,7 @@ def free_workspace_candidate(session, original):
         if wid in seen:
             raise ValueError('free_workspace_ambiguous')
         seen.add(wid)
-        if wid == original:
+        if wid == original and not allow_original:
             continue
         kinds = [str(workspace.get(key) or '').strip().lower() for key in ['type', 'account_type', 'kind']]
         plan = str(workspace.get('plan_type') or '').strip().lower()
@@ -230,7 +230,7 @@ def recover_unbound_free(oauth, chat, authorize_url, data, authorize):
         raise ValueError("fallback_identity")
     tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
     verified, workspace, plan = verify_tokens(tokens, data["email"], data.get("userId"), oauth.selected_workspace or None, force=False)
-    if workspace == data.get("accountId") or plan != "free":
+    if (workspace == data.get("accountId") and str(data.get('planType') or '').strip().lower() != 'free') or plan != "free":
         raise ValueError("fallback_identity")
     return verified, workspace
 

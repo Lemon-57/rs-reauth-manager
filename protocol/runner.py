@@ -185,7 +185,7 @@ def _run_once(data, used_codes):
             if not selected:
                 if self.unbound_workspace:
                     try:
-                        selected = free_workspace_candidate(session, target)
+                        selected = free_workspace_candidate(session, target, allow_original=forced_free and str(data.get('planType') or '').strip().lower() == 'free')
                     except ValueError as exc:
                         if str(exc) == 'free_workspace_missing':
                             return ''
@@ -230,7 +230,7 @@ def _run_once(data, used_codes):
                 return ''
             if self.unbound_workspace:
                 try:
-                    selected = free_workspace_candidate(evidence, target)
+                    selected = free_workspace_candidate(evidence, target, allow_original=forced_free and str(data.get('planType') or '').strip().lower() == 'free')
                 except ValueError as exc:
                     if str(exc) == 'free_workspace_missing' and not ids and self.session_lookup_failure:
                         self.failed_authorization = self.session_lookup_failure

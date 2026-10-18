@@ -22,6 +22,8 @@ free.groups = []
 const revisions = new Map(accounts.map(a => [a.id, 1]))
 const records = new Map(), handles = new Map(), starts = [], completes = []
 const disables = [], enables = [], saves = [], credentials = new Map()
+const deletions = []
+let deleteMode = 'normal'
 function credential(a) {
   return { account_id: a.id, provider_id: 'openai', credential_revision: revisions.get(a.id), facts: { name: a.name, authentication_kind: 'oauth', material: { schema_version: 1, installation_id: '3d07c9c6-3b57-4a12-a51d-1e21df254477', transport: 'http', principal: { oauth_subject: 'original-subject', poid: null }, access_token: 'old-access', refresh_token: 'old-secret-rt', id_token: 'old-id', oauth_client_id: 'fixture', oauth_scope: 'openid', cookies: [{ name: 'fixture', value: 'fixture-cookie' }] }, email: a.email, upstream_user_id: a.userId, upstream_account_id: a.accountId, plan_type: a.planType, has_refresh_token: true, access_token_expires_at_ms: null, next_refresh_at_ms: null } }
 }
@@ -57,7 +59,7 @@ async function callback(meta, payload) {
     assert.equal(data.facts.plan_type, a.id.startsWith('up_') ? 'team' : a.id.startsWith('force_') ? 'plus' : 'free'); assert.equal(data.facts.upstream_account_id, a.id.startsWith('up_') ? 'team-workspace' : a.id.startsWith('force_') ? 'alternate-workspace' : 'personal-workspace'); assert.equal(data.facts.material.refresh_token, 'fallback-private-rt')
     saves.push(a.id)
     if (a.id === 'fb_save_failure') return result(meta.id, {}, {})
-    a.accountId = data.facts.upstream_account_id; a.planType = data.facts.plan_type; a.status = 'normal'
+    a.accountId = data.facts.upstream_account_id; a.planType = data.facts.plan_type; a.status = a.enabled ? 'normal' : 'disabled'
     const revision = revisions.get(a.id) + 1; revisions.set(a.id, revision)
     credentials.set(a.id, { ...old, credential_revision: revision, facts: structuredClone(data.facts) })
     if (a.id === 'fb_uncertain') return result(meta.id, {}, {})
@@ -85,6 +87,16 @@ async function callback(meta, payload) {
       dataReply = { documents: [{ provider: 'openai', document: { accounts: [{ id, outboundProxyUrl: 'http://fixture:pass@127.0.0.1:21001', refreshToken: 'old-secret-rt' }] } }] }
     }
     else if (url.pathname === '/api/admin/accounts/oauth/start') { assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountId', 'name', 'provider']); starts.push(structuredClone(data)); dataReply = { flowId: `flow_${data.accountId}`, authorizationUrl: nativeAuthorization }; status = 201 }
+    else if (url.pathname === '/api/admin/accounts/delete') {
+      assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountIds', 'provider']); assert.equal(data.provider, 'openai')
+      deletions.push(structuredClone(data.accountIds))
+      if (deleteMode === 'rejected') { status = 409; code = 40901; dataReply = null }
+      else {
+        if (!['not_removed', 'wrong_count'].includes(deleteMode)) for (let i = accounts.length - 1; i >= 0; i--) if (data.accountIds.includes(accounts[i].id)) accounts.splice(i, 1)
+        dataReply = { deletedCount: deleteMode === 'wrong_count' ? 0 : data.accountIds.length, accountIds: data.accountIds }
+        if (deleteMode === 'lost') { status = 502; code = 50201 }
+      }
+    }
     else if (url.pathname === '/api/admin/accounts/batch-update') {
       assert.equal(meta.params.method, 'POST'); assert.deepEqual(Object.keys(data).sort(), ['accountIds', 'enabled']); assert.equal(data.accountIds.length, 1)
       const a = accounts.find(a => a.id === data.accountIds[0]); assert.equal(a.capacity.usedSlots, 0)
@@ -92,7 +104,7 @@ async function callback(meta, payload) {
         assert.ok(a.id.startsWith('up_')); assert.ok(saves.includes(a.id)); assert.equal(a.planType, 'team'); assert.equal(a.enabled, false)
         enables.push(a.id)
         if (a.id === 'up_enable_fail') { status = 502; code = 50201 } else {
-          a.enabled = true
+          a.enabled = true; a.status = 'normal'
           if (a.id === 'up_enable_uncertain') { status = 502; code = 50201 }
         }
         dataReply = {}
@@ -100,7 +112,7 @@ async function callback(meta, payload) {
       assert.equal(data.enabled, false)
       disables.push(a.id); dataReply = {}
       if (a.id === 'fb_disable_failure') { status = 502; code = 50201 }
-      else { a.enabled = false; if (a.id === 'fb_disable_race') revisions.set(a.id, revisions.get(a.id) + 1); if (a.id === 'fb_inflight_race') a.capacity.usedSlots = 1 }
+      else { a.enabled = false; a.status = 'disabled'; if (a.id === 'fb_disable_race') revisions.set(a.id, revisions.get(a.id) + 1); if (a.id === 'fb_inflight_race') a.capacity.usedSlots = 1 }
       }
     }
     else if (url.pathname === '/api/admin/accounts/oauth/complete') {
@@ -158,7 +170,7 @@ let passed = 0
 const check = name => { passed++; console.log(`PASS ${name}`) }
 try {
   await start()
-  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 8); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
+  const reg = JSON.parse((await call('management.register', {}, Buffer.alloc(0), 'registration')).payload.toString()); assert.equal(reg.resources.length, 3); assert.equal(reg.routes.length, 9); assert.ok(!reg.resources.some(r => r.path.includes('runtime'))); check('Only UI resources are exposed, protocol runtime stays private')
   const beforeProbe = records.get('queue')?.value.jobs.length ?? 0; assert.deepEqual((await request('runtime-check', {})).value, { ready: true }); assert.equal(starts.length, 0); assert.equal(completes.length, 0); assert.equal(records.get('queue')?.value.jobs.length ?? 0, beforeProbe); check('Runtime preflight never queues an account or starts native authorization')
   const listing = await request('accounts'); assert.equal(listing.status, 200); assert.equal(listing.value.accounts.length, 11); assert.ok(listing.value.accounts.some(a => a.id === 'free')); assert.ok(!listing.value.accounts.some(a => ['api_key', 'other_provider'].includes(a.id))); for (const a of listing.value.accounts) { assert.ok(!('notes' in a)); assert.ok(!('refreshToken' in a)); assert.ok(!JSON.stringify(a).includes('fixture-password')) } check('All OpenAI OAuth plans including Free are listed without leaking credentials')
   assert.equal(listing.value.accounts.find(a => a.id === 'bad_notes').notesValid, false); check('Notes must match original account email')
@@ -204,7 +216,7 @@ try {
     const before = structuredClone(a), oldCompletes = completes.length, d = disables.length
     await submit([id]); const done = await finish(id)
     assert.equal(done.status, 'success'); assert.equal(done.step, 'free'); assert.match(done.message, /原工作区已失效.*已切回 Free.*已停止调度/)
-    assert.equal(a.enabled, false); assert.equal(a.planType, 'free'); assert.equal(a.accountId, 'personal-workspace'); assert.equal(a.status, 'normal')
+    assert.equal(a.enabled, false); assert.equal(a.planType, 'free'); assert.equal(a.accountId, 'personal-workspace'); assert.equal(a.status, 'disabled')
     for (const k of ['id', 'email', 'userId', 'name', 'groups', 'notes', 'outboundProxyEndpoint', 'weight', 'concurrencyLimit', 'modelAccess']) assert.deepEqual(a[k], before[k])
     assert.equal(completes.length, oldCompletes); assert.equal(disables.length, d + (before.enabled ? 1 : 0)); assert.equal(saves.at(-1), id)
     check(`${id}: verified Free recovery replaces original ID via SDK CAS, preserves settings, and stops scheduling`)
@@ -275,6 +287,43 @@ try {
     for (const secret of ['fixture-password', 'fallback-private-rt', 'private-host']) assert.ok(!done.message.includes(secret))
     assert.equal(saves.length, saved); assert.equal(completes.length, completed); assert.deepEqual(a, before)
     check(`${id}: specific diagnostics survive SDK transport without credential leakage or account changes`)
+  }
+  {
+    const missing = make('delete_incomplete'), busy = make('delete_inflight'), keep = make('delete_keep')
+    missing.notes = ''; missing.outboundProxyEndpoint = null; busy.capacity.usedSlots = 7
+    accounts.push(missing, busy, keep)
+    for (const a of [missing, busy, keep]) revisions.set(a.id, 1)
+    await submit([busy.id, keep.id])
+    const keepBefore = structuredClone(keep), keepJob = structuredClone(job(keep.id))
+    const authWrites = [starts.length, saves.length, disables.length, enables.length, completes.length]
+    const removed = await request('delete', { accountIds: [missing.id, busy.id] })
+    assert.equal(removed.status, 200); assert.deepEqual(removed.value.deletedAccountIds, [missing.id, busy.id])
+    assert.ok(!accounts.some(a => [missing.id, busy.id].includes(a.id)))
+    assert.ok(!removed.value.jobs.some(j => [missing.id, busy.id].includes(j.accountId)))
+    assert.deepEqual(job(keep.id), keepJob); assert.deepEqual(keep, keepBefore)
+    assert.deepEqual([starts.length, saves.length, disables.length, enables.length, completes.length], authWrites)
+    check('Native batch deletion accepts queued, in-flight and incomplete accounts without confirmations or scheduling mutations; unrelated jobs remain')
+    const n = deletions.length
+    for (const ids of [[], ['delete_keep', 'delete_keep'], ['../outside'], ['does_not_exist']]) assert.equal((await request('delete', { accountIds: ids })).status, 400)
+    assert.equal(deletions.length, n)
+    check('Malformed, duplicate or out-of-scope delete selections never reach native mutation')
+    for (const mode of ['rejected', 'wrong_count', 'not_removed']) {
+      deleteMode = mode
+      const response = await request('delete', { accountIds: [keep.id] })
+      assert.equal(response.status, 400); assert.ok(accounts.some(a => a.id === keep.id)); assert.deepEqual(job(keep.id), keepJob)
+      check(`${mode}: deletion does not report success or clear jobs when native deletion is unconfirmed`)
+    }
+    deleteMode = 'lost'; const beforeLost = deletions.length
+    assert.equal((await request('delete', { accountIds: [keep.id] })).status, 400)
+    assert.equal(deletions.length, beforeLost + 1); assert.ok(!accounts.some(a => a.id === keep.id))
+    assert.equal((await request('delete', { accountIds: [keep.id] })).status, 400); assert.equal(deletions.length, beforeLost + 1)
+    check('A lost native delete response never replays deletion; subsequent absence is checked before another mutation')
+    deleteMode = 'normal'
+    await request('cancel', { requestId: null })
+    await submit(['slow']); await tick(); assert.equal(job('slow').status, 'running')
+    const running = await request('delete', { accountIds: ['slow'] })
+    assert.equal(running.status, 200); assert.ok(!running.value.jobs.some(j => j.accountId === 'slow'))
+    check('Deleting a running authorization account removes its job and retires its local worker without an active-task gate')
   }
   await stop(); assert.equal(errors, ''); console.log(`Verified ${passed} protocol scenarios`)
 } catch (error) { child?.kill(); console.error(error); process.exitCode = 1 }

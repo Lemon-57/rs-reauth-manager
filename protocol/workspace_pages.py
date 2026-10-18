@@ -27,6 +27,81 @@ class _Scripts(HTMLParser):
             self.current = None
 
 
+def _script_json_values(source, decoder):
+    """Scan JSON entry points without interpreting JS strings, comments or expressions."""
+    position, accepted, attempts = 0, 0, 0
+    length = len(source)
+    call = re.compile(r'(?:enqueue|JSON\s*\.\s*parse)\s*\(\s*')
+    while position < length:
+        char = source[position]
+        if char in {'"', "'", '`'}:
+            quote = char
+            position += 1
+            while position < length:
+                if source[position] == '\\':
+                    position += 2
+                elif source[position] == quote:
+                    position += 1
+                    break
+                else:
+                    position += 1
+            continue
+        if source.startswith('//', position):
+            end = source.find('\n', position + 2)
+            position = length if end < 0 else end + 1
+            continue
+        if source.startswith('/*', position):
+            end = source.find('*/', position + 2)
+            position = length if end < 0 else end + 2
+            continue
+        if char == '/':
+            prefix = source[max(0, position - 64):position].rstrip()
+            regex_start = not prefix or prefix[-1] in '=(:,;![{?&|+*%~' or re.search(r'\b(?:return|throw|case|typeof|void|delete|yield|await)$', prefix)
+            if regex_start:
+                end, in_class = position + 1, False
+                while end < length and source[end] not in '\r\n':
+                    if source[end] == '\\':
+                        end += 2
+                        continue
+                    if source[end] == '[':
+                        in_class = True
+                    elif source[end] == ']':
+                        in_class = False
+                    elif source[end] == '/' and not in_class:
+                        end += 1
+                        while end < length and source[end].isalpha():
+                            end += 1
+                        position = end
+                        break
+                    end += 1
+                else:
+                    position += 1
+                continue
+        match = call.match(source, position) if position == 0 or not (source[position - 1].isalnum() or source[position - 1] in {'_', '$'}) else None
+        start = match.end() if match else None
+        if char == '=' and (position == 0 or source[position - 1] not in '=!<>+-*/%&|^?') and (position + 1 == length or source[position + 1] not in '=>'):
+            start = position + 1
+            while start < length and source[start].isspace():
+                start += 1
+        if start is not None and start < length and source[start] in '{["':
+            attempts += 1
+            if attempts > 512:
+                raise ValueError('workspace_evidence_invalid')
+            try:
+                value, end = decoder.raw_decode(source, start)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                if isinstance(value, (dict, list)) or (isinstance(value, str) and value.lstrip().startswith(('{', '['))):
+                    accepted += 1
+                    if accepted > 64:
+                        raise ValueError('workspace_evidence_invalid')
+                    yield value
+                position = end
+                continue
+        position += 1
+
+
 def workspace_page(text):
     text = str(text or '')
     if len(text) > 2 * 1024 * 1024:
@@ -155,15 +230,7 @@ def workspace_page(text):
         try:
             value = json.loads(source)
         except (ValueError, RecursionError):
-            matches = re.finditer(r'(?:\benqueue\s*\(|\bJSON\.parse\s*\(|=)\s*', source)
-            for index, match in enumerate(matches):
-                if index >= 64:
-                    raise ValueError('workspace_evidence_invalid')
-                try:
-                    value, _ = decoder.raw_decode(source, match.end())
-                except (ValueError, RecursionError):
-                    continue
-                documents.append(value)
+            documents.extend(_script_json_values(source, decoder))
         else:
             documents.append(value)
     for value in documents:
