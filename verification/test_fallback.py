@@ -162,6 +162,47 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
                 selected = [body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')]
                 self.assertEqual(selected, ['new-team'])
 
+    def test_live_organization_kind_is_verified_as_team_before_upgrade(self):
+        workspaces = [
+            {'id': 'new-team', 'kind': 'organization'},
+            {'id': 'personal-workspace', 'kind': 'personal'},
+        ]
+        for html_only in [False, True]:
+            with self.subTest(html_only=html_only):
+                self.execute(workspaces=workspaces, html_only=html_only)
+                self.assertEqual(self.messages[-1]['event'], 'team_upgrade')
+                self.assertEqual(self.messages[-1]['workspaceId'], 'new-team')
+                selected = [body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')]
+                self.assertEqual(selected, ['new-team'])
+
+    def test_organization_candidate_requires_real_team_tokens_and_same_user(self):
+        workspaces = [{'id': 'personal-workspace', 'kind': 'personal'}, {'id': 'new-team', 'kind': 'organization'}]
+        for token_plan, wrong_user in [('free', False), ('plus', False), ('enterprise', False), ('team', True)]:
+            with self.subTest(plan=token_plan, wrong_user=wrong_user):
+                self.execute(workspaces=workspaces, html_only=True, token_plan=token_plan, wrong_user=wrong_user)
+                self.assertEqual(self.messages[-1]['event'], 'error')
+                self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+
+    def test_multiple_organizations_require_manual_workspace_choice(self):
+        self.execute(html_only=True, workspaces=[
+            {'id': 'personal-workspace', 'kind': 'personal'},
+            {'id': 'new-team', 'kind': 'organization'},
+            {'id': 'second-team', 'kind': 'organization'},
+        ])
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.calls))
+
+    def test_conflicting_personal_or_nonteam_organization_is_not_selected(self):
+        for fields in [{'is_personal': True}, {'type': 'personal'}, {'plan_type': 'plus'}, {'plan_type': 'enterprise'}]:
+            with self.subTest(fields=fields):
+                self.execute(html_only=True, workspaces=[
+                    {'id': 'personal-workspace', 'kind': 'personal'},
+                    {'id': 'new-team', 'kind': 'organization', **fields},
+                ])
+                self.assertEqual(self.messages[-1]['event'], 'complete')
+                self.assertFalse(any(url.endswith('/oauth/token') for _, url, _ in self.calls))
+
     def test_team_only_free_remaining_automatically_falls_back(self):
         self.execute(plan='team', token_plan='free')
         self.assertEqual(self.messages[-1]['event'], 'free_fallback')

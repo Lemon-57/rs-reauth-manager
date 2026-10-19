@@ -35,7 +35,10 @@ def team_candidate(session, original):
             continue
         kinds = {str(workspace.get(k) or '').strip().lower() for k in ['type', 'account_type', 'kind']}
         plan = str(workspace.get('plan_type') or '').strip().lower()
-        if (kinds & {'team', 'business'} or plan in {'team', 'business'}) and not (workspace.get('is_personal') is True or kinds & {'personal', 'individual'} or plan not in {'', 'team', 'business'}):
+        # Current consent pages identify team memberships as kind=organization.
+        # This is only a candidate: recover_team still requires both exchanged
+        # tokens to prove the same user, workspace and actual Team/Business plan.
+        if (kinds & {'team', 'business', 'organization'} or plan in {'team', 'business'}) and not (workspace.get('is_personal') is True or kinds & {'personal', 'individual'} or plan not in {'', 'team', 'business'}):
             candidates.append(workspace['id'])
     if len(candidates) > 1:
         raise ValueError('workspace')
