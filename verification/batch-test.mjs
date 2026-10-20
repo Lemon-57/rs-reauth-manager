@@ -13,14 +13,14 @@ let accounts = [account('error'), account('missing', { notesValid: false, proxy:
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
 let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, submitGate = null, calls = [], latestBatch = null, checks = 0, mounted
-let automationEnabled = false, loseAutomation = false, failDirectory = false
+let automationEnabled = false, loseAutomation = false, failDirectory = false, jobsGate = null
 let deleteGate = null, throwAfterDelete = false, wrongDeleteResult = false
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
   calls.push(clone(input))
   if (input.path === 'api/accounts') { if (failDirectory) throw new Error('fixture account directory timeout'); return reply({ accounts }) }
-  if (input.path === 'api/jobs') return reply({ jobs, automation: { enabled: automationEnabled } })
+  if (input.path === 'api/jobs') { const enabled = automationEnabled; if (jobsGate) await jobsGate.promise; return reply({ jobs, automation: { enabled } }) }
   const body = input.body ? JSON.parse(input.body) : {}
   if (input.path === 'api/automation') { assert.deepEqual(Object.keys(body), ['enabled']); automationEnabled = body.enabled; if (loseAutomation) throw new Error('fixture setting response lost'); return reply({ jobs, automation: { enabled: automationEnabled } }) }
   if (input.path === 'api/delete') {
@@ -259,6 +259,16 @@ try {
   assert.equal(state.automationEnabled.value, false); assert.equal(state.error.value, '')
   assert.equal(calls.filter(c => c.path === 'api/automation').length, settingsCalls + 1)
   check('Automatic switch reads back saved state, including a lost response, without replaying the configuration request')
+  state.busy.value = true; loseAutomation = false
+  await state.setAutomation(true); assert.equal(state.automationEnabled.value, true)
+  await state.setAutomation(false); assert.equal(state.automationEnabled.value, false)
+  assert.equal(state.automationBusy.value, false); state.busy.value = false
+  check('The automatic switch remains independently usable while another page action is busy')
+  await state.setAutomation(true); jobsGate = Promise.withResolvers()
+  const staleRead = state.load()
+  await state.setAutomation(false); jobsGate.resolve(); jobsGate = null; await staleRead
+  assert.equal(state.automationEnabled.value, false); assert.equal(state.automationLoaded.value, true)
+  check('A jobs response started before disabling cannot restore the previous checked state')
   jobs.push({...job('paused','success','automatic'),automatic:true})
   await state.load();assert.equal(state.resultOf(accounts.find(a=>a.id==='paused')).automatic,true)
   assert.equal(state.success.value,0)

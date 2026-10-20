@@ -9,14 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const INTERVAL_MS: u64 = 60_000;
 const COOLDOWN_MS: u64 = 6 * 60 * 60 * 1000;
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Automation {
     pub enabled: bool,
-    pub next_scan_at: u64,
     pub attempts: BTreeMap<String, Attempt>,
 }
 #[derive(Serialize, Deserialize)]
@@ -30,19 +28,25 @@ pub struct Attempt {
 
 pub fn authentication_failed(a: &Value) -> bool {
     // RS 也将上游拒绝写成 access_token_expired，必须再查凭据终态
-    candidate(a) && (a["errorReason"] == "credential_expired" || a["_credentialState"] == "expired")
+    candidate(a)
+        && match a["errorReason"].as_str() {
+            Some("credential_expired") => true,
+            Some("access_token_expired") => a["_credentialState"] == "expired",
+            Some("credential_invalid") => a["_credentialState"] == "invalid",
+            _ => false,
+        }
 }
 fn candidate(a: &Value) -> bool {
     eligible(a)
         && a["status"] == "error"
         && matches!(
             a["errorReason"].as_str(),
-            Some("credential_expired" | "access_token_expired")
+            Some("credential_expired" | "access_token_expired" | "credential_invalid")
         )
 }
 fn prepared(a: &Value) -> bool {
     candidate(a)
-        && a["enabled"] == true
+        && (a["enabled"] == true || a["errorReason"] == "credential_invalid")
         && notes_valid(a)
         && a["outboundProxyEndpoint"]
             .as_str()
@@ -60,7 +64,10 @@ pub fn ready(a: &Value) -> bool {
 impl Automation {
     pub fn observe(&mut self, accounts: &[Value]) {
         for a in accounts {
-            if a["status"] == "normal"
+            if (a["status"] == "normal"
+                || (a["enabled"] == false
+                    && a["status"] == "disabled"
+                    && a["_credentialState"] == "ready"))
                 && a["errorReason"].is_null()
                 && let Some(attempt) = a["id"].as_str().and_then(|id| self.attempts.get_mut(id))
                 && !attempt.requires_review
@@ -78,11 +85,10 @@ impl Automation {
 
 pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFault> {
     let timestamp = now();
-    if !queue.automation.enabled || timestamp < queue.automation.next_scan_at {
+    if !queue.automation.enabled {
         return Ok(());
     }
-    queue.automation.next_scan_at = timestamp.saturating_add(INTERVAL_MS);
-    let accounts = crate::directory(host).await?;
+    let mut accounts = crate::directory(host).await?;
     // 保留最新任务的人工核对边界，历史失败不会覆盖较新的人工成功
     let mut seen = std::collections::BTreeSet::new();
     for job in queue
@@ -123,6 +129,20 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
             attempt.requires_review = false;
         }
     }
+    // 暂停不等于凭据已恢复，只为待观察的暂停账号读取原生凭据终态
+    for summary in &mut accounts {
+        if summary["enabled"] == false
+            && summary["status"] == "disabled"
+            && let Some(id) = summary["id"].as_str()
+            && queue
+                .automation
+                .attempts
+                .get(id)
+                .is_some_and(|a| !a.requires_review && !a.recovered)
+        {
+            *summary = detail(host, id).await?;
+        }
+    }
     queue.automation.observe(&accounts);
     // 手动队列优先，每次巡检最多加入一个账号
     if queue.jobs.iter().any(Job::active) {
@@ -138,6 +158,9 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
         let a = detail(host, id).await?;
         if !ready(&a) {
             continue;
+        }
+        if !crate::control::enabled(host, queue.automation.enabled).await? {
+            return Ok(());
         }
         queue.automation.attempts.insert(
             id.into(),
@@ -207,6 +230,18 @@ mod tests {
         a["_credentialState"] = json!("expired");
         assert!(authentication_failed(&a));
         a["status"] = json!("normal");
+        assert!(!authentication_failed(&a));
+    }
+    #[test]
+    fn invalid_requires_current_runtime_proof_even_when_paused() {
+        let mut a = json!({"provider":"openai","authenticationKind":"oauth","status":"error","enabled":false,"errorReason":"credential_invalid"});
+        for state in ["ready", "expired", "unknown", "banned", ""] {
+            a["_credentialState"] = json!(state);
+            assert!(!authentication_failed(&a));
+        }
+        a["_credentialState"] = json!("invalid");
+        assert!(authentication_failed(&a));
+        a["status"] = json!("disabled");
         assert!(!authentication_failed(&a));
     }
     #[test]

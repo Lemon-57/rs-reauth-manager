@@ -1,6 +1,7 @@
 //! 管理接口、授权队列与宿主生命周期的组合
 
 mod automatic;
+mod control;
 mod deletion;
 mod diagnostics;
 mod host;
@@ -362,7 +363,20 @@ impl Manager {
     }
     async fn tick(&mut self, host: &HostClient) -> Result<(), PluginFault> {
         self.recover(host).await?;
-        let (mut queue, version) = host::load(host).await?;
+        let (mut queue, mut version) = host::load(host).await?;
+        if !queue.automation.enabled {
+            let mut cancelled = false;
+            for job in &mut queue.jobs {
+                if job.automatic && job.status == "queued" {
+                    job.finish("cancelled", "已关闭自动授权，尚未开始的自动任务已取消");
+                    cancelled = true;
+                }
+            }
+            if cancelled {
+                host::save(host, &queue, version).await?;
+                return Ok(());
+            }
+        }
         if let Some(mut current) = self.worker.take() {
             let output = current
                 .output
@@ -574,12 +588,12 @@ impl Manager {
             host::save(host, &queue, version).await?;
             return Ok(());
         }
-        if queue.automation.enabled && now() >= queue.automation.next_scan_at {
+        if queue.automation.enabled && !queue.jobs.iter().any(Job::active) {
             let result = automatic::scan(host, &mut queue).await;
             host::save(host, &queue, version).await?;
             result?;
-            // Reload the state version on the next reconcile before starting the job
-            return Ok(());
+            // 入队后读取新的状态版本，在本次通知内开始，不等待补偿计时器
+            (queue, version) = host::load(host).await?;
         }
         if let Some(position) = queue.jobs.iter().position(|j| j.status == "queued") {
             let job = &mut queue.jobs[position];
@@ -592,7 +606,7 @@ impl Manager {
                 self.runtime.prepare().await?;
                 let job=&queue.jobs[position];let a=detail(host,&job.account_id).await?;
                 require_idle(&a)?;
-                if job.automatic && (!queue.automation.enabled || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {
+                if job.automatic && (!control::enabled(host, queue.automation.enabled).await? || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {
                     return Err(fault("自动授权条件或账号版本已变化，未发起登录，不会自动重试"))
                 }
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
@@ -652,24 +666,6 @@ async fn handle(
     }
     let (mut queue, version) = host::load(&call.host).await?;
     match call.request.path.as_str() {
-        "api/automation" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Configure {
-                enabled: bool,
-            }
-            let request: Configure =
-                serde_json::from_slice(&call.payload).map_err(|_| fault("自动授权设置无效"))?;
-            queue.automation.enabled = request.enabled;
-            queue.automation.next_scan_at = now().saturating_add(automatic::INTERVAL_MS);
-            if !request.enabled {
-                for job in &mut queue.jobs {
-                    if job.automatic && job.status == "queued" {
-                        job.finish("cancelled", "已关闭自动授权，尚未开始的自动任务已取消");
-                    }
-                }
-            }
-        }
         "api/delete" => {
             let ids = deletion::remove(&call.host, &call.payload).await?;
             let removed = queue
@@ -884,6 +880,7 @@ async fn handle(
             let request: Cancel =
                 serde_json::from_slice(&call.payload).map_err(|_| fault("取消参数无效"))?;
             if request.request_id.is_none() {
+                control::set(&call.host, false).await?;
                 queue.automation.enabled = false;
             }
             for job in &mut queue.jobs {
@@ -935,11 +932,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     let background = Arc::clone(&manager);
     let shutdown = Arc::clone(&manager);
+    let controls = Arc::new(Mutex::new(()));
     let plugin = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .management(registration(), move |call| {
             let manager = Arc::clone(&manager);
+            let controls = Arc::clone(&controls);
             async move {
-                let result = handle(&mut *manager.lock().await, call).await;
+                let result =
+                    if call.request.path == "api/automation" || call.request.path == "api/jobs" {
+                        let _control = controls.lock().await;
+                        control::handle(call).await
+                    } else {
+                        handle(&mut *manager.lock().await, call).await
+                    };
                 let (status, value) = match result {
                     Ok(value) => (200, value),
                     Err(error) => (400, json!({"error":{"message":error.message}})),

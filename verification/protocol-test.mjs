@@ -11,7 +11,7 @@ const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLS
 const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace3`,email:`${id}@example.com`,authenticationKind:'oauth',userId:'original-user',enabled:id!=='disabled',planType:'team',status:'error',notes:`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`,outboundProxyEndpoint:'http://127.0.0.1:21001',accountId:'original-workspace',groups:[{id:'g1',name:'Team'}],weight:3,concurrencyLimit:null,modelAccess:{mode:'all'},hasRefreshToken:true,capacity:{usedSlots:0},errorReason:null})
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[]
-let child,buffer,pending,ready,sequence=99,errors=''
+let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
 function credential(a,workspace=a.accountId,plan=a.planType) {
@@ -57,7 +57,7 @@ async function callback(meta,payload) {
  }
  if(meta.method==='host.http.dispatch') {
   const url=new URL(meta.params.uri,'http://mock.invalid');let dataReply,status=200,code=200
-  if(url.pathname==='/api/admin/accounts')dataReply={items:accounts}
+  if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
   else if(url.pathname==='/api/admin/accounts/detail')dataReply={account:accounts.find(a=>a.id===url.searchParams.get('accountId')),credentialConfiguration:{transport:'http'}}
   else if(url.pathname==='/api/admin/accounts/export') {
    assert.equal(url.searchParams.get('confirm'),'export_sensitive_accounts');const id=url.searchParams.get('accountIds');assert.ok(!id.includes(','))
@@ -89,6 +89,7 @@ async function callback(meta,payload) {
     if(a.id.includes('expired_tokens'))p.exp=1
     c.facts.material.access_token=c.facts.material.id_token=jwt(p);c.facts.material.refresh_token=a.id==='missing_rt'?'':'native-issued-private-rt'
     const rev=revisions.get(a.id)+1;revisions.set(a.id,rev);c.credential_revision=rev;credentials.set(a.id,c);nativeMaterials.set(a.id,structuredClone(c.facts.material));a.status='disabled'
+    a.runtimeCredentialState='ready';a.errorReason=null
     dataReply={accountId:a.id};status=201
    }
   } else if(url.pathname==='/api/admin/accounts/refresh') {
@@ -212,14 +213,41 @@ try {
  for(const id of ['auto_good','auto_wrong_user','auto_native_503','auto_legacy_principal']) {
   const a=add(id);a.errorReason='credential_expired';a.runtimeCredentialState='expired';if(id==='auto_legacy_principal'){const c=credentials.get(id);c.facts.material.principal=null;for(const key of ['id_token','access_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;c.facts.material[key]=jwt(p)}}
   const n=completes.length,r=refreshes.length,m=metadataSaves.length
-  await request('automation',{enabled:true});records.get('queue').value.automation.nextScanAt=0
+  await request('automation',{enabled:true})
   await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(job(id).automatic,true)
   const done=await finish(id);assert.equal(completes.length,n+1);assert.equal(metadataSaves.length,m)
   if(['auto_good','auto_legacy_principal'].includes(id)){assert.equal(done.status,'success',done.message);assert.equal(refreshes.length,r+1);assert.equal(a.enabled,true)}
   else {assert.equal(done.status,'review');assert.equal(refreshes.length,r);assert.equal(a.enabled,false)}
-  const count=starts.length;records.get('queue').value.automation.nextScanAt=0;await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(starts.length,count)
+  const count=starts.length;await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(starts.length,count)
   await request('automation',{enabled:false})
   check(`${id}: automatic authorization uses the same start/callback/complete/refresh protocol as manual authorization`)
+ }
+ for(const enabled of [true,false]) {
+  const a=add(enabled?'auto_invalid_enabled':'auto_invalid_paused');a.enabled=enabled;a.status='error';a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  const n=completes.length,c=controls.length;await request('automation',{enabled:true})
+  await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(job(a.id).automatic,true)
+  const done=await finish(a.id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,enabled);assert.equal(completes.length,n+1)
+  if(!enabled){assert.ok(!controls.slice(c).some(([id,value])=>id===a.id&&value));await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(records.get('queue').value.automation.attempts[a.id].recovered,true)}
+  await request('automation',{enabled:false})
+  check(`${a.id}: native Invalid proof triggers the same OAuth flow and preserves the original pause without a temporary enable`)
+ }
+ {
+  const a=add('auto_invalid_unconfirmed');a.enabled=false;a.status='error';a.errorReason='credential_invalid';a.runtimeCredentialState='ready'
+  const n=starts.length;await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(starts.length,n);await request('automation',{enabled:false})
+  check('A paused account with stale credential_invalid text and Ready runtime credentials never triggers automatic login')
+ }
+ {
+  const a=add('auto_cancel_during_scan');a.errorReason='credential_expired';a.runtimeCredentialState='expired'
+  await request('automation',{enabled:true});const n=starts.length
+  directoryGate=Promise.withResolvers()
+  const reconcile=call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');await sleep(80)
+  const off=await request('automation',{enabled:false});assert.equal(off.status,200);assert.equal(off.value.automation.enabled,false)
+  assert.equal((await request('jobs')).value.automation.enabled,false)
+  directoryGate.resolve();directoryGate=null;await reconcile
+  assert.equal(starts.length,n,'A scan finishing after disable must not send login credentials')
+  assert.equal((await request('jobs')).value.automation.enabled,false,'Stale queue saves must not reenable automation')
+  await stop();await start();assert.equal((await request('jobs')).value.automation.enabled,false)
+  check('Disabling stays responsive during a blocked scan, fences late work, persists across restart and cannot be overwritten by queue saves')
  }
  {
   const a=add('legacy');await submit([a.id]);delete job(a.id).logoutOthers;delete job(a.id).cleanupStarted

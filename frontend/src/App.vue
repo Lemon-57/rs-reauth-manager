@@ -27,8 +27,8 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', kind: 'sele
       <ZButton :type="failed ? 'danger' : 'default'" variant="text" class="counter" :aria-pressed="filter === 'failed'" aria-label="显示本次任务未完成的账号" title="本次提交失败、需核对或中断的账号，重新进入页面归零" @click="showResults('failed')"><span>未完成</span><b>{{ failed }}</b></ZButton>
     </div>
     <div class="selection" role="group" aria-label="自动重新授权设置">
-      <ZCheckbox :model-value="automationEnabled" :disabled="!automationLoaded || automationBusy || busy" :label="automationLoaded ? '自动重新授权' : '自动重新授权（状态未读取）'" @change="setAutomation" />
-      <span class="muted">每分钟检查凭据失效，单次尝试，保留原代理、工作区和配置</span>
+      <ZCheckbox class="account-checkbox" :model-value="automationEnabled" :disabled="!automationLoaded || automationBusy" :label="automationLoaded ? '自动重新授权' : '自动重新授权（状态未读取）'" @change="setAutomation" />
+      <span class="muted">授权失效时自动触发，后台检查补漏，保留原代理、工作区和配置</span>
     </div>
     <p class="muted">手动与自动重新授权均会登出其他设备，保留本次登录，退出期间暂时暂停该账号调度，完成后按原策略恢复，退出或验证失败时保留暂停并提示核对</p>
     <div class="toolbar">

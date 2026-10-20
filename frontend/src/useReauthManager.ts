@@ -7,12 +7,19 @@ export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
   const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
+  let automationChange = 0
   async function setAutomation(enabled: boolean) {
     if (automationBusy.value || !automationLoaded.value) return
+    automationChange++
     automationBusy.value = true; error.value = ''
-    try { await api.automation(enabled) }
-    catch (e) { error.value = (e as Error).message }
-    finally {
+    try {
+      const state = await api.automation(enabled)
+      if (!state.automation || state.automation.enabled !== enabled) throw new Error('自动授权设置未确认，请刷新核对')
+      automationEnabled.value = state.automation.enabled
+      automationLoaded.value = true
+      receiveJobs(state.jobs)
+    } catch (e) {
+      error.value = (e as Error).message
       try {
         const state = await api.jobs()
         if (!state.automation) throw new Error('自动授权设置未确认，请刷新核对')
@@ -21,6 +28,7 @@ export function useReauthManager() {
         if (state.automation.enabled === enabled) error.value = ''
         else error.value ||= '自动授权设置未确认，请刷新核对'
       } catch (e) { error.value ||= (e as Error).message }
+    } finally {
       automationBusy.value = false
     }
   }
@@ -100,10 +108,11 @@ export function useReauthManager() {
   }
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
   async function load() {
-    loading.value = true; error.value = ''; automationLoaded.value = false
+    loading.value = true; error.value = ''
+    const settingChange = automationChange
     const results = await Promise.allSettled([
       api.jobs().then(state => {
-        if (state.automation) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
+        if (state.automation && !automationBusy.value && settingChange === automationChange) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
         receiveJobs(state.jobs)
       }),
       api.accounts().then(state => { accounts.value = state.accounts }),
@@ -163,10 +172,11 @@ export function useReauthManager() {
     if (destroyed || polling) return
     polling = true
     try {
-      if (!busy.value && (active.value || automationEnabled.value)) {
+      if (!busy.value && !automationBusy.value && (active.value || automationEnabled.value)) {
+        const settingChange = automationChange
         if (active.value) await api.tick()
         const state = await api.jobs()
-        if (state.automation) automationEnabled.value = state.automation.enabled
+        if (state.automation && !automationBusy.value && settingChange === automationChange) automationEnabled.value = state.automation.enabled
         if (receiveJobs(state.jobs)) accounts.value = (await api.accounts()).accounts
       }
     } catch (e) { error.value = (e as Error).message }

@@ -22,6 +22,7 @@ try {
   check('Legacy errors are labelled historical without inventing a cause or mutating retained state')
   assert.equal(progress({ step: 'free', status: 'success' }), '登录成功')
   assert.equal(statusText({ enabled: false, status: 'normal' }), '已停用')
+  assert.equal(statusText({ enabled: false, status: 'error' }), '异常（已停用）')
   check('Verified Free fallback is labelled login success while scheduling remains disabled')
   assert.equal(planKey(' Free '), 'free'); assert.equal(planLabel(' Free '), 'Free'); assert.equal(planKey(null), 'unknown'); check('Free membership labels and filter keys normalize case and whitespace')
   const { parseAccounts } = await server.ssrLoadModule('/src/api/schemas/reauth.ts')

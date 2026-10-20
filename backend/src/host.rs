@@ -35,13 +35,15 @@ pub async fn load(host: &HostClient) -> Result<(crate::Queue, Option<u64>), Plug
         .map_err(|e| e.into_plugin_fault())?;
     let data: StateGetResult =
         serde_json::from_value(reply.result).map_err(|_| fault("任务状态读取失败"))?;
-    match data.record {
+    let (mut queue, version): (crate::Queue, Option<u64>) = match data.record {
         Some(record) => Ok((
             serde_json::from_value(record.value).map_err(|_| fault("任务状态格式无效"))?,
             Some(record.version),
         )),
         None => Ok((crate::Queue::default(), None)),
-    }
+    }?;
+    queue.automation.enabled = crate::control::enabled(host, queue.automation.enabled).await?;
+    Ok((queue, version))
 }
 pub async fn save(
     host: &HostClient,
