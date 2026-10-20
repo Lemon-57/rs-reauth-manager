@@ -30,6 +30,7 @@ class Chat:
     def __init__(self, **kwargs):
         assert kwargs["proxy"] == "http://fixture:pass@127.0.0.1:21001"
         self.session = Session()
+        self.device_id = '59859b73-b63b-45f4-86f9-e728a9512905'
         self.ua = "fixture"
         self.impersonate = "chrome133a"
 
@@ -52,6 +53,28 @@ class OAuth:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_manual_and_automatic_return_the_same_rs_owned_callback_without_tokens(self):
+        self.data.update(userId='original-user',planType='team')
+        results=[]
+        for automatic in [False,True]:
+            self.data['automatic']=automatic
+            self.messages=[]
+            self.run_login()
+            self.assertEqual(self.messages[-1]['event'],'complete')
+            self.assertNotIn('tokens',self.messages[-1])
+            results.append(self.messages[-1])
+        self.assertEqual(results[0],results[1])
+
+    def test_protocol_adapters_cannot_generate_pkce_or_call_token_endpoint(self):
+        import ast
+        for name in ['runner.py','fallback.py','sessions.py']:
+            source=(ROOT/'protocol'/name).read_text(encoding='utf-8')
+            tree=ast.parse(source)
+            calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]
+            self.assertFalse(any(isinstance(n.func,ast.Attribute) and n.func.attr in {'generate_pkce','_exchange_code_for_tokens'} for n in calls))
+            self.assertFalse(any(isinstance(n.func,ast.Name) and n.func.id=='generate_pkce' for n in calls))
+            self.assertNotIn('https://auth.openai.com/oauth/token',source)
+
     def setUp(self):
         self.messages = []
         self.data = {"notes": f"{EMAIL}----fixture-password----{SECRET}", "email": EMAIL, "proxy": "http://fixture:pass@127.0.0.1:21001", "authorizationUrl": URL, "accountId": "original-workspace"}

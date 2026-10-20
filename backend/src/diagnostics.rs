@@ -36,6 +36,7 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "phone_verify" => "提交手机验证码",
         "session" => "初始化登录会话",
         "session_lookup" => "读取登录会话及工作区",
+        "other_sessions" => "登出其他设备",
         "login" => "提交登录身份",
         "password" => "密码验证",
         "mfa_factor" => "识别 2FA 验证器",
@@ -56,6 +57,15 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         _ => "登录协议",
     };
     let reason = match diagnostic["reason"].as_str().unwrap_or_default() {
+        "sessions_current_unconfirmed" => "无法唯一确认本次设备，已停止，不使用全部登出",
+        "sessions_response_invalid" | "sessions_incomplete" => "设备目录格式异常或不完整，已停止",
+        "sessions_request_rejected" => "上游拒绝读取设备目录，已停止",
+        "sessions_revoke_unconfirmed" => "其他设备退出结果未确认，可能只完成部分退出",
+        "sessions_changed" => "本次会话或设备目录发生变化，已停止",
+        "sessions_refresh_unconfirmed" => "本次 RT 刷新未确认",
+        "sessions_identity_changed" => "授权身份、工作区或套餐发生变化，未写回",
+        "sessions_transport_unconfirmed" => "设备退出或 RT 验证发生传输异常，未自动重放",
+        "sessions_proxy_invalid" => "原代理不可用，未回退直连",
         "password_rejected" => "上游拒绝邮箱或密码",
         "account_banned" => "账号已被封禁或停用，上游拒绝继续登录",
         "payment_required" => "上游返回 Payment Required，账号需要付款或订阅状态异常",

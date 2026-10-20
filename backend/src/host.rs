@@ -94,9 +94,22 @@ pub async fn admin(
     if !(200..300).contains(&reply.status) || value["code"] != 200 {
         // 上游正文可能包含凭据或回调，不直接透传到页面
         let code = value["code"].as_u64().unwrap_or_default();
+        let reason = match value["message"].as_str().unwrap_or_default() {
+            "OpenAI 授权服务暂不可用，请检查出站连接后重试" => {
+                "；RS 判定上游授权码交换入口或出站连接不可用"
+            }
+            "OpenAI 授权状态存储暂不可用，请稍后重试" => {
+                "；RS 判定授权状态存储不可用"
+            }
+            "OpenAI 授权结果未知，请先核对账号状态，不要立即重复提交" => {
+                "；RS 判定令牌交换结果未知，不得重放"
+            }
+            "OpenAI 拒绝了授权码，请重新发起授权" => "；RS 判定授权码被拒绝",
+            _ => "",
+        };
         return Err(fault(&format!(
-            "RS 操作失败（HTTP {} / {}），请检查原账号授权状态",
-            reply.status, code
+            "RS 操作失败（HTTP {} / {}）{}，请检查原账号授权状态",
+            reply.status, code, reason
         )));
     }
     value

@@ -389,7 +389,8 @@ class VendorContractTests(unittest.TestCase):
     def test_rs_wrapper_through_real_upstream_redirect_and_callback(self):
         self.execute(desktop_url())
         self.assertEqual(self.requests, [("GET", URL)])
-        self.assertEqual(self.messages[-1], {"event": "complete", "callbackUrl": "http://127.0.0.1:1455/auth/callback?state=fixture&code=fixture-code"})
+        self.assertEqual({k: v for k, v in self.messages[-1].items() if k != 'deviceId'}, {"event": "complete", "callbackUrl": "http://127.0.0.1:1455/auth/callback?state=fixture&code=fixture-code"})
+        self.assertRegex(self.messages[-1]['deviceId'], r'^[0-9a-f-]{36}$')
         self.assertNotIn("fixture-code", json.dumps(self.messages[:-1]))
 
     def test_direct_url_still_uses_real_upstream(self):

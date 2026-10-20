@@ -1,16 +1,7 @@
-//! 校验同一用户的工作区恢复凭据，停用调度后以精确版本写回原账号
-use crate::{
-    detail,
-    host::{admin, fault, now},
-    require_idle, settings,
-};
+//! 只读核验 RS 已保存的授权身份与工作区，不交换或保存 RT
+use crate::host::{fault, now};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use gateway_plugin_sdk::{
-    PluginFault,
-    call::host::{AuthCredential, AuthSaveRequest, AuthSaveResult},
-    client::HostClient,
-};
-use serde::{Serialize, de::DeserializeOwned};
+use gateway_plugin_sdk::{PluginFault, call::host::AuthCredential, client::HostClient};
 use serde_json::{Value, json};
 
 const AUTH: &str = "https://api.openai.com/auth";
@@ -27,7 +18,7 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
         .ok_or_else(|| fault(IDENTITY_ERROR))
 }
 
-fn claims(token: &str) -> Result<Value, PluginFault> {
+pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
         return Err(fault(IDENTITY_ERROR));
@@ -47,10 +38,11 @@ fn claims(token: &str) -> Result<Value, PluginFault> {
     Ok(claims)
 }
 
-fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFault> {
+pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFault> {
     let workspace = text(output, "workspaceId")?;
     let user = text(original, "userId")?;
     let email = text(original, "email")?;
+    let same = output["event"] == "same_workspace";
     let forced = output["event"] == "forced_workspace" && output["administratorConfirmed"] == true;
     let forced_free = output["event"] == "forced_free" && output["administratorConfirmed"] == true;
     let upgraded = output["event"] == "team_upgrade"
@@ -58,12 +50,15 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
         && original["planType"]
             .as_str()
             .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"));
-    if (!forced
+    if (!same
+        && !forced
         && !forced_free
         && !upgraded
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
-        || (workspace == text(original, "accountId")?
+        || (same && workspace != text(original, "accountId")?)
+        || (!same
+            && workspace == text(original, "accountId")?
             && !(forced_free
                 && original["planType"]
                     .as_str()
@@ -91,10 +86,18 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
                 != Some(user)
             || !auth["chatgpt_plan_type"].as_str().is_some_and(|p| {
                 !p.trim().is_empty()
-                    && (forced
-                        || (upgraded
-                            && matches!(p.to_ascii_lowercase().as_str(), "team" | "business"))
-                        || (!upgraded && p.eq_ignore_ascii_case("free")))
+                    && ((same
+                        && original["planType"]
+                            .as_str()
+                            .is_some_and(|old| p.trim().eq_ignore_ascii_case(old.trim())))
+                        || (!same
+                            && (forced
+                                || (upgraded
+                                    && matches!(
+                                        p.to_ascii_lowercase().as_str(),
+                                        "team" | "business"
+                                    ))
+                                || (!upgraded && p.eq_ignore_ascii_case("free")))))
             })
         {
             return Err(fault(IDENTITY_ERROR));
@@ -108,172 +111,85 @@ fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFa
     Ok((identity, access))
 }
 
-async fn auth_call<T: DeserializeOwned>(
-    host: &HostClient,
-    method: &str,
-    data: &impl Serialize,
-    message: &str,
-) -> Result<T, PluginFault> {
-    let payload = serde_json::to_vec(data).map_err(|_| fault(message))?;
+pub async fn credential(host: &HostClient, id: &str) -> Result<AuthCredential, PluginFault> {
     let reply = host
-        .call(method, json!({}), payload)
-        .await
-        .map_err(|_| fault(message))?;
-    serde_json::from_slice(&reply.payload).map_err(|_| fault(message))
-}
-
-fn unchanged(a: &Value, snapshot: &Value, expected: &Value) -> Result<(), PluginFault> {
-    require_idle(a)?;
-    if settings(a) != *expected || a["_credentialRevision"] != snapshot["credentialRevision"] {
-        return Err(fault(
-            "登录期间账号配置或凭据发生变化，已停止工作区授权写回",
-        ));
-    }
-    Ok(())
-}
-
-pub async fn commit(
-    host: &HostClient,
-    id: &str,
-    snapshot: &Value,
-    output: &Value,
-) -> Result<(), PluginFault> {
-    let original = &snapshot["settings"];
-    let (identity, access) = validate(output, original)?;
-    let current = detail(host, id).await?;
-    unchanged(&current, snapshot, original)?;
-    let credential: AuthCredential = auth_call(
-        host,
-        "host.auth.get",
-        &json!({"account_id": id}),
-        "原账号凭据读取失败，未提交工作区授权",
-    )
-    .await?;
-    let mut facts = credential.facts;
-    if credential.account_id != id
-        || credential.provider_id != "openai"
-        || Some(credential.credential_revision) != snapshot["credentialRevision"].as_u64()
-        || facts.authentication_kind != "oauth"
-        || facts.name != original["name"]
-        || facts.email.as_deref() != original["email"].as_str()
-        || facts.upstream_user_id.as_deref() != original["userId"].as_str()
-        || facts.upstream_account_id.as_deref() != original["accountId"].as_str()
-        || facts.plan_type.as_deref() != original["planType"].as_str()
-        || facts.material.get("schema_version") != Some(&json!(1))
-        || facts
-            .material
-            .get("installation_id")
-            .and_then(Value::as_str)
-            .is_none()
-        || facts
-            .material
-            .get("principal")
-            .and_then(|p| p["oauth_subject"].as_str())
-            .is_some_and(|sub| identity["sub"] != sub)
-    {
-        return Err(fault(IDENTITY_ERROR));
-    }
-    for key in ["access_token", "refresh_token", "id_token"] {
-        facts
-            .material
-            .insert(key.into(), output["tokens"][key].clone());
-    }
-    facts.material.insert(
-        "principal".into(),
-        json!({"oauth_subject":identity["sub"],"poid":null}),
-    );
-    facts.upstream_account_id = output["workspaceId"].as_str().map(str::to_owned);
-    let plan = text(&identity[AUTH], "chatgpt_plan_type")?.to_ascii_lowercase();
-    facts.plan_type = Some(plan.clone());
-    facts.has_refresh_token = true;
-    facts.access_token_expires_at_ms = access["exp"].as_i64().and_then(|exp| exp.checked_mul(1000));
-    facts.next_refresh_at_ms = None;
-    // 读取凭据后再次校验，先停止调度再变更工作区身份
-    unchanged(&detail(host, id).await?, snapshot, original)?;
-    if original["enabled"] != false {
-        admin(
-            host,
-            "POST",
-            "/api/admin/accounts/batch-update",
-            Some(json!({"accountIds":[id],"enabled":false})),
-        )
-        .await
-        .map_err(|_| fault("停止调度结果待核对，尚未提交工作区授权，请检查原账号"))?;
-    }
-    let result = async {
-        let mut disabled = original.clone();
-        disabled["enabled"] = json!(false);
-        unchanged(&detail(host, id).await?, snapshot, &disabled)?;
-        let result: AuthSaveResult = auth_call(
-            host,
-            "host.auth.save",
-            &AuthSaveRequest::Replace {
-                account_id: id.into(),
-                credential_revision: credential.credential_revision,
-                facts,
-            },
-            "工作区授权提交结果不确定",
-        )
-        .await?;
-        if result.account_id != id || result.credential_revision <= credential.credential_revision {
-            return Err(fault("工作区授权写回版本未确认"));
-        }
-        let after = detail(host, id).await?;
-        let mut expected = disabled;
-        expected["accountId"] = output["workspaceId"].clone();
-        expected["planType"] = json!(plan);
-        if settings(&after) != expected
-            || after["_credentialRevision"] != result.credential_revision
-            || !matches!(after["status"].as_str(), Some("normal" | "disabled"))
-            || after["hasRefreshToken"] != true
-        {
-            return Err(fault("工作区授权写回后的账号状态未确认"));
-        }
-        let saved: AuthCredential = auth_call(
-            host,
+        .call(
             "host.auth.get",
-            &json!({"account_id":id}),
-            "工作区授权凭据读回失败",
+            json!({}),
+            serde_json::to_vec(&json!({"account_id":id})).map_err(|_| fault("凭据请求无效"))?,
         )
-        .await?;
-        if saved.account_id != id
-            || saved.provider_id != "openai"
-            || saved.credential_revision != result.credential_revision
-            || saved.facts.plan_type.as_deref() != Some(plan.as_str())
-            || saved.facts.upstream_account_id.as_deref() != output["workspaceId"].as_str()
-            || saved.facts.upstream_user_id.as_deref() != original["userId"].as_str()
-            || ["access_token", "refresh_token", "id_token"]
-                .iter()
-                .any(|k| saved.facts.material.get(*k) != output["tokens"].get(*k))
-        {
-            return Err(fault("工作区授权凭据写回未确认"));
-        }
-        if output["event"] == "team_upgrade" {
-            let pending_enable = detail(host, id).await?;
-            require_idle(&pending_enable)?;
-            if settings(&pending_enable) != expected
-                || pending_enable["_credentialRevision"] != result.credential_revision
-            {
-                return Err(fault("Team 调度开启前账号配置或凭据已变化"));
-            }
-            admin(
-                host,
-                "POST",
-                "/api/admin/accounts/batch-update",
-                Some(json!({"accountIds":[id],"enabled":true})),
-            )
-            .await?;
-            expected["enabled"] = json!(true);
-            let enabled = detail(host, id).await?;
-            if settings(&enabled) != expected
-                || enabled["_credentialRevision"] != result.credential_revision
-                || enabled["status"] != "normal"
-            {
-                return Err(fault("Team 调度开启结果未确认"));
-            }
-        }
-        Ok(())
+        .await
+        .map_err(|_| fault("RS 已保存凭据读取失败"))?;
+    let value: AuthCredential =
+        serde_json::from_slice(&reply.payload).map_err(|_| fault("RS 已保存凭据格式无效"))?;
+    if value.account_id != id || value.provider_id != "openai" {
+        return Err(fault("RS 已保存凭据账号不一致"));
     }
-    .await;
-    result.map_err(|_: PluginFault| fault("工作区授权或调度状态未确认，请人工核对；不会自动重试"))
+    Ok(value)
+}
+
+pub fn tokens(credential: &AuthCredential) -> Value {
+    json!({"access_token":credential.facts.material.get("access_token"),"refresh_token":credential.facts.material.get("refresh_token"),"id_token":credential.facts.material.get("id_token")})
+}
+
+pub fn subject(credential: &AuthCredential) -> Result<String, PluginFault> {
+    if let Some(subject) = credential
+        .facts
+        .material
+        .get("principal")
+        .and_then(|p| p["oauth_subject"].as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(subject.into());
+    }
+    // 旧存量凭据的过期 JWT 仅用于重建原绑定，不作为可用授权，也不跳过新令牌核验
+    let mut subjects = Vec::new();
+    for key in ["id_token", "access_token"] {
+        let token = credential
+            .facts
+            .material
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| s.len() <= 32768)
+            .ok_or_else(|| fault("原账号主体无法从已保存凭据确认"))?;
+        let parts: Vec<_> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(fault("原账号主体无法从已保存凭据确认"));
+        }
+        let raw = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|_| fault("原账号主体参考格式无效"))?;
+        let value: Value =
+            serde_json::from_slice(&raw).map_err(|_| fault("原账号主体参考格式无效"))?;
+        let auth = &value[AUTH];
+        if auth["chatgpt_user_id"]
+            .as_str()
+            .or_else(|| auth["user_id"].as_str())
+            != credential.facts.upstream_user_id.as_deref()
+            || auth["chatgpt_account_id"].as_str()
+                != credential.facts.upstream_account_id.as_deref()
+        {
+            return Err(fault("原账号已存主体与用户或工作区不一致"));
+        }
+        if key == "id_token" {
+            let email = value["email"]
+                .as_str()
+                .or_else(|| value["https://api.openai.com/profile"]["email"].as_str());
+            if !email
+                .zip(credential.facts.email.as_deref())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                return Err(fault("原账号已存主体邮箱不一致"));
+            }
+        }
+        let sub = value["sub"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_whitespace))
+            .ok_or_else(|| fault("原账号主体参考缺失"))?;
+        subjects.push(sub.to_owned());
+    }
+    if subjects[0] != subjects[1] {
+        return Err(fault("原账号 ID 与访问令牌主体不一致"));
+    }
+    Ok(subjects.remove(0))
 }

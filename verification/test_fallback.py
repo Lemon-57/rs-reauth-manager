@@ -1,4 +1,4 @@
-"""Offline guards plus the unmodified vendor's actual PKCE and token-exchange code."""
+"""Offline workspace guards and the unmodified upstream authorization-code flow."""
 import base64
 import copy
 import hashlib
@@ -96,23 +96,23 @@ class FallbackGuards(unittest.TestCase):
 
 
 class AutomaticWorkspaceTransitions(unittest.TestCase):
-    def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None):
+    def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None, automatic=False, token_workspace=None):
         self.messages, self.calls = [], []
         source = 'personal-workspace' if plan == 'free' else 'old-team'
-        target = 'new-team' if plan == 'free' else 'personal-workspace'
+        target = source if automatic else 'new-team' if plan == 'free' else 'personal-workspace'
         workspaces = workspaces if workspaces is not None else [
             {'id': 'personal-workspace', 'type': 'personal', 'plan_type': 'free'},
             *([{'id': 'new-team', 'type': 'team', 'plan_type': 'team'}] if plan == 'free' else []),
         ]
         cookie = {} if html_only else {'workspaces': workspaces}
-        data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': desktop_url(), 'accountId': source, 'userId': 'original-user', 'planType': plan}
+        data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': desktop_url(), 'accountId': source, 'userId': 'original-user', 'planType': plan, 'automatic': automatic}
         query = {}
         testcase = self
         consent = 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent'
         value = tokens()
         for key in ['access_token', 'id_token']:
             payload = json.loads(base64.urlsafe_b64decode(value[key].split('.')[1] + '=='))
-            payload[AUTH].update(chatgpt_account_id=target, chatgpt_plan_type=token_plan, chatgpt_user_id='wrong-user' if wrong_user else 'original-user')
+            payload[AUTH].update(chatgpt_account_id=token_workspace or target, chatgpt_plan_type=token_plan, chatgpt_user_id='wrong-user' if wrong_user else 'original-user')
             value[key] = jwt(payload)
         def response(url, status=200, body=None, location=None):
             return types.SimpleNamespace(url=url, status_code=status, headers={'Location': location} if location else {}, text=json.dumps(body or {}), json=lambda: body or {})
@@ -152,7 +152,7 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
         with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **kw: self.messages.append({'event': event, **kw})):
             runner.run(data)
 
-    def test_free_with_unique_team_switches_using_fresh_pkce(self):
+    def test_free_with_unique_team_returns_native_workspace_callback(self):
         for html_only in [False, True]:
             with self.subTest(html_only=html_only):
                 self.execute(html_only=html_only)
@@ -175,13 +175,13 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
                 selected = [body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')]
                 self.assertEqual(selected, ['new-team'])
 
-    def test_organization_candidate_requires_real_team_tokens_and_same_user(self):
-        workspaces = [{'id': 'personal-workspace', 'kind': 'personal'}, {'id': 'new-team', 'kind': 'organization'}]
-        for token_plan, wrong_user in [('free', False), ('plus', False), ('enterprise', False), ('team', True)]:
-            with self.subTest(plan=token_plan, wrong_user=wrong_user):
-                self.execute(workspaces=workspaces, html_only=True, token_plan=token_plan, wrong_user=wrong_user)
-                self.assertEqual(self.messages[-1]['event'], 'error')
-                self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+    def test_organization_authorization_returns_code_for_native_identity_validation(self):
+        for plan in ['free','plus','enterprise','team']:
+            self.execute(workspaces=[{'id':'new-team','kind':'organization'},{'id':'personal-workspace','kind':'personal'}],html_only=True,token_plan=plan)
+            self.assertEqual(self.messages[-1]['event'],'team_upgrade')
+            self.assertIn('state=fixture',self.messages[-1]['callbackUrl'])
+            self.assertNotIn('tokens',self.messages[-1])
+            self.assertFalse(any(url.endswith('/oauth/token') for _,url,_ in self.calls))
 
     def test_multiple_organizations_require_manual_workspace_choice(self):
         self.execute(html_only=True, workspaces=[
@@ -243,17 +243,40 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
         self.execute(workspaces=[{'id': 'personal-workspace', 'type': 'personal'}, {'id': 'new-team'}])
         self.assertEqual(self.messages[-1]['event'], 'complete')
 
-    def test_team_upgrade_rejects_nonteam_or_changed_identity(self):
-        for token_plan, wrong_user in [('free', False), ('plus', False), ('team', True)]:
-            with self.subTest(plan=token_plan, wrong_user=wrong_user):
-                self.execute(token_plan=token_plan, wrong_user=wrong_user)
-                self.assertEqual(self.messages[-1]['event'], 'error')
-                self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+    def test_team_upgrade_never_accepts_or_exchanges_plugin_tokens(self):
+        self.execute(token_plan='free',wrong_user=True)
+        self.assertEqual(self.messages[-1]['event'],'team_upgrade')
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertFalse(any(url.endswith('/oauth/token') for _,url,_ in self.calls))
 
     def test_other_team_remaining_does_not_trigger_automatic_free_downgrade(self):
         self.execute(plan='team', token_plan='free', workspaces=[{'id': 'personal-workspace', 'type': 'personal'}, {'id': 'other-team', 'type': 'team'}])
         self.assertEqual(self.messages[-1]['event'], 'error')
         self.assertEqual(self.messages[-1]['code'], 'workspace')
+
+
+    def test_unattended_preserves_original_team_and_rs_pkce(self):
+        self.execute(plan='team',automatic=True,workspaces=[{'id':'old-team','type':'team'},{'id':'another-team','type':'team'}])
+        self.assertEqual(self.messages[-1]['event'],'complete')
+        self.assertIn('state=fixture',self.messages[-1]['callbackUrl'])
+        self.assertEqual([b['workspace_id'] for _,u,b in self.calls if u.endswith('/workspace/select')],['old-team'])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u,_ in self.calls))
+
+    def test_unattended_free_does_not_upgrade_to_team(self):
+        self.execute(plan='free',token_plan='free',automatic=True)
+        self.assertEqual(self.messages[-1]['event'],'complete')
+        self.assertNotIn('tokens',self.messages[-1])
+
+    def test_unattended_emits_no_credentials_before_native_validation(self):
+        self.execute(plan='team',automatic=True,workspaces=[{'id':'old-team','type':'team'}],wrong_user=True)
+        self.assertEqual(self.messages[-1]['event'],'complete')
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u,_ in self.calls))
+
+    def test_unattended_missing_original_workspace_never_downgrades(self):
+        self.execute(plan='team', token_plan='free', automatic=True)
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertFalse(any(url.endswith('/oauth/token') for _, url, _ in self.calls))
 
 
 class RealVendorFreeRecovery(unittest.TestCase):
@@ -288,18 +311,19 @@ class RealVendorFreeRecovery(unittest.TestCase):
                     status = 200 if url.endswith('/issue_challenge') else next(mfa_states)
                     body = {'error': {'code': 'invalid_state'}} if status == 409 else {}
                     if url.endswith('/verify') and status == 200:
+                        self.authenticated = True
                         body = {'continue_url': f'http://127.0.0.1:1455/auth/callback?state={recovery_queries[-1]["state"][0]}&code=fixture-code'}
                     return types.SimpleNamespace(status_code=status, url=url, headers={}, text=json.dumps(body), json=lambda: body)
                 testcase.assertEqual(method, "GET")
                 testcase.assertEqual(urlsplit(url).netloc, "auth.openai.com")
                 calls.append((method, url))
                 params = parse_qs(urlsplit(url).query)
-                if invalid_mfa_once and url != URL:
+                if invalid_mfa_once and not getattr(self,'authenticated',False) and sum(m == 'GET' and u == URL for m, u in calls) > 1:
                     recovery_queries.append(params)
                     return types.SimpleNamespace(status_code=302, url=url, headers={'Location': 'https://auth.openai.com/mfa-challenge/fixture-factor'}, text='')
-                if url == URL and selection_page:
+                if url == URL and selection_page and sum(m == 'GET' and u == URL for m, u in calls) == 1:
                     return types.SimpleNamespace(status_code=200, url="https://auth.openai.com/workspace", headers={}, text="workspaces", json=lambda: {})
-                state = "wrong" if bad_state and url != URL else params["state"][0]
+                state = "wrong" if bad_state else params["state"][0]
                 return types.SimpleNamespace(status_code=302, url=url, headers={"Location": f"http://127.0.0.1:1455/auth/callback?state={state}&code=fixture-code"}, text="")
 
             def post(self, url, **kwargs):
@@ -329,38 +353,36 @@ class RealVendorFreeRecovery(unittest.TestCase):
         with patch.object(TotpMfaClient, 'get_mfa_code', side_effect=['123456', '234567']), patch.object(oauth_client.OAuthClient, '_resolve_totp_factor', return_value={'id': 'fixture-factor'}), patch.object(oauth_client.OAuthClient, '_visit_oauth_page'), patch.object(chatgpt_client, "create_http_session", side_effect=session), patch.object(oauth_client, "create_http_session", side_effect=session), patch.object(socket, "create_connection", side_effect=AssertionError("Network forbidden")), patch.object(runner, "emit", side_effect=lambda event, **fields: messages.append({"event": event, **fields})):
             runner.run(data)
 
-    def test_free_transition_can_restart_with_fresh_pkce_and_no_stale_failure(self):
+    def test_free_transition_restart_retains_rs_state_and_pkce(self):
         self.execute(invalid_mfa_once=True)
-        self.assertEqual(self.messages[-1]['event'], 'free_fallback')
-        self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
-        self.assertFalse(any(m['event'] == 'error' for m in self.messages))
-        self.assertEqual(len(self.recovery_queries), 2)
-        self.assertNotEqual(self.recovery_queries[0]['state'], self.recovery_queries[1]['state'])
-        self.assertNotEqual(self.recovery_queries[0]['code_challenge'], self.recovery_queries[1]['code_challenge'])
-        self.assertEqual(sum(url.endswith('/oauth/token') for _, url in self.calls), 1)
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertTrue(self.recovery_queries)
+        for query in self.recovery_queries:
+            self.assertEqual(query['state'],['fixture'])
+            self.assertEqual(query['code_challenge'],['a'*43])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
-    def test_direct_callback_recovers_with_fresh_pkce_same_proxy_real_exchange(self):
+    def test_direct_callback_retains_rs_state_pkce_and_original_proxy(self):
         self.execute()
-        result = self.messages[-1]
-        self.assertEqual(result["event"], "free_fallback")
-        self.assertEqual(result["workspaceId"], "personal-workspace")
-        self.assertEqual(result["originalWorkspaceId"], "original-workspace")
-        self.assertIs(result["originalWorkspaceUnavailable"], True)
-        self.assertEqual(len(self.calls), 3)
-        self.assertNotIn("fixture-private-rt", json.dumps(self.messages[:-1]))
-        self.assertFalse(any(message["event"] == "complete" for message in self.messages))
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertEqual(self.messages[-1]['workspaceId'],'personal-workspace')
+        self.assertIn('state=fixture',self.messages[-1]['callbackUrl'])
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertEqual(len(self.calls),2)
+        for _,url in self.calls:
+            self.assertEqual(parse_qs(urlsplit(url).query)['code_challenge'],['a'*43])
 
     def test_selection_page_recovers_without_vendor_changes(self):
         self.execute(selection_page=True)
         self.assertEqual(self.messages[-1]["event"], "free_fallback")
 
-    def test_explicit_forced_workspace_uses_fresh_pkce_and_verified_nonfree_tokens(self):
+    def test_explicit_forced_workspace_returns_only_the_native_callback(self):
         self.execute(force=True)
-        self.assertEqual(self.messages[-1]["event"], "forced_workspace")
-        self.assertEqual(self.messages[-1]["workspaceId"], "personal-workspace")
-        self.assertIs(self.messages[-1]["administratorConfirmed"], True)
-        self.assertEqual(len(self.calls), 2)
-        self.assertNotIn("fixture-private-rt", json.dumps(self.messages[:-1]))
+        self.assertEqual(self.messages[-1]['event'],'forced_workspace')
+        self.assertEqual(self.messages[-1]['workspaceId'],'personal-workspace')
+        self.assertTrue(self.messages[-1]['administratorConfirmed'])
+        self.assertEqual(len(self.calls),1)
+        self.assertNotIn('tokens',self.messages[-1])
 
     def test_forced_wrong_state_never_emits_or_exchanges_tokens(self):
         self.execute(force=True, bad_state=True)
@@ -379,28 +401,26 @@ class RealVendorFreeRecovery(unittest.TestCase):
         self.assertEqual(self.messages[-1]['diagnostic']['stage'], 'identity')
         self.assertEqual(len(self.calls), 1)
 
-    def test_incomplete_tokens_never_emit_fallback(self):
+    def test_plugin_does_not_receive_fallback_tokens(self):
         self.execute(bad_tokens=True)
-        self.assertEqual(self.messages[-1]['code'], 'fallback_identity')
-        self.assertEqual(self.messages[-1]['diagnostic']['stage'], 'identity')
-        self.assertIsNone(self.messages[-1]['diagnostic']['httpStatus'])
-        self.assertFalse(any(message["event"] == "free_fallback" for message in self.messages))
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
-    def test_direct_token_exchange_retains_actual_http_failure(self):
+    def test_plugin_does_not_call_token_service_even_if_it_would_fail(self):
         self.execute(token_status=503)
-        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'upstream_unavailable', 'httpStatus': 503})
-        self.assertNotIn('private-response', json.dumps(self.messages))
-        self.assertFalse(any(message['event'] == 'free_fallback' for message in self.messages))
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
-    def test_token_redirect_is_rejected_with_specific_reason(self):
+    def test_plugin_never_follows_token_redirects(self):
         self.execute(token_status=307)
-        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'token_redirect_rejected', 'httpStatus': 307})
-        self.assertFalse(any(message['event'] == 'free_fallback' for message in self.messages))
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
-    def test_token_exchange_parse_failure_is_not_reported_as_proxy_or_identity(self):
+    def test_native_exchange_result_is_not_parsed_by_protocol_worker(self):
         self.execute(token_json_invalid=True)
-        self.assertEqual(self.messages[-1]['diagnostic'], {'stage': 'token_exchange', 'reason': 'response_invalid_json', 'httpStatus': 200})
-        self.assertNotIn('private-response', json.dumps(self.messages))
+        self.assertEqual(self.messages[-1]['event'],'free_fallback')
+        self.assertNotIn('tokens',self.messages[-1])
 
 
 class RealVendorForcedFreeConsent(unittest.TestCase):
@@ -490,12 +510,12 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         for secret in ['fixture-password', SECRET, 'fixture:pass', 'fixture-private-rt', 'fixture-code', 'private-error']:
             self.assertNotIn(secret, json.dumps(self.messages))
 
-    def test_consent_selects_personal_then_verifies_fresh_pkce_and_free_identity(self):
+    def test_consent_selects_personal_then_returns_rs_native_callback(self):
         self.execute()
         self.assertEqual(self.messages[-1]['event'], 'forced_free')
         self.assertEqual(self.messages[-1]['workspaceId'], 'personal-workspace')
         self.assertTrue(self.messages[-1]['administratorConfirmed'])
-        self.assertEqual([method for method, _ in self.calls], ['GET', 'GET', 'POST', 'POST'])
+        self.assertEqual([method for method, _ in self.calls], ['GET', 'GET', 'POST'])
         self.assertNotIn('fixture-private-rt', json.dumps(self.messages[:-1]))
 
     def test_explicit_free_verification_can_refresh_same_original_free_workspace(self):
@@ -566,15 +586,11 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         self.assert_no_writeback()
         self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'free_workspace_ambiguous')
 
-    def test_html_candidate_does_not_relax_final_free_identity_checks(self):
-        changed = tokens()
-        for key in ['id_token', 'access_token']:
-            payload = json.loads(base64.urlsafe_b64decode(changed[key].split('.')[1] + '=='))
-            payload[AUTH]['chatgpt_plan_type'] = 'team'
-            changed[key] = jwt(payload)
-        self.execute(cookie={}, dump_status=403, html_text='{"workspace_id":"personal-workspace"}', changed_tokens=changed)
-        self.assert_no_writeback()
-        self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+    def test_html_candidate_returns_native_callback_without_local_token_exchange(self):
+        self.execute(cookie={},dump_status=403,html_text='{"workspace_id":"personal-workspace"}')
+        self.assertEqual(self.messages[-1]['event'],'forced_free')
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
     def test_explicit_free_can_select_personal_even_if_original_team_is_listed(self):
         self.execute([{'id': 'original-workspace', 'type': 'team'}, {'id': 'personal-workspace', 'type': 'personal'}])
@@ -591,7 +607,7 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
     def test_direct_callback_still_requires_identity_without_workspace_selection(self):
         self.execute(cookie={}, direct=True)
         self.assertEqual(self.messages[-1]['event'], 'forced_free')
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 1)
 
     def test_ambiguous_candidates_do_not_select_first_workspace(self):
         for workspaces in [
@@ -625,17 +641,11 @@ class RealVendorForcedFreeConsent(unittest.TestCase):
         self.assert_no_writeback()
         self.assertFalse(any(url.endswith('/oauth/token') for _, url in self.calls))
 
-    def test_nonfree_or_other_user_tokens_never_emit_writeback(self):
-        for field, value in [('chatgpt_plan_type', 'plus'), ('chatgpt_user_id', 'other-user'), ('chatgpt_account_id', 'original-workspace'), ('chatgpt_account_id', 'another-personal-workspace')]:
-            changed = tokens()
-            for key in ['id_token', 'access_token']:
-                payload = json.loads(base64.urlsafe_b64decode(changed[key].split('.')[1] + '=='))
-                payload[AUTH][field] = value
-                changed[key] = jwt(payload)
-            with self.subTest(field=field):
-                self.execute(changed_tokens=changed)
-                self.assert_no_writeback()
-                self.assertEqual(self.messages[-1]['diagnostic']['reason'], 'identity_unconfirmed')
+    def test_forced_free_never_carries_locally_exchanged_tokens(self):
+        self.execute(changed_tokens=tokens())
+        self.assertEqual(self.messages[-1]['event'],'forced_free')
+        self.assertNotIn('tokens',self.messages[-1])
+        self.assertFalse(any(u.endswith('/oauth/token') for _,u in self.calls))
 
     def test_workspace_http_failure_retains_actual_stage_and_status(self):
         self.execute(selection_status=403)

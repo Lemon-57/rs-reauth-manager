@@ -1,8 +1,7 @@
-"""Verified personal-Free recovery, using the upstream PKCE and token exchange protocol."""
+"""Workspace selection on the original RS-owned authorization flow."""
 import base64
 import json
 import re
-import secrets
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
@@ -157,8 +156,9 @@ def verify_free_tokens(tokens, email, user_id, workspace, *, force=False):
     return verified
 
 
-def verify_tokens(tokens, email, user_id, workspace=None, *, force=False):
-    if not isinstance(tokens, dict) or any(not isinstance(tokens.get(key), str) or not tokens[key] or len(tokens[key]) > 32768 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in tokens[key]) for key in ["access_token", "refresh_token", "id_token"]):
+def verify_tokens(tokens, email, user_id, workspace=None, *, force=False, require_refresh=True):
+    keys = ["access_token", "id_token"] + (["refresh_token"] if require_refresh else [])
+    if not isinstance(tokens, dict) or any(not isinstance(tokens.get(key), str) or not tokens[key] or len(tokens[key]) > 32768 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in tokens[key]) for key in keys):
         raise ValueError("fallback_identity")
     identity = claims(tokens.get("id_token"))
     access = claims(tokens.get("access_token"))
@@ -184,58 +184,39 @@ def verify_tokens(tokens, email, user_id, workspace=None, *, force=False):
     workspace_ids = {auth.get("chatgpt_account_id") for auth in [identity_auth, access_auth]}
     if len(workspace_ids) != 1 or None in workspace_ids:
         raise ValueError("fallback_identity")
-    return ({key: tokens[key] for key in ["access_token", "refresh_token", "id_token"]}, workspace_ids.pop(), plans[0])
+    return ({key: tokens[key] for key in keys}, workspace_ids.pop(), plans[0])
 
 
 def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, force=False):
-    from vendor.lib.utils import generate_pkce
-
-    verifier, challenge = generate_pkce()
-    state = secrets.token_urlsafe(32)
     parsed = urlsplit(authorize_url)
     params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
-    params.update(state=state, code_challenge=challenge, code_challenge_method="S256")
-    # The RS pending verifier stays private to RS; never exchange its code with another verifier.
-    oauth.oauth_client_id = params["client_id"]
-    oauth.oauth_redirect_uri = params["redirect_uri"]
+    state = params['state']
     oauth.selected_workspace = personal_id
-    result = authorize(urlunsplit(parsed._replace(query=urlencode(params))), state)
+    result = authorize(authorize_url, state)
     if not isinstance(result, dict) or result.get("ok") is not True or result.get("state") != state or not isinstance(result.get("code"), str) or not result["code"] or not oauth.workspace_matches():
         raise ValueError("fallback_identity")
-    tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
-    return verify_free_tokens(tokens, data["email"], data.get("userId"), personal_id, force=force)
+    return result
 
 
 def recover_team(oauth, chat, authorize_url, data, workspace, authorize):
-    tokens = recover_free(oauth, chat, authorize_url, data, workspace, authorize, force=True)
-    _, _, plan = verify_tokens(tokens, data['email'], data.get('userId'), workspace, force=True)
-    if plan not in {'team', 'business'}:
-        raise ValueError('fallback_identity')
-    return tokens
+    return recover_free(oauth, chat, authorize_url, data, workspace, authorize, force=True)
 
 
 def recover_unbound_free(oauth, chat, authorize_url, data, authorize):
-    from vendor.lib.utils import generate_pkce
-
     if not data.get('userId'):
         raise ValueError('fallback_identity')
-    verifier, challenge = generate_pkce()
-    state = secrets.token_urlsafe(32)
     parsed = urlsplit(authorize_url)
     params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
-    params.update(state=state, code_challenge=challenge, code_challenge_method="S256")
-    oauth.oauth_client_id = params["client_id"]
-    oauth.oauth_redirect_uri = params["redirect_uri"]
+    state = params['state']
     oauth.unbound_workspace = True
     oauth.selected_workspace = ""
-    result = authorize(urlunsplit(parsed._replace(query=urlencode(params))), state)
+    result = authorize(authorize_url, state)
     if not isinstance(result, dict) or result.get("ok") is not True or result.get("state") != state or not isinstance(result.get("code"), str) or not result["code"]:
         raise ValueError("fallback_identity")
-    tokens = oauth._exchange_code_for_tokens(result["code"], verifier, chat.ua, chat.impersonate)
-    verified, workspace, plan = verify_tokens(tokens, data["email"], data.get("userId"), oauth.selected_workspace or None, force=False)
-    if (workspace == data.get("accountId") and str(data.get('planType') or '').strip().lower() != 'free') or plan != "free":
+    workspace = oauth.selected_workspace
+    if workspace == data.get("accountId") and str(data.get('planType') or '').strip().lower() != 'free':
         raise ValueError("fallback_identity")
-    return verified, workspace
+    return result, workspace
 
 
 def workspace_choices(session, original):

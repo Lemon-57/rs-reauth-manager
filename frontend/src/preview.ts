@@ -8,11 +8,13 @@ export function installPreview() {
   let jobs: Job[] = [{ requestId: 'preview-workspace:acct_preview_0', accountId: 'acct_preview_0', status: 'failed', step: 'workspace', message: '无法匹配原账号工作区，已停止写回', startedAt: Date.now() - 10000, finishedAt: Date.now(), workspaceChoices: [{ id: 'preview-other-team' }, { id: 'preview-personal-free' }] }]
   const diagnostics = ['提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误（HTTP 409） [上游错误码 invalid_state]\n首次登录失败：提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效（HTTP 409）\n已重建一次登录会话，本次仍失败，不再自动重登\n错误码：fixture_' + 'diagnostic_'.repeat(18) + '完整错误结尾', '提交 2FA 动态码：上游限制登录频率，不自动重试（最后响应 HTTP 429）', '密码验证：请求超时，保留原代理，不自动重试', '2FA 验证未通过，请检查原账号备注']
   jobs.push(...diagnostics.map((message, i): Job => ({ requestId: `preview-diagnostic:${i}`, accountId: `acct_preview_${i + 1}`, status: 'failed', step: 'failed', message, startedAt: Date.now() - 10000, finishedAt: Date.now() })))
+  let automationEnabled = false
   const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer })
   window.codexProxyPlugin = { version: 2, theme, async request(input) {
     const body = input.body ? JSON.parse(input.body) : {}
     if (input.path === 'api/accounts') return encode({ accounts })
-    if (input.path === 'api/jobs') return encode({ jobs })
+    if (input.path === 'api/jobs') return encode({ jobs, automation: { enabled: automationEnabled } })
+    if (input.path === 'api/automation') { automationEnabled = body.enabled === true; return encode({ jobs, automation: { enabled: automationEnabled } }) }
     if (input.path === 'api/delete') {
       const ids = body.accountIds as string[]
       accounts = accounts.filter(a => !ids.includes(a.id)); jobs = jobs.filter(j => !ids.includes(j.accountId))

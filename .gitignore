@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .cache/
 .venv/
+reports/
 *.log
 *.env
 *.env.*
@@ -23,6 +24,7 @@ verification/*
 !verification/test_vendor_contract.py
 !verification/test_fallback.py
 !verification/test_page_resources.py
+!verification/test_sessions.py
 !verification/bridge-test.mjs
 !verification/checkbox-test.mjs
 !verification/batch-test.mjs

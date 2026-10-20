@@ -110,7 +110,10 @@ def _run_once(data, used_codes):
     target = str(data.get("accountId") or "")
     forced = data.get("forceWorkspaceId")
     forced_free = data.get("forceFree") is True
-    auto_team = str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
+    automatic = data.get("automatic") is True
+    auto_team = not automatic and str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
+    if automatic and (forced or forced_free or not target or not data.get("userId") or not data.get("planType")):
+        raise ValueError("workspace")
     if forced is not None and (not isinstance(forced, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", forced) or forced == target):
         raise ValueError("workspace")
 
@@ -155,15 +158,8 @@ def _run_once(data, used_codes):
             return response
 
         def _exchange_code_for_tokens(self, *args, **kwargs):
-            self.last_attempt = {'stage': 'token_exchange', 'httpStatus': None}
-            try:
-                tokens = super()._exchange_code_for_tokens(*args, **kwargs)
-            except Exception as exc:
-                self.last_attempt['transport'] = transport_reason(exc)
-                raise
-            if not tokens:
-                self.failed_authorization = describe_failure({'error': 'token_exchange_failed'}, attempt=self.last_attempt)
-            return tokens
+            # All authorization codes belong to RS, including workspace recovery.
+            raise ValueError('native_exchange_required')
 
         def _remember_workspace(self, value):
             value = str(value or '').strip()
@@ -244,6 +240,8 @@ def _run_once(data, used_codes):
                     except ValueError:
                         continue
                     if personal in ids:
+                        if automatic:
+                            raise ValueError("workspace")
                         raise WorkspaceUnavailable(personal)
             if not ids and self.session_lookup_failure:
                 self.failed_authorization = self.session_lookup_failure
@@ -299,6 +297,12 @@ def _run_once(data, used_codes):
         return describe_failure(attempt={'stage': 'session', 'httpStatus': None}, exception=exc)
     chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt))
     oauth.session = chat.session
+    def completed(event, result=None, **fields):
+        if result is not None:
+            if result.get('state') != state or not result.get('code'):
+                raise ValueError('state')
+            fields['callbackUrl'] = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({'state': state, 'code': result['code']}), ''))
+        emit(event, deviceId=chat.device_id, **fields)
     try:
         emit("step", step="login")
         def authorize(url, expected):
@@ -316,6 +320,8 @@ def _run_once(data, used_codes):
                 pending = oauth.unresolved_workspace
                 if isinstance(result, dict) and result.get('error') in {'oauth_callback_not_found', 'oauth_callback_timeout'} and pending and pending['attempt'] is oauth.last_attempt:
                     if pending['personal']:
+                        if automatic:
+                            raise ValueError('workspace')
                         raise WorkspaceUnavailable(pending['personal'])
                     if pending['failure']['code'] == 'workspace':
                         raise ValueError('workspace')
@@ -324,26 +330,28 @@ def _run_once(data, used_codes):
             return result
 
         def fallback(personal):
+            if automatic:
+                raise ValueError("workspace")
             if not data.get("userId"):
                 raise ValueError("fallback_identity")
             oauth.bound_workspace = False
-            tokens = recover_free(oauth, chat, authorize_url, data, personal, authorize)
-            emit("free_fallback", workspaceId=personal, originalWorkspaceId=target, originalWorkspaceUnavailable=True, tokens=tokens)
+            result = recover_free(oauth, chat, authorize_url, data, personal, authorize)
+            completed("free_fallback", workspaceId=personal, originalWorkspaceId=target, originalWorkspaceUnavailable=True, result=result)
 
         try:
             if forced_free:
-                tokens, workspace = recover_unbound_free(oauth, chat, authorize_url, data, authorize)
-                emit("forced_free", workspaceId=workspace, originalWorkspaceId=target, administratorConfirmed=True, tokens=tokens)
+                result, workspace = recover_unbound_free(oauth, chat, authorize_url, data, authorize)
+                completed("forced_free", workspaceId=workspace, originalWorkspaceId=target, administratorConfirmed=True, result=result)
                 return
             if forced:
-                tokens = recover_free(oauth, chat, authorize_url, data, forced, authorize, force=True)
-                emit("forced_workspace", workspaceId=forced, originalWorkspaceId=target, administratorConfirmed=True, tokens=tokens)
+                result = recover_free(oauth, chat, authorize_url, data, forced, authorize, force=True)
+                completed("forced_workspace", workspaceId=forced, originalWorkspaceId=target, administratorConfirmed=True, result=result)
                 return
             try:
                 result = authorize(authorize_url, state)
             except WorkspaceUpgrade as upgrade:
-                tokens = recover_team(oauth, chat, authorize_url, data, upgrade.workspace_id, authorize)
-                emit('team_upgrade', workspaceId=upgrade.workspace_id, originalWorkspaceId=target, uniqueTeamConfirmed=True, tokens=tokens)
+                result = recover_team(oauth, chat, authorize_url, data, upgrade.workspace_id, authorize)
+                completed('team_upgrade', workspaceId=upgrade.workspace_id, originalWorkspaceId=target, uniqueTeamConfirmed=True, result=result)
                 return
             except WorkspaceUnavailable as unavailable:
                 fallback(unavailable.personal_id)
@@ -359,14 +367,14 @@ def _run_once(data, used_codes):
                     oauth._remember_workspace(choice['id'])
                 team = team_candidate(session, target)
                 if team:
-                    tokens = recover_team(oauth, chat, authorize_url, data, team, authorize)
-                    emit('team_upgrade', workspaceId=team, originalWorkspaceId=target, uniqueTeamConfirmed=True, tokens=tokens)
+                    result = recover_team(oauth, chat, authorize_url, data, team, authorize)
+                    completed('team_upgrade', workspaceId=team, originalWorkspaceId=target, uniqueTeamConfirmed=True, result=result)
                     return
             if not oauth.workspace_matches():
                 fallback(automatic_free_candidate(oauth._decode_oauth_session_cookie(), target))
                 return
             callback = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({"state": state, "code": result["code"]}), ""))
-            emit("complete", callbackUrl=callback)
+            completed("complete", callbackUrl=callback)
         except ValueError as exc:
             if oauth.local_mfa_failure is not None:
                 return oauth.local_mfa_failure
@@ -399,10 +407,20 @@ def main():
         os._exit(0)
     threading.Thread(target=watchdog, daemon=True).start()
     try:
-        data = json.loads(sys.stdin.read(16385))
+        raw = sys.stdin.read(131073)
+        if len(raw) > 131072:
+            raise ValueError('protocol')
+        data = json.loads(raw)
         # Vendored diagnostics must never share the structured protocol pipe.
         with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            run(data)
+            if data.get('action') in {'cleanup_sessions', 'verify_sessions'}:
+                from sessions import SessionCleanupError, cleanup
+                try:
+                    cleanup(data, emit)
+                except SessionCleanupError as exc:
+                    emit('error', code='sessions', diagnostic={'stage': 'other_sessions', 'reason': exc.reason, 'httpStatus': None})
+            else:
+                run(data)
     except ValueError as exc:
         code = str(exc)
         if code in {'credentials', 'authorization', 'workspace', 'proxy'}:

@@ -13,7 +13,7 @@ import { displayTime, isActive, planLabel, planType, progress, resultMessage, st
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
 
-const { accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
+const { automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
 const statusOptions = [{ value: 'all', label: '全部状态' }, { value: 'error', label: '账号异常' }, { value: 'ready', label: '可重新授权' }, { value: 'active', label: '处理中' }, { value: 'failed', label: '本次未完成' }, { value: 'success', label: '本次成功' }, { value: 'invalid', label: '备注或代理缺失' }, { value: 'disabled', label: '已停用' }]
 const columns: TableColumn<Account>[] = [{ key: 'select', label: '', kind: 'selection' }, { key: 'identity', label: '账号', kind: 'identity', width: 300 }, { key: 'groups', label: '分组', kind: 'meta', width: 160 }, { key: 'plan', label: '订阅', width: 85 }, { key: 'status', label: '账号状态', width: 110 }, { key: 'credentials', label: '登录资料', width: 112 }, { key: 'proxy', label: '账号代理', minWidth: 165 }, { key: 'expiry', label: '访问令牌到期', width: 170 }, { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210 }, { key: 'actions', label: '操作', kind: 'actions', width: 86 }]
 </script>
@@ -26,6 +26,11 @@ const columns: TableColumn<Account>[] = [{ key: 'select', label: '', kind: 'sele
       <ZButton type="success" variant="text" class="counter" :aria-pressed="filter === 'success'" aria-label="显示本次任务成功的账号" title="本次提交成功的账号，重新进入页面归零" @click="showResults('success')"><span>成功</span><b>{{ success }}</b></ZButton>
       <ZButton :type="failed ? 'danger' : 'default'" variant="text" class="counter" :aria-pressed="filter === 'failed'" aria-label="显示本次任务未完成的账号" title="本次提交失败、需核对或中断的账号，重新进入页面归零" @click="showResults('failed')"><span>未完成</span><b>{{ failed }}</b></ZButton>
     </div>
+    <div class="selection" role="group" aria-label="自动重新授权设置">
+      <ZCheckbox :model-value="automationEnabled" :disabled="!automationLoaded || automationBusy || busy" :label="automationLoaded ? '自动重新授权' : '自动重新授权（状态未读取）'" @change="setAutomation" />
+      <span class="muted">每分钟检查凭据失效，单次尝试，保留原代理、工作区和配置</span>
+    </div>
+    <p class="muted">手动与自动重新授权均会登出其他设备，保留本次登录，退出期间暂时暂停该账号调度，完成后按原策略恢复，退出或验证失败时保留暂停并提示核对</p>
     <div class="toolbar">
       <ZInput v-model="search" class="search" placeholder="搜索邮箱、分组或代理" clearable aria-label="搜索账号"><template #prefix><Search :size="16" /></template></ZInput>
       <ZSelect v-model="plan" class="filter" :options="planOptions" aria-label="会员标识筛选" />

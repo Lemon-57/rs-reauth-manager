@@ -1,9 +1,12 @@
 //! 管理接口、授权队列与宿主生命周期的组合
 
+mod automatic;
 mod deletion;
 mod diagnostics;
 mod host;
+mod native;
 mod recovery;
+mod sessions;
 mod worker;
 
 use gateway_plugin_sdk::{
@@ -36,6 +39,14 @@ struct Job {
     force_workspace_id: Option<String>,
     #[serde(default)]
     free_fallback: bool,
+    #[serde(default)]
+    automatic: bool,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+    #[serde(default)]
+    logout_others: bool,
+    #[serde(default)]
+    cleanup_started: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkspaceChoice {
@@ -55,6 +66,8 @@ impl Job {
 #[derive(Default, Serialize, Deserialize)]
 pub struct Queue {
     jobs: Vec<Job>,
+    #[serde(default)]
+    automation: automatic::Automation,
 }
 struct Manager {
     runtime: worker::Runtime,
@@ -121,6 +134,7 @@ fn registration() -> ManagementRegistration {
             ("GET", "api/accounts"),
             ("GET", "api/jobs"),
             ("POST", "api/submit"),
+            ("POST", "api/automation"),
             ("POST", "api/cancel"),
             ("POST", "api/delete"),
             ("POST", "api/tick"),
@@ -211,6 +225,7 @@ async fn detail(host: &HostClient, id: &str) -> Result<Value, PluginFault> {
         return Err(fault("账号凭据版本匹配失败"));
     }
     a["_credentialRevision"] = runtime["credential_revision"].clone();
+    a["_credentialState"] = runtime["credential_state"].clone();
     Ok(a)
 }
 async fn proxy(host: &HostClient, a: &Value) -> Result<String, PluginFault> {
@@ -254,8 +269,9 @@ async fn proxy(host: &HostClient, a: &Value) -> Result<String, PluginFault> {
     }
     Ok(text.into())
 }
-async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
-    let mut rows = vec![];
+async fn directory(host: &HostClient) -> Result<Vec<Value>, PluginFault> {
+    let mut accounts = vec![];
+    let mut seen = std::collections::BTreeSet::new();
     for page in 1..=100u16 {
         let data = admin(
             host,
@@ -267,25 +283,43 @@ async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
         let items = data["items"]
             .as_array()
             .ok_or_else(|| fault("账号列表格式无效"))?;
-        for a in items.iter().filter(|a| eligible(a)) {
-            let groups = a["groups"]
-                .as_array()
-                .ok_or_else(|| fault("账号分组格式无效"))?
-                .iter()
-                .map(
-                    |group| match (group["id"].as_str(), group["name"].as_str()) {
-                        (Some(id), Some(name)) => Ok(json!({"id":id,"name":name})),
-                        _ => Err(fault("账号分组格式无效")),
-                    },
-                )
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.push(json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a),"groups":groups}));
+        if items.len() > 100 {
+            return Err(fault("账号分页大小无效"));
+        }
+        for a in items {
+            let id = a["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| fault("账号目录身份无效"))?;
+            if !seen.insert(id.to_owned()) {
+                return Err(fault("账号目录存在重复分页"));
+            }
+            accounts.push(a.clone());
         }
         if items.len() < 100 {
-            return Ok(json!({"accounts":rows}));
+            return Ok(accounts);
         }
     }
     Err(fault("账号超过本次读取上限"))
+}
+async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
+    let accounts = directory(host).await?;
+    let mut rows = vec![];
+    for a in accounts.iter().filter(|a| eligible(a)) {
+        let groups = a["groups"]
+            .as_array()
+            .ok_or_else(|| fault("账号分组格式无效"))?
+            .iter()
+            .map(
+                |group| match (group["id"].as_str(), group["name"].as_str()) {
+                    (Some(id), Some(name)) => Ok(json!({"id":id,"name":name})),
+                    _ => Err(fault("账号分组格式无效")),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.push(json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a),"groups":groups}));
+    }
+    Ok(json!({"accounts":rows}))
 }
 fn protocol_error(code: &str) -> &'static str {
     match code {
@@ -311,7 +345,12 @@ impl Manager {
         let mut changed = false;
         for job in &mut queue.jobs {
             if job.active() {
-                job.finish("interrupted", "插件进程已重启，请先检查原账号后手动重试");
+                let message = if job.cleanup_started {
+                    "设备退出流程被中断，账号可能已暂停；请核对设备、RT 与启停状态，不会自动重试"
+                } else {
+                    "插件进程已重启，原生授权或启停状态可能尚未确认，请先核对账号与提交回执后手动处理"
+                };
+                job.finish("interrupted", message);
                 changed = true;
             }
         }
@@ -340,99 +379,186 @@ impl Manager {
             };
             let job = &mut queue.jobs[position];
             if let Some(output) = output {
-                if output["event"] == "complete" {
-                    if job.force_workspace_id.is_some() {
-                        job.finish("review", "强制授权返回类型不匹配，未写回");
-                        host::save(host, &queue, version).await?;
-                        return Ok(());
+                if current.snapshot["phase"] == "cleanup" {
+                    let launched =
+                        match sessions::refresh(host, &job.account_id, &current.snapshot, &output)
+                            .await
+                        {
+                            Ok((input, snapshot)) => {
+                                self.runtime
+                                    .start(
+                                        input,
+                                        current.flow.clone(),
+                                        snapshot,
+                                        current.request_id.clone(),
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                    match launched {
+                        Ok(mut worker) => {
+                            worker.started = current.started;
+                            self.worker = Some(worker);
+                            job.step = "verify_refresh".into();
+                            host::save(host, &queue, version).await?;
+                            return Ok(());
+                        }
+                        Err(error) => job.finish(
+                            "review",
+                            &format!(
+                                "{}；请核对设备、原生 RT 与账号启停，不会自动重放",
+                                error.message
+                            ),
+                        ),
                     }
-                    job.step = "saving".into();
-                    let result=async {
-                        let latest=detail(host,&job.account_id).await?;
-                        require_idle(&latest)?;
-                        if settings(&latest)!=current.snapshot["settings"] || latest["_credentialRevision"] != current.snapshot["credentialRevision"] {return Err(fault("登录期间账号配置或凭据发生变化，已停止写回"))}
-                        let callback=output["callbackUrl"].as_str().ok_or_else(||fault("协议回调格式无效"))?;
-                        let done=admin(host,"POST","/api/admin/accounts/oauth/complete",Some(json!({"provider":"openai","flowId":current.flow,"callbackUrl":callback}))).await?;
-                        if done["accountId"]!=job.account_id{return Err(fault("RS 写回账号与原账号不一致，请人工核对"))}
-                        let after=detail(host,&job.account_id).await?;
-                        if settings(&after)!=current.snapshot["settings"]{return Err(fault("授权已提交，但账号配置校验不一致，请人工核对"))}
-                        if after["status"]=="error"||!after["hasRefreshToken"].as_bool().unwrap_or(false){return Err(fault("授权已提交，但账号状态尚未恢复，请人工核对"))}
-                        Ok::<(),PluginFault>(())
-                    }.await;
-                    match result {
-                        Ok(()) => job.finish("success", "新授权已写回原账号，配置校验通过"),
-                        Err(error) => job.finish("review", &error.message),
-                    }
-                } else if output["event"] == "free_fallback"
-                    || output["event"] == "forced_workspace"
-                    || output["event"] == "forced_free"
-                    || output["event"] == "team_upgrade"
-                {
-                    job.step = "saving".into();
-                    let forced = output["event"] == "forced_workspace";
-                    let forced_free = output["event"] == "forced_free";
-                    let upgraded = output["event"] == "team_upgrade";
-                    if (forced
-                        && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
-                            || job.force_workspace_id.is_none()))
-                        || (!forced && job.force_workspace_id.is_some())
-                        || (forced_free && !job.free_fallback)
-                        || (upgraded && job.free_fallback)
-                    {
-                        job.finish("review", "工作区与管理员确认不一致，未写回");
-                        host::save(host, &queue, version).await?;
-                        return Ok(());
-                    }
-                    match recovery::commit(host, &job.account_id, &current.snapshot, &output).await
+                } else if current.snapshot["phase"] == "verify" {
+                    match sessions::finish(host, &job.account_id, &current.snapshot, &output).await
                     {
                         Ok(()) => {
-                            if upgraded {
-                                job.finish(
-                                    "success",
-                                    "已切换到同一用户的唯一 Team 工作区，已开启调度",
-                                );
-                            } else if forced {
-                                job.finish(
-                                    "success",
-                                    "管理员已确认，其他工作区授权已写回原账号，已停止调度",
-                                );
-                            } else if forced_free {
-                                job.finish(
-                                    "success",
-                                    "管理员已确认，已退回同一用户的 Free 并停止调度",
-                                );
-                                job.step = "free".into();
-                            } else {
-                                job.finish("success", "原工作区已失效，已切回 Free，已停止调度");
+                            let message = format!(
+                                "{}；已登出其他设备，本次 RT 刷新及写回已确认",
+                                current.snapshot["successMessage"]
+                                    .as_str()
+                                    .unwrap_or("新授权已写回")
+                            );
+                            job.finish("success", &message);
+                            if current.snapshot["successStep"] == "free" {
                                 job.step = "free".into();
                             }
                         }
-                        Err(error) => job.finish("review", &error.message),
+                        Err(error) => {
+                            let diagnostic = diagnostics::message(&output, &error.message);
+                            job.finish(
+                                "review",
+                                &format!(
+                                    "{diagnostic}；请核对账号启停、设备退出与 RT 状态，不会自动重试"
+                                ),
+                            );
+                        }
+                    }
+                } else if matches!(
+                    output["event"].as_str(),
+                    Some(
+                        "complete"
+                            | "free_fallback"
+                            | "forced_workspace"
+                            | "forced_free"
+                            | "team_upgrade"
+                    )
+                ) {
+                    job.step = "saving".into();
+                    current.snapshot["flowId"] = json!(current.flow);
+                    match native::complete(host,job,&mut current.snapshot,&output).await {
+                        Ok((message,free))=>{job.finish("success",&message);if free {job.step="free".into();}},
+                        Err(error)=>job.finish("review",&format!("原生授权未确认：{}；请核对账号启停及提交回执，不会自动改走插件换取 RT",error.message)),
                     }
                 } else {
-                    job.finish(
-                        "failed",
-                        &diagnostics::message(
-                            &output,
-                            protocol_error(output["code"].as_str().unwrap_or_default()),
-                        ),
+                    let message = diagnostics::message(
+                        &output,
+                        protocol_error(output["code"].as_str().unwrap_or_default()),
                     );
+                    job.finish("failed", &message);
                     if output["code"] == "workspace" && job.force_workspace_id.is_none() {
                         job.step = "workspace".into();
                         job.workspace_choices = workspace_choices(&output);
                     }
                 }
+                if job.status == "success"
+                    && job.logout_others
+                    && current.snapshot["phase"].is_null()
+                {
+                    let id = job.account_id.clone();
+                    let success_message = job.message.clone();
+                    let success_step = job.step.clone();
+                    job.status = "running".into();
+                    job.step = "other_sessions".into();
+                    job.finished_at = None;
+                    job.cleanup_started = true;
+                    // 暂停或撤销前先持久化操作意图
+                    host::save(host, &queue, version).await?;
+                    let prepared = sessions::prepare(
+                        host,
+                        &id,
+                        &output["deviceId"],
+                        &current.snapshot,
+                        &output,
+                    )
+                    .await;
+                    let launched = match prepared {
+                        Ok((input, mut snapshot)) => {
+                            snapshot["successMessage"] = json!(success_message);
+                            snapshot["successStep"] = json!(success_step);
+                            self.runtime
+                                .start(
+                                    input,
+                                    current.flow.clone(),
+                                    snapshot,
+                                    current.request_id.clone(),
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let (mut latest, version) = host::load(host).await?;
+                    match launched {
+                        Ok(mut worker) => {
+                            worker.started = current.started;
+                            self.worker = Some(worker);
+                        }
+                        Err(error) => latest.jobs[position].finish(
+                            "review",
+                            &format!(
+                                "新授权已写回，设备退出未完成：{}；请核对账号启停状态",
+                                error.message
+                            ),
+                        ),
+                    }
+                    host::save(host, &latest, version).await?;
+                    return Ok(());
+                }
             } else if now().saturating_sub(current.started) > 420000 {
-                job.finish("failed", "协议登录超时，未自动重试");
+                let message = if job.cleanup_started {
+                    "设备退出或 RT 验证超时，账号保持暂停，请人工核对，不会自动重试"
+                } else {
+                    "协议登录超时，未自动重试"
+                };
+                job.finish(
+                    if job.cleanup_started {
+                        "review"
+                    } else {
+                        "failed"
+                    },
+                    message,
+                );
             } else if current
                 .child
                 .try_wait()
                 .map_err(|_| fault("协议进程状态不可用"))?
                 .is_some()
             {
-                // 子进程退出后，读取协程仍可能在处理最后一行
-                if now().saturating_sub(current.started) > 5000 {
-                    job.finish("failed", "协议进程已退出，未取得有效回调");
+                // 子进程退出后继续等待读取协程排空，不能丢掉最后的 RT
+                let exhausted = {
+                    let data = current
+                        .output
+                        .lock()
+                        .map_err(|_| fault("协议结果读取失败"))?;
+                    data.drained && data.result.is_none()
+                };
+                if exhausted {
+                    let message = if job.cleanup_started {
+                        "设备退出进程异常结束，账号保持暂停，请核对设备与 RT 状态"
+                    } else {
+                        "协议进程已退出，未取得有效回调"
+                    };
+                    job.finish(
+                        if job.cleanup_started {
+                            "review"
+                        } else {
+                            "failed"
+                        },
+                        message,
+                    );
                 } else {
                     self.worker = Some(current);
                 }
@@ -448,6 +574,13 @@ impl Manager {
             host::save(host, &queue, version).await?;
             return Ok(());
         }
+        if queue.automation.enabled && now() >= queue.automation.next_scan_at {
+            let result = automatic::scan(host, &mut queue).await;
+            host::save(host, &queue, version).await?;
+            result?;
+            // Reload the state version on the next reconcile before starting the job
+            return Ok(());
+        }
         if let Some(position) = queue.jobs.iter().position(|j| j.status == "queued") {
             let job = &mut queue.jobs[position];
             job.status = "running".into();
@@ -459,11 +592,14 @@ impl Manager {
                 self.runtime.prepare().await?;
                 let job=&queue.jobs[position];let a=detail(host,&job.account_id).await?;
                 require_idle(&a)?;
+                if job.automatic && (!queue.automation.enabled || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {
+                    return Err(fault("自动授权条件或账号版本已变化，未发起登录，不会自动重试"))
+                }
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
                 let proxy=proxy(host,&a).await?;
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback});
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback,"automatic":job.automatic});
                 self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
             }.await;
             match result {
@@ -516,6 +652,24 @@ async fn handle(
     }
     let (mut queue, version) = host::load(&call.host).await?;
     match call.request.path.as_str() {
+        "api/automation" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Configure {
+                enabled: bool,
+            }
+            let request: Configure =
+                serde_json::from_slice(&call.payload).map_err(|_| fault("自动授权设置无效"))?;
+            queue.automation.enabled = request.enabled;
+            queue.automation.next_scan_at = now().saturating_add(automatic::INTERVAL_MS);
+            if !request.enabled {
+                for job in &mut queue.jobs {
+                    if job.automatic && job.status == "queued" {
+                        job.finish("cancelled", "已关闭自动授权，尚未开始的自动任务已取消");
+                    }
+                }
+            }
+        }
         "api/delete" => {
             let ids = deletion::remove(&call.host, &call.payload).await?;
             let removed = queue
@@ -599,6 +753,10 @@ async fn handle(
                     workspace_choices: vec![],
                     force_workspace_id: None,
                     free_fallback: false,
+                    automatic: false,
+                    expected_revision: None,
+                    logout_others: true,
+                    cleanup_started: false,
                 });
             }
         }
@@ -663,6 +821,10 @@ async fn handle(
                 workspace_choices: vec![],
                 force_workspace_id: Some(request.workspace_id),
                 free_fallback: false,
+                automatic: false,
+                expected_revision: None,
+                logout_others: true,
+                cleanup_started: false,
             });
         }
         "api/free-fallback" => {
@@ -712,11 +874,18 @@ async fn handle(
                 workspace_choices: vec![],
                 force_workspace_id: None,
                 free_fallback: true,
+                automatic: false,
+                expected_revision: None,
+                logout_others: true,
+                cleanup_started: false,
             });
         }
         "api/cancel" => {
             let request: Cancel =
                 serde_json::from_slice(&call.payload).map_err(|_| fault("取消参数无效"))?;
+            if request.request_id.is_none() {
+                queue.automation.enabled = false;
+            }
             for job in &mut queue.jobs {
                 if job.active()
                     && request
@@ -724,7 +893,12 @@ async fn handle(
                         .as_ref()
                         .is_none_or(|id| id == &job.request_id)
                 {
-                    job.finish("cancelled", "已取消，不会重新提交授权回调");
+                    let message = if job.cleanup_started {
+                        "设备退出已取消，账号可能已暂停，部分设备可能已退出；请人工核对，不会自动重放"
+                    } else {
+                        "已取消，不会重新提交授权回调"
+                    };
+                    job.finish("cancelled", message);
                     if manager
                         .worker
                         .as_ref()

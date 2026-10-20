@@ -18,6 +18,7 @@ use tokio::{
 pub struct Output {
     pub step: String,
     pub result: Option<Value>,
+    pub drained: bool,
 }
 pub struct Worker {
     pub child: Child,
@@ -236,19 +237,25 @@ impl Runtime {
                             Some("session_restart") => "session_restart",
                             Some("login") => "login",
                             Some("mfa") => "mfa",
+                            Some("other_sessions") => "other_sessions",
+                            Some("verify_refresh") => "verify_refresh",
                             _ => "running",
                         }
                         .into();
                     }
                     Some(
                         "complete" | "free_fallback" | "forced_workspace" | "forced_free"
-                        | "team_upgrade" | "error",
+                        | "team_upgrade" | "same_workspace" | "sessions_cleaned"
+                        | "sessions_verified" | "error",
                     ) => {
                         data.result = Some(value);
                         break;
                     }
                     _ => break,
                 }
+            }
+            if let Ok(mut data) = target.lock() {
+                data.drained = true;
             }
         });
         Ok(Worker {

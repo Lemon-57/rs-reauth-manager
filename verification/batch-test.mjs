@@ -13,14 +13,16 @@ let accounts = [account('error'), account('missing', { notesValid: false, proxy:
 const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${batch}:${id}`, status, step: status, message: status === 'failed' ? 'fixture failure' : '', startedAt: 1, finishedAt: ['queued', 'running'].includes(status) ? null : 2 })
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
 let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, submitGate = null, calls = [], latestBatch = null, checks = 0, mounted
+let automationEnabled = false, loseAutomation = false, failDirectory = false
 let deleteGate = null, throwAfterDelete = false, wrongDeleteResult = false
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
 globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: async input => {
   calls.push(clone(input))
-  if (input.path === 'api/accounts') return reply({ accounts })
-  if (input.path === 'api/jobs') return reply({ jobs })
+  if (input.path === 'api/accounts') { if (failDirectory) throw new Error('fixture account directory timeout'); return reply({ accounts }) }
+  if (input.path === 'api/jobs') return reply({ jobs, automation: { enabled: automationEnabled } })
   const body = input.body ? JSON.parse(input.body) : {}
+  if (input.path === 'api/automation') { assert.deepEqual(Object.keys(body), ['enabled']); automationEnabled = body.enabled; if (loseAutomation) throw new Error('fixture setting response lost'); return reply({ jobs, automation: { enabled: automationEnabled } }) }
   if (input.path === 'api/delete') {
     assert.deepEqual(Object.keys(body), ['accountIds'])
     if (deleteGate) await deleteGate.promise
@@ -250,5 +252,21 @@ try {
   assert.match(state.error.value, /deletion response lost.*未自动重复删除/)
   assert.ok(!state.accounts.value.some(a => a.id === 'healthy')); assert.deepEqual(state.selected.value, [])
   check('A lost delete response refreshes actual account absence without replaying the destructive request')
+  assert.equal(state.automationEnabled.value, false)
+  await state.setAutomation(true); assert.equal(state.automationEnabled.value, true); assert.equal(state.error.value, '')
+  const settingsCalls = calls.filter(c => c.path === 'api/automation').length
+  loseAutomation = true; await state.setAutomation(false)
+  assert.equal(state.automationEnabled.value, false); assert.equal(state.error.value, '')
+  assert.equal(calls.filter(c => c.path === 'api/automation').length, settingsCalls + 1)
+  check('Automatic switch reads back saved state, including a lost response, without replaying the configuration request')
+  jobs.push({...job('paused','success','automatic'),automatic:true})
+  await state.load();assert.equal(state.resultOf(accounts.find(a=>a.id==='paused')).automatic,true)
+  assert.equal(state.success.value,0)
+  check('Background automatic results remain visible after reopening without entering manual batch totals')
+  automationEnabled = true; failDirectory = true; await state.load()
+  assert.equal(state.automationEnabled.value,true); assert.equal(state.automationLoaded.value,true)
+  assert.match(state.error.value,/fixture account directory timeout/)
+  failDirectory = false
+  check('Account directory timeout cannot hide the saved automatic setting or present an enabled backend as disabled')
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }

@@ -6,14 +6,31 @@ import type { Account, Job } from './types'
 export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
-  const deleting = ref(false), notice = ref('')
+  const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
+  async function setAutomation(enabled: boolean) {
+    if (automationBusy.value || !automationLoaded.value) return
+    automationBusy.value = true; error.value = ''
+    try { await api.automation(enabled) }
+    catch (e) { error.value = (e as Error).message }
+    finally {
+      try {
+        const state = await api.jobs()
+        if (!state.automation) throw new Error('自动授权设置未确认，请刷新核对')
+        automationEnabled.value = state.automation.enabled; automationLoaded.value = true
+        receiveJobs(state.jobs)
+        if (state.automation.enabled === enabled) error.value = ''
+        else error.value ||= '自动授权设置未确认，请刷新核对'
+      } catch (e) { error.value ||= (e as Error).message }
+      automationBusy.value = false
+    }
+  }
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
   const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
   const batchByAccount = computed(() => new Map(batchJobs.value.map(j => [j.accountId, j])))
   const jobOf = (a: Account) => {
     const job = latestByAccount.value.get(a.id)
-    return job && (isActive(job) || isUnfinished(job)) ? job : undefined
+    return job && (isActive(job) || isUnfinished(job) || job.automatic) ? job : undefined
   }
   const resultOf = (a: Account) => batchByAccount.value.get(a.id) || jobOf(a)
   const ready = (a: Account) => a.notesValid && !!a.proxy && !isActive(jobOf(a))
@@ -82,7 +99,18 @@ export function useReauthManager() {
     return changed
   }
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
-  async function load() { loading.value = true; error.value = ''; try { accounts.value = (await api.accounts()).accounts; receiveJobs((await api.jobs()).jobs) } catch (e) { error.value = (e as Error).message } finally { loading.value = false } }
+  async function load() {
+    loading.value = true; error.value = ''; automationLoaded.value = false
+    const results = await Promise.allSettled([
+      api.jobs().then(state => {
+        if (state.automation) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
+        receiveJobs(state.jobs)
+      }),
+      api.accounts().then(state => { accounts.value = state.accounts }),
+    ])
+    for (const result of results) if (result.status === 'rejected') error.value ||= (result.reason as Error).message
+    loading.value = false
+  }
   async function deleteSelected() {
     if (busy.value || !chosen.value.length) return
     const ids = chosen.value.map(a => a.id)
@@ -130,16 +158,21 @@ export function useReauthManager() {
       try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve the original submission error. */ }
     } finally { busy.value = false }
   }
-  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { receiveJobs((await api.cancel(job?.requestId || null)).jobs) } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
+  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { receiveJobs((await api.cancel(job?.requestId || null)).jobs); const state = await api.jobs(); if (state.automation) automationEnabled.value = state.automation.enabled; receiveJobs(state.jobs) } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
   async function poll() {
     if (destroyed || polling) return
     polling = true
     try {
-      if (active.value && !busy.value) { await api.tick(); if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts }
+      if (!busy.value && (active.value || automationEnabled.value)) {
+        if (active.value) await api.tick()
+        const state = await api.jobs()
+        if (state.automation) automationEnabled.value = state.automation.enabled
+        if (receiveJobs(state.jobs)) accounts.value = (await api.accounts()).accounts
+      }
     } catch (e) { error.value = (e as Error).message }
-    finally { polling = false; if (!destroyed) timer = setTimeout(poll, 3000) }
+    finally { polling = false; if (!destroyed) timer = setTimeout(poll, active.value ? 3000 : 15000) }
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }
