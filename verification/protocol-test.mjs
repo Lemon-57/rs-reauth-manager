@@ -171,19 +171,19 @@ try {
  await start()
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,11)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
- for(const id of ['new_team','new_wrong_user','new_missing_rt']){
+ for(const id of ['new_team','new_wrong_user','new_missing_rt','new_cleanup_failure','new_verify_failure']){
   const req={requestId:randomUUID(),email:id+'@example.com',notes:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ',proxyUrl:'http://fixture:pass@127.0.0.1:21001',groupIds:['g1']}
   const n=starts.length,c=completes.length
   assert.equal((await request('import',req)).status,200)
   const duplicate=await request('import',req);assert.equal(duplicate.status,200);assert.equal(starts.length,n+1)
   let done
   for(let i=0;i<60;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
-  assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,false)
+  assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,id==='new_team')
   if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted,true);assert.ok(refreshes.includes(id))}
   else{assert.equal(done.status,'review',done.message);const before=[starts.length,completes.length];await tick();assert.deepEqual([starts.length,completes.length],before)}
   const count=starts.length;assert.equal((await request('import',{...req,requestId:randomUUID(),email:'other@example.com',notes:'other@example.com----fixture-password----GEZDGNBVGY3TQOJQ'})).status,400);assert.equal(starts.length,count)
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
-  check(`${id}: new accounts use native start/complete, validate AT and ID Token, retain pause and never replay`)
+  check(`${id}: new accounts use native start/complete, validate AT and ID Token, enable on success and never replay`)
  }
  {
   const n=starts.length

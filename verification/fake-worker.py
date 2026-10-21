@@ -15,10 +15,10 @@ if data.get('action') in {'cleanup_sessions','verify_sessions'}:
     assert 'clientId' not in data and data['deviceId']==DID
     if data['action']=='verify_sessions':
         assert data['expectedSessionId']=='fixture-current-session'
-        emit({'event':'sessions_verified','otherSessionsRevoked':name!='verify_failure','currentSessionRetained':name!='verify_failure'})
+        emit({'event':'sessions_verified','otherSessionsRevoked':name not in {'verify_failure','new_verify_failure'},'currentSessionRetained':name not in {'verify_failure','new_verify_failure'}})
         sys.exit(0)
     if name=='cleanup_slow':time.sleep(60)
-    if name=='cleanup_failure':emit({'event':'error','code':'sessions','diagnostic':{'stage':'other_sessions','reason':'sessions_revoke_unconfirmed'}})
+    if name in {'cleanup_failure','new_cleanup_failure'}:emit({'event':'error','code':'sessions','diagnostic':{'stage':'other_sessions','reason':'sessions_revoke_unconfirmed'}})
     else:emit({'event':'sessions_cleaned','workspaceId':data['accountId'],'originalWorkspaceId':data['accountId'],'otherSessionsRevoked':name!='cleanup_no_proof','revokedCount':2,'retainedSessionId':'fixture-current-session'})
     sys.exit(0)
 assert '----' in data['notes'] and data['email'] in data['notes']

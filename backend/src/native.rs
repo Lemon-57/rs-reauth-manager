@@ -373,11 +373,10 @@ async fn complete_new_account(
         return Err(fault("新增账号凭据版本、所选工作区或固定代理不一致"));
     }
     snapshot["postAuthorizationSettings"] = crate::settings(&account);
-    snapshot["resumeAfterCleanup"] = json!(false);
+    snapshot["resumeAfterCleanup"] = json!(true);
     snapshot["createdAccountId"] = json!(id);
     Ok((
-        "RS 原生 OAuth 已创建并保存 Team RT，备注与 GPT Pro 分组已读回确认；账号保持停用等待核对"
-            .into(),
+        "RS 原生 OAuth 已创建并保存 Team RT，备注与 GPT Pro 分组已读回确认".into(),
         false,
     ))
 }
