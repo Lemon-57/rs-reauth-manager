@@ -11,6 +11,13 @@ use gateway_plugin_sdk::{
 };
 use serde_json::{Value, json};
 
+fn same_proxy(left: &str, right: &Value) -> bool {
+    url::Url::parse(left)
+        .ok()
+        .zip(right.as_str().and_then(|value| url::Url::parse(value).ok()))
+        .is_some_and(|(a, b)| a == b)
+}
+
 fn final_status_confirmed(status: &Value) -> bool {
     matches!(
         status.as_str(),
@@ -361,7 +368,7 @@ async fn complete_new_account(
     recovery::validate(&check, &crate::settings(&account))?;
     if credential.credential_revision != account["_credentialRevision"].as_u64().unwrap_or(0)
         || output["workspaceId"] != account["accountId"]
-        || crate::proxy(host, &account).await? != snapshot["proxy"]
+        || !same_proxy(&crate::proxy(host, &account).await?, &snapshot["proxy"])
     {
         return Err(fault("新增账号凭据版本、所选工作区或固定代理不一致"));
     }
@@ -379,6 +386,22 @@ async fn complete_new_account(
 mod tests {
     use super::final_status_confirmed;
     use serde_json::json;
+
+    #[test]
+    fn proxy_normalization_preserves_authentication_and_fixed_endpoint() {
+        assert!(super::same_proxy(
+            "http://fixture:pass@127.0.0.1:21001/",
+            &json!("http://fixture:pass@127.0.0.1:21001")
+        ));
+        assert!(!super::same_proxy(
+            "http://fixture:other@127.0.0.1:21001/",
+            &json!("http://fixture:pass@127.0.0.1:21001")
+        ));
+        assert!(!super::same_proxy(
+            "http://fixture:pass@127.0.0.1:21002/",
+            &json!("http://fixture:pass@127.0.0.1:21001")
+        ));
+    }
 
     #[test]
     fn final_status_accepts_stable_rs_account_states() {

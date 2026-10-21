@@ -8,7 +8,7 @@ def emit(value):
     if value['event'] in {'complete','free_fallback','forced_workspace','forced_free','team_upgrade'}:value['deviceId']=DID
     print(json.dumps(value),flush=True)
 data=json.load(sys.stdin)
-assert data['proxy']=='http://fixture:pass@127.0.0.1:21001'
+assert data['proxy'].rstrip('/')=='http://fixture:pass@127.0.0.1:21001'
 name=data.get('email','').split('@')[0]
 if data.get('action') in {'cleanup_sessions','verify_sessions'}:
     assert set(data['tokens'])=={'access_token','id_token'}

@@ -76,7 +76,7 @@ async function callback(meta,payload) {
   else if(url.pathname==='/api/admin/accounts/detail')dataReply={account:accounts.find(a=>a.id===url.searchParams.get('accountId')),credentialConfiguration:{transport:'http'}}
   else if(url.pathname==='/api/admin/accounts/export') {
    assert.equal(url.searchParams.get('confirm'),'export_sensitive_accounts');const id=url.searchParams.get('accountIds');assert.ok(!id.includes(','))
-   dataReply={documents:[{provider:'openai',document:{accounts:[{id,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'}]}}]}
+   dataReply={documents:[{provider:'openai',document:{accounts:[{id,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'+(id.startsWith('new_')?'/':'')}]}}]}
   } else if(url.pathname==='/api/admin/accounts/oauth/start') {
    assert.deepEqual(Object.keys(data).sort(),['accountId','name','provider']);starts.push(structuredClone(data));dataReply={flowId:`flow_${data.accountId}`,authorizationUrl:nativeAuthorization};status=201
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
