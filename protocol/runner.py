@@ -184,7 +184,7 @@ def _run_once(data, used_codes):
                     self.selected_workspace = candidate
                     return candidate
                 return ""
-            if auto_team and selected == target:
+            if auto_team and selected == target and not getattr(self, 'selecting_team', False):
                 return ''
             if not selected:
                 if self.unbound_workspace:
@@ -215,9 +215,9 @@ def _run_once(data, used_codes):
                     self.selected_workspace = candidate
                     return candidate
                 return ""
-            if auto_team and self.selected_workspace == target:
+            if auto_team and self.selected_workspace == target and not getattr(self, 'selecting_team', False):
                 combined = merge_workspace_evidence(self.session_evidence, evidence)
-                team = team_candidate(combined, target)
+                team = team_candidate(combined, target, allow_original=True)
                 if team:
                     raise WorkspaceUpgrade(team)
                 session = self.session_evidence if isinstance(self.session_evidence, dict) else {}
@@ -392,7 +392,7 @@ def _run_once(data, used_codes):
                 oauth.session_evidence = session
                 for choice in workspace_choices(session, target):
                     oauth._remember_workspace(choice['id'])
-                team = team_candidate(session, target)
+                team = team_candidate(session, target, allow_original=True)
                 if team:
                     result = recover_team(oauth, chat, authorize_url, data, team, authorize)
                     completed('team_upgrade', workspaceId=team, originalWorkspaceId=target, uniqueTeamConfirmed=True, result=result)

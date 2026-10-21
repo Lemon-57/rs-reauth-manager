@@ -18,7 +18,7 @@ class WorkspaceUpgrade(ValueError):
         self.workspace_id = workspace_id
 
 
-def team_candidate(session, original):
+def team_candidate(session, original, *, allow_original=False):
     if not isinstance(session, dict):
         return None
     workspaces = session.get('workspaces')
@@ -30,7 +30,7 @@ def team_candidate(session, original):
         raise ValueError('workspace_evidence_invalid')
     candidates = []
     for workspace in workspaces:
-        if workspace['id'] == original:
+        if workspace['id'] == original and not allow_original:
             continue
         kinds = {str(workspace.get(k) or '').strip().lower() for k in ['type', 'account_type', 'kind']}
         plan = str(workspace.get('plan_type') or '').strip().lower()
@@ -199,6 +199,7 @@ def recover_free(oauth, chat, authorize_url, data, personal_id, authorize, *, fo
 
 
 def recover_team(oauth, chat, authorize_url, data, workspace, authorize):
+    oauth.selecting_team = True
     return recover_free(oauth, chat, authorize_url, data, workspace, authorize, force=True)
 
 

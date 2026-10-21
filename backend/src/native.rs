@@ -118,7 +118,11 @@ pub async fn complete(
     {
         return Err(fault("原账号身份或凭据版本未确认，未提交原生完成接口"));
     }
-    let old_subject = recovery::subject(&old)?;
+    let old_subject = if team {
+        recovery::subject_for_team_upgrade(&old)?
+    } else {
+        recovery::subject(&old)?
+    };
     let callback = output["callbackUrl"]
         .as_str()
         .ok_or_else(|| fault("授权码回调缺失，未提交原生完成接口"))?;

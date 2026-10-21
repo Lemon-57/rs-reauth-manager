@@ -96,9 +96,9 @@ class FallbackGuards(unittest.TestCase):
 
 
 class AutomaticWorkspaceTransitions(unittest.TestCase):
-    def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None, automatic=False, token_workspace=None):
+    def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None, automatic=False, token_workspace=None, recorded_workspace=None):
         self.messages, self.calls = [], []
-        source = 'personal-workspace' if plan == 'free' else 'old-team'
+        source = recorded_workspace or ('personal-workspace' if plan == 'free' else 'old-team')
         target = source if automatic else 'new-team' if plan == 'free' else 'personal-workspace'
         workspaces = workspaces if workspaces is not None else [
             {'id': 'personal-workspace', 'type': 'personal', 'plan_type': 'free'},
@@ -161,6 +161,14 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
                 self.assertTrue(self.messages[-1]['uniqueTeamConfirmed'])
                 selected = [body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')]
                 self.assertEqual(selected, ['new-team'])
+
+    def test_team_membership_matching_stale_record_is_still_selected_once(self):
+        for html_only in [False, True]:
+            self.execute(recorded_workspace='new-team', html_only=html_only)
+            self.assertEqual(self.messages[-1]['event'], 'team_upgrade')
+            self.assertEqual(self.messages[-1]['workspaceId'], 'new-team')
+            self.assertEqual([body['workspace_id'] for _, url, body in self.calls if url.endswith('/workspace/select')], ['new-team'])
+            self.assertFalse(any(url.endswith('/oauth/token') for _, url, _ in self.calls))
 
     def test_live_organization_kind_is_verified_as_team_before_upgrade(self):
         workspaces = [

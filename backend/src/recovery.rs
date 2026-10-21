@@ -59,6 +59,7 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
         || (same && workspace != text(original, "accountId")?)
         || (!same
             && workspace == text(original, "accountId")?
+            && !upgraded
             && !(forced_free
                 && original["planType"]
                     .as_str()
@@ -133,6 +134,17 @@ pub fn tokens(credential: &AuthCredential) -> Value {
 }
 
 pub fn subject(credential: &AuthCredential) -> Result<String, PluginFault> {
+    subject_with_workspace_check(credential, true)
+}
+
+pub fn subject_for_team_upgrade(credential: &AuthCredential) -> Result<String, PluginFault> {
+    subject_with_workspace_check(credential, false)
+}
+
+fn subject_with_workspace_check(
+    credential: &AuthCredential,
+    check_workspace: bool,
+) -> Result<String, PluginFault> {
     if let Some(subject) = credential
         .facts
         .material
@@ -166,8 +178,9 @@ pub fn subject(credential: &AuthCredential) -> Result<String, PluginFault> {
             .as_str()
             .or_else(|| auth["user_id"].as_str())
             != credential.facts.upstream_user_id.as_deref()
-            || auth["chatgpt_account_id"].as_str()
-                != credential.facts.upstream_account_id.as_deref()
+            || (check_workspace
+                && auth["chatgpt_account_id"].as_str()
+                    != credential.facts.upstream_account_id.as_deref())
         {
             return Err(fault("原账号已存主体与用户或工作区不一致"));
         }

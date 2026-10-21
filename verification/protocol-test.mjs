@@ -211,6 +211,27 @@ try {
   assert.ok(!done.message.includes('private-upstream-response'));const count=completes.length;await tick();assert.equal(completes.length,count)
   check(`${id}: unconfirmed native save or changed identity is quarantined without alternative token exchange or replay`)
  }
+ for(const id of ['up_stale_workspace','up_same_workspace','up_stale_wrong_user','up_stale_wrong_email','up_stale_wrong_subject','stale_workspace_regular']) {
+  const a=add(id);a.planType='free'
+  if(id==='up_same_workspace')a.accountId='team-workspace'
+  const c=credential(a);c.facts.material.principal=null
+  for(const key of ['id_token','access_token']) {
+   const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'))
+   p.exp=1;p[AUTH].chatgpt_account_id='stale-personal-workspace'
+   if(id==='up_stale_wrong_user')p[AUTH].chatgpt_user_id='another-user'
+   if(id==='up_stale_wrong_email')p.email='another@example.com'
+   if(id==='up_stale_wrong_subject')p.sub='different-old-subject'
+   c.facts.material[key]=jwt(p)
+  }
+  credentials.set(id,c)
+  const n=completes.length;await submit([id]);const done=await finish(id)
+  if(['up_stale_workspace','up_same_workspace'].includes(id)) {
+   assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(a.planType,'team');assert.equal(a.enabled,true)
+  } else {
+   assert.equal(done.status,'review');assert.equal(completes.length,n+(id==='up_stale_wrong_subject'?1:0))
+  }
+  check(`${id}: Team membership tolerates stale old workspace while user, email and new authorization remain checked`)
+ }
  for(const id of ['fb_good','fb_metadata_lost','up_good','up_wrong_plan']) {
   const a=add(id);if(id.startsWith('up_')){a.planType='free';credentials.set(id,credential(a))}
   const n=completes.length,r=refreshes.length,m=metadataSaves.length
