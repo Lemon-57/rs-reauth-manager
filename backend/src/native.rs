@@ -11,6 +11,13 @@ use gateway_plugin_sdk::{
 };
 use serde_json::{Value, json};
 
+fn final_status_confirmed(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some("normal" | "disabled" | "quota_exhausted" | "rate_limited")
+    )
+}
+
 pub async fn restore(
     host: &HostClient,
     id: &str,
@@ -40,7 +47,7 @@ pub async fn restore(
     target["enabled"] = json!(enabled);
     if settings(&after) != target
         || after["_credentialRevision"].as_u64() != Some(revision)
-        || !matches!(after["status"].as_str(), Some("normal" | "disabled"))
+        || !final_status_confirmed(&after["status"])
     {
         return Err(fault("最终授权配置或调度状态未确认，请人工核对"));
     }
@@ -268,4 +275,25 @@ pub async fn complete(
         "RS 原生 OAuth 已换取、保存 RT，身份及配置已读回确认"
     };
     Ok((message.into(), free))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_status_confirmed;
+    use serde_json::json;
+
+    #[test]
+    fn final_status_accepts_stable_rs_account_states() {
+        for status in ["normal", "disabled", "quota_exhausted", "rate_limited"] {
+            assert!(final_status_confirmed(&json!(status)));
+        }
+    }
+
+    #[test]
+    fn final_status_rejects_unconfirmed_or_error_states() {
+        for status in ["error", "unknown", ""] {
+            assert!(!final_status_confirmed(&json!(status)));
+        }
+        assert!(!final_status_confirmed(&json!(null)));
+    }
 }
