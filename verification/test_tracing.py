@@ -3,8 +3,8 @@ import json
 import sys
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import patch
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'protocol'))
 from tracing import ObservedSession
@@ -12,6 +12,80 @@ from diagnostics import describe_failure, stage_for_url
 
 
 class TracingTests(unittest.TestCase):
+    @staticmethod
+    def challenge(**headers):
+        return types.SimpleNamespace(status_code=403, headers={'server': 'cloudflare', **headers}, text='<title>Just a moment</title>')
+
+    @patch('tracing.time.sleep')
+    def test_initial_challenge_retries_same_get_once_with_existing_session_and_native_parameters(self, sleep):
+        for method in ['get', 'request']:
+            with self.subTest(method=method):
+                calls, observed, steps = [], [], []
+                cookies = {}
+                accepted = types.SimpleNamespace(status_code=302, headers={'location': '/log-in'}, text='')
+                def invoke(*args, **kwargs):
+                    calls.append((args, dict(kwargs)))
+                    if len(calls) == 1:
+                        cookies['fixture-session'] = 'fixture-private-cookie'
+                        return self.challenge()
+                    self.assertEqual(cookies['fixture-session'], 'fixture-private-cookie')
+                    return accepted
+                session = types.SimpleNamespace(cookies=cookies)
+                setattr(session, method, invoke)
+                wrapped = ObservedSession(session, observed.append, recover_initial_page=True, on_initial_retry=lambda: steps.append('retry'))
+                url = 'https://auth.openai.com/oauth/authorize?state=fixture-state&code_challenge=fixture-challenge&client_id=fixture&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback'
+                args = ('GET', url) if method == 'request' else (url,)
+                kwargs = {'headers': {'User-Agent': 'fixture'}, 'allow_redirects': False, 'impersonate': 'chrome133a', 'timeout': 30}
+                self.assertIs(getattr(wrapped, method)(*args, **kwargs), accepted)
+                self.assertEqual(calls, [(args, kwargs), (args, kwargs)])
+                self.assertEqual(steps, ['retry'])
+                self.assertEqual(observed[-1]['httpStatus'], 302)
+                self.assertEqual(observed[-1]['initialPageRetries'], 1)
+                self.assertIs(wrapped.cookies, cookies)
+        self.assertEqual(sleep.call_count, 2)
+
+    @patch('tracing.time.sleep')
+    def test_repeated_initial_challenge_stops_after_two_gets_and_remains_a_403(self, sleep):
+        calls, observed = [], []
+        response = self.challenge()
+        session = types.SimpleNamespace(get=lambda *args, **kwargs: calls.append(args) or response)
+        wrapped = ObservedSession(session, observed.append, recover_initial_page=True)
+        self.assertIs(wrapped.get('https://auth.openai.com/oauth/authorize'), response)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(observed[-1]['httpStatus'], 403)
+        wrapped.get('https://auth.openai.com/oauth/authorize')
+        self.assertEqual(len(calls), 3)
+        sleep.assert_called_once_with(2)
+
+    @patch('tracing.time.sleep')
+    def test_recovery_never_replays_posts_later_pages_unknown_denials_or_long_retry_after(self, sleep):
+        cases = [
+            ('POST', 'https://auth.openai.com/oauth/authorize', self.challenge()),
+            ('POST', 'https://auth.openai.com/api/accounts/password/verify', self.challenge()),
+            ('POST', 'https://auth.openai.com/api/accounts/mfa/verify', self.challenge()),
+            ('POST', 'https://auth.openai.com/oauth/token', self.challenge()),
+            ('GET', 'https://auth.openai.com/log-in', self.challenge()),
+            ('GET', 'https://other.example/oauth/authorize', self.challenge()),
+            ('GET', 'https://auth.openai.com/oauth/authorize', types.SimpleNamespace(status_code=403, headers={}, text='forbidden')),
+            ('GET', 'https://auth.openai.com/oauth/authorize', self.challenge(**{'retry-after': '60'})),
+            ('GET', 'https://auth.openai.com/oauth/authorize', self.challenge(**{'retry-after': 'Wed, 21 Oct 2026 12:00:00 GMT'})),
+            ('GET', 'https://auth.openai.com/oauth/authorize', types.SimpleNamespace(status_code=429, headers={'server': 'cloudflare'}, text='Just a moment')),
+        ]
+        for method, url, response in cases:
+            with self.subTest(method=method, url=url, status=response.status_code):
+                calls = []
+                session = types.SimpleNamespace(request=lambda *a, **kw: calls.append((a, kw)) or response)
+                wrapped = ObservedSession(session, lambda attempt: None, recover_initial_page=True)
+                self.assertIs(wrapped.request(method, url, allow_redirects=False), response)
+                self.assertEqual(len(calls), 1)
+        calls = []
+        session = types.SimpleNamespace(request=lambda *a, **kw: calls.append((a, kw)) or self.challenge())
+        wrapped = ObservedSession(session, lambda attempt: None, recover_initial_page=True)
+        wrapped.request('POST', 'https://auth.openai.com/api/accounts/authorize/continue')
+        wrapped.request('GET', 'https://auth.openai.com/oauth/authorize')
+        self.assertEqual(len(calls), 2)
+        sleep.assert_not_called()
+
     def test_token_posts_never_follow_redirects_or_forward_code_to_another_origin(self):
         for method in ['post', 'request']:
             calls = []

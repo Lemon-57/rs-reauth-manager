@@ -295,7 +295,7 @@ def _run_once(data, used_codes):
             except Exception:
                 pass
         return describe_failure(attempt={'stage': 'session', 'httpStatus': None}, exception=exc)
-    chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt))
+    chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt), recover_initial_page=True, on_initial_retry=lambda: emit('step', step='authorize_retry'))
     oauth.session = chat.session
     def completed(event, result=None, **fields):
         if result is not None:

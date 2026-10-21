@@ -17,7 +17,7 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前源码版本 | `0.1.26`，公开版本以 Releases 为准 |
+| 当前源码版本 | `0.1.27`，公开版本以 Releases 为准 |
 | 宿主兼容清单 | `>=3.29.1, <3.30.0` |
 | 插件合同 | RPC v4、management v2、maintenance v1，manifestVersion 仍为 2 |
 | 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |
@@ -105,6 +105,8 @@ Free、Plus、Pro、Team、Business 等全部套餐的 OAuth 账号均可列出�
 `vendor/lib` 原模块保持不变，适配代码在 `protocol/runner.py`，本地 TOTP 生成与等待逻辑在 `protocol/totp.py`，原始 MIT 许可位于 `protocol/LICENSE.reauth-web`
 会话读取失败时继续使用授权页的有界 JSON/hydration 工作区证据，相关解析位于 `protocol/workspace_pages.py`；不执行页面脚本，不按 ID 子串或默认首项匹配。令牌交换禁止自动跟随重定向。适配修复、保留差异及仍需处理的宿主身份校验边界见 [协议适配差异审查](docs/UPSTREAM-PARITY.md)
 适配层接受 RS 返回的官方桌面授权外层链接，仅拆出并校验 `authorize_url` 后交给上游协议；常规路径不重新生成或替换 RS 的 state、PKCE、client_id 和回调地址，也支持直接 OAuth 链接
+新登录会话的首个原生授权页 GET 遇到明确的 Cloudflare 403 挑战时，等待两秒后仅重取一次，沿用原代理、TLS 身份、会话、请求头及原生 OAuth 参数。上游要求等待更长、持续挑战或其他拒绝时停止并显示真实错误；不自动处理人工挑战，不重放密码、2FA、工作区选择或令牌交换。
+
 同一挑战的 2FA 校验最多提交三次不同动态码，仅对明确的验证码无效或过期换码；重试等待预算为 TOTP 刷新周期加五秒余量。登录身份、密码或 MFA 步骤明确返回 HTTP 400/409 的 `invalid_state` 时，放弃旧挑战和 Cookie，使用原代理最多重建一次登录会话；所有授权均保留 RS 的 state、PKCE 和待完成流程。已提交的动态码在同一任务内不重复使用
 429、封禁、付款、密码错误、人工验证、无具体错误码的 409、传输异常、授权回调校验失败和令牌交换失败均不自动重登或猜测换码。新会话仍失败时同时显示两次原因，不重放凭据写回，任务失败后不自动重新排队；单号 420 秒总时限不因恢复而延长
 所有授权复用 RS 已生成的 state、PKCE、client_id 与回调地址，以及账号固定代理和现有登录协议。插件不得生成另一套 PKCE、调用上游 token 接口交换授权码，或用 SDK 写入自行换取的 RT。以后新增账号也必须沿用这一原生链路，项目 AGENTS.md 已将其设为持久规则
