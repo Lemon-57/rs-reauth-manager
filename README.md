@@ -19,7 +19,7 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前源码版本 | `0.1.30`，公开版本以 Releases 为准 |
+| 当前源码版本 | `0.1.31`，公开版本以 Releases 为准 |
 | 宿主兼容清单 | `>=3.29.1, <3.30.0` |
 | 插件合同 | RPC v4、management v2、maintenance v1，manifestVersion 仍为 2 |
 | 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |
