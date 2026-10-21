@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
@@ -284,9 +285,10 @@ def _run_once(data, used_codes):
     emit("step", step="session")
     chat = None
     try:
-        chat = ChatGPTClient(proxy=proxy, verbose=False, impersonate="chrome133a")
+        impersonates = "chrome124,chrome133a,chrome136,chrome120"
+        chat = ChatGPTClient(proxy=proxy, verbose=False, impersonate=random.choice(impersonates.split(",")))
         chat.current_email = email
-        oauth = BoundOAuthClient({"oauth_phone_strategy": "sms", "sub2api_oauth_max_hops": 20, "oauth_email_otp_max_attempts": 1, "oauth_email_otp_timeout": 30, "sub2api_oauth_impersonates": "chrome133a", "sub2api_redirect_uri": urlunsplit(redirect)}, proxy=proxy, verbose=False)
+        oauth = BoundOAuthClient({"oauth_phone_strategy": "sms", "sub2api_oauth_max_hops": 20, "oauth_email_otp_max_attempts": 3, "oauth_email_otp_timeout": 150, "sub2api_oauth_impersonates": impersonates, "sub2api_redirect_uri": urlunsplit(redirect)}, proxy=proxy, verbose=False)
         oauth.session.close()
     except Exception as exc:
         if chat is not None:
@@ -295,7 +297,7 @@ def _run_once(data, used_codes):
             except Exception:
                 pass
         return describe_failure(attempt={'stage': 'session', 'httpStatus': None}, exception=exc)
-    chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt), recover_initial_page=True, on_initial_retry=lambda: emit('step', step='authorize_retry'))
+    chat.session = ObservedSession(chat.session, lambda attempt: setattr(oauth, 'last_attempt', attempt))
     oauth.session = chat.session
     def completed(event, result=None, **fields):
         if result is not None:
@@ -315,7 +317,7 @@ def _run_once(data, used_codes):
             oauth.session_evidence = None
             oauth.session_lookup_failure = None
             oauth.unresolved_workspace = None
-            result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret), max_hops=20)
+            result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret))
             if not isinstance(result, dict) or result.get('ok') is not True:
                 pending = oauth.unresolved_workspace
                 if isinstance(result, dict) and result.get('error') in {'oauth_callback_not_found', 'oauth_callback_timeout'} and pending and pending['attempt'] is oauth.last_attempt:

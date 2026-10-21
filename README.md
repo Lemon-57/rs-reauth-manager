@@ -8,6 +8,8 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 
 截图为模拟数据，不包含真实账号资料
 
+登录协议与原版的逐项对照见 [协议对照](docs/PROTOCOL-PARITY.md)，RS 继续统一负责授权码交换及 RT 保存。
+
 ## 安装
 
 在 [Releases](https://github.com/Lemon-57/rs-reauth-manager/releases) 下载对应版本的 `.tar.gz` 与 `.sha256`，核对摘要后，在 RS 的插件管理中上传安装
@@ -17,7 +19,7 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前源码版本 | `0.1.27`，公开版本以 Releases 为准 |
+| 当前源码版本 | `0.1.28`，公开版本以 Releases 为准 |
 | 宿主兼容清单 | `>=3.29.1, <3.30.0` |
 | 插件合同 | RPC v4、management v2、maintenance v1，manifestVersion 仍为 2 |
 | 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |

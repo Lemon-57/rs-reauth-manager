@@ -113,6 +113,59 @@ class BoundWorkspacePageTests(unittest.TestCase):
 
 
 class VendorContractTests(unittest.TestCase):
+    def test_original_defaults_are_shared_by_manual_and_automatic_login(self):
+        pool = 'chrome124,chrome133a,chrome136,chrome120'
+        for automatic in [False, True]:
+            for chosen in pool.split(','):
+                messages, requests, configs, choices = [], [], [], []
+                def session(**kwargs):
+                    self.assertEqual(kwargs['proxy'], 'http://fixture:pass@127.0.0.1:21001')
+                    return OfflineSession(requests, 'fixture', 'original-workspace')
+                original_init = oauth_client.OAuthClient.__init__
+                def init(instance, config, **kwargs):
+                    configs.append(config)
+                    original_init(instance, config, **kwargs)
+                def choose(values):
+                    if values == pool.split(','):
+                        choices.append(list(values))
+                        return chosen
+                    return values[0]
+                data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL,
+                        'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': URL,
+                        'accountId': 'original-workspace', 'userId': 'original-user', 'planType': 'team',
+                        'automatic': automatic}
+                with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(oauth_client.OAuthClient, '__init__', init), patch.object(runner.random, 'choice', side_effect=choose), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **fields: messages.append({'event': event, **fields})):
+                    runner.run(data)
+                self.assertEqual(choices, [pool.split(',')])
+                self.assertEqual(configs, [{'oauth_phone_strategy': 'sms', 'sub2api_oauth_max_hops': 20,
+                                           'oauth_email_otp_max_attempts': 3, 'oauth_email_otp_timeout': 150,
+                                           'sub2api_oauth_impersonates': pool,
+                                           'sub2api_redirect_uri': 'http://127.0.0.1:1455/auth/callback'}])
+                self.assertEqual(requests, [('GET', URL)])
+                self.assertEqual(messages[-1]['event'], 'complete')
+
+    def test_runner_uses_original_candidate_sequence_and_stops_on_persistent_challenge(self):
+        pool = ['chrome124', 'chrome133a', 'chrome136', 'chrome120']
+        for accepted in [True, False]:
+            calls, messages = [], []
+            class Session(OfflineSession):
+                def request(self, method, url, **kwargs):
+                    calls.append(kwargs['impersonate'])
+                    if not accepted or len(calls) < len(pool):
+                        return types.SimpleNamespace(status_code=403, url=url, headers={'server': 'cloudflare'}, text='Just a moment')
+                    return super().request(method, url, **kwargs)
+            data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL,
+                    'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': URL,
+                    'accountId': 'original-workspace'}
+            def session(**kwargs):
+                return Session([], 'fixture', 'original-workspace')
+            with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(chatgpt_client, '_random_chrome_version', return_value=('chrome133a', 133, '133.0.1.1', 'fixture', 'fixture')), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **fields: messages.append({'event': event, **fields})):
+                runner.run(data)
+            self.assertEqual(calls, ['chrome133a', 'chrome124', 'chrome136', 'chrome120'])
+            self.assertEqual(messages[-1]['event'], 'complete' if accepted else 'error')
+            if not accepted:
+                self.assertEqual(messages[-1]['diagnostic']['httpStatus'], 403)
+
     def password_failure(self, first_code, *, next_status=200):
         messages, requests, sessions = [], [], []
         failures = iter([409, next_status])
@@ -275,7 +328,7 @@ class VendorContractTests(unittest.TestCase):
 
     def test_retry_wait_has_a_full_totp_period_plus_margin(self):
         self.mfa_failure(200, 409, error_code='otp_expired', codes=['123456', None])
-        self.assertEqual(self.mfa_timeouts, [30, 35])
+        self.assertEqual(self.mfa_timeouts, [150, 35])
 
     def test_invalid_state_on_final_submission_restarts_and_can_succeed(self):
         messages = self.mfa_failure(200, [409, 409, 409, 200], error_code=['otp_expired', 'otp_expired', 'invalid_state', ''], codes=['123456', '234567', '345678', '456789'])
@@ -298,7 +351,7 @@ class VendorContractTests(unittest.TestCase):
         self.assertEqual(messages[-1]['event'], 'complete')
         self.assertEqual(self.mfa_generation_count, 2)
         self.assertEqual(self.mfa_requests, ['issue_challenge', 'verify', 'verify'])
-        self.assertEqual(self.mfa_timeouts, [30, 35])
+        self.assertEqual(self.mfa_timeouts, [150, 35])
 
     def test_invalid_state_while_issuing_challenge_restarts_only_once_without_codes(self):
         messages = self.mfa_failure(409, error_code='invalid_state', codes=[])

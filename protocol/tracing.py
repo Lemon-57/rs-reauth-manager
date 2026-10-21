@@ -1,21 +1,17 @@
 """Observe all vendor HTTP entry points without retaining URLs, payloads or secrets."""
 from diagnostics import MFA_ERRORS, REASONS, stage_for_url, transport_reason
 from urllib.parse import urlsplit
-import time
 
 
 class ObservedSession:
-    def __init__(self, session, record, *, recover_initial_page=False, on_initial_retry=None):
+    def __init__(self, session, record):
         self._session = session
         self._record = record
-        self._recover_initial_page = recover_initial_page
-        self._on_initial_retry = on_initial_retry
-        self._initial_request_seen = False
 
     def __getattr__(self, name):
         return getattr(self._session, name)
 
-    def _call(self, invoke, url, *, method, **kwargs):
+    def _call(self, invoke, url, **kwargs):
         try:
             parsed = urlsplit(url)
         except (TypeError, ValueError):
@@ -24,17 +20,8 @@ class ObservedSession:
             kwargs['allow_redirects'] = False
         attempt = {'stage': stage_for_url(url), 'httpStatus': None}
         self._record(attempt)
-        # 仅允许全新登录会话的首个原生授权页 GET 恢复一次，不重放登录或交换请求
-        initial_page = self._recover_initial_page and not self._initial_request_seen and method.upper() == 'GET' and parsed and parsed.scheme == 'https' and parsed.netloc == 'auth.openai.com' and parsed.path == '/oauth/authorize'
-        self._initial_request_seen = True
         try:
             response = invoke(**kwargs)
-            if initial_page and self._initial_challenge(response):
-                if self._on_initial_retry:
-                    self._on_initial_retry()
-                time.sleep(2)
-                response = invoke(**kwargs)
-                attempt['initialPageRetries'] = 1
         except Exception as exc:
             attempt['transport'] = transport_reason(exc)
             raise
@@ -63,28 +50,11 @@ class ObservedSession:
                             break
         return response
 
-    @staticmethod
-    def _initial_challenge(response):
-        if getattr(response, 'status_code', None) != 403:
-            return False
-        headers = getattr(response, 'headers', {}) or {}
-        if headers.get('server', '').lower() != 'cloudflare' and not headers.get('cf-ray'):
-            return False
-        # 尊重上游要求等待更长的响应，不提前重发，也不接管人工挑战
-        if headers.get('retry-after'):
-            try:
-                if float(headers['retry-after']) > 2:
-                    return False
-            except (ValueError, TypeError):
-                return False
-        body = str(getattr(response, 'text', '') or '').lower()
-        return any(marker in body for marker in ('just a moment', 'cf-chl-', '/cdn-cgi/challenge-platform/'))
-
     def request(self, method, url, **kwargs):
-        return self._call(lambda **kw: self._session.request(method, url, **kw), url, method=method, **kwargs)
+        return self._call(lambda **kw: self._session.request(method, url, **kw), url, **kwargs)
 
     def get(self, url, **kwargs):
-        return self._call(lambda **kw: self._session.get(url, **kw), url, method='GET', **kwargs)
+        return self._call(lambda **kw: self._session.get(url, **kw), url, **kwargs)
 
     def post(self, url, **kwargs):
-        return self._call(lambda **kw: self._session.post(url, **kw), url, method='POST', **kwargs)
+        return self._call(lambda **kw: self._session.post(url, **kw), url, **kwargs)
