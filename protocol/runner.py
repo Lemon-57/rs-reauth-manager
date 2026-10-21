@@ -112,6 +112,7 @@ def _run_once(data, used_codes):
     forced = data.get("forceWorkspaceId")
     forced_free = data.get("forceFree") is True
     automatic = data.get("automatic") is True
+    new_account = data.get("newAccount") is True
     auto_team = not automatic and str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
     if automatic and (forced or forced_free or not target or not data.get("userId") or not data.get("planType")):
         raise ValueError("workspace")
@@ -120,7 +121,7 @@ def _run_once(data, used_codes):
 
     class BoundOAuthClient(OAuthClient):
         bound_workspace = False
-        selected_workspace = forced or target
+        selected_workspace = forced or ("" if new_account else target)
         workspace_candidates = []
         unbound_workspace = False
         last_attempt = None
@@ -177,6 +178,12 @@ def _run_once(data, used_codes):
                 self.session_lookup_failure = describe_failure(attempt=self.last_attempt)
             for choice in workspace_choices(session, target):
                 self._remember_workspace(choice['id'])
+            if new_account and not selected:
+                candidate = team_candidate(session, "")
+                if candidate:
+                    self.selected_workspace = candidate
+                    return candidate
+                return ""
             if auto_team and selected == target:
                 return ''
             if not selected:
@@ -202,6 +209,12 @@ def _run_once(data, used_codes):
             for choice in workspace_choices(evidence, target):
                 self._remember_workspace(choice['id'])
             ids = {workspace['id'] for workspace in evidence['workspaces']}
+            if new_account and not self.selected_workspace:
+                candidate = team_candidate(evidence, "")
+                if candidate:
+                    self.selected_workspace = candidate
+                    return candidate
+                return ""
             if auto_team and self.selected_workspace == target:
                 combined = merge_workspace_evidence(self.session_evidence, evidence)
                 team = team_candidate(combined, target)
@@ -357,6 +370,18 @@ def _run_once(data, used_codes):
                 return
             except WorkspaceUnavailable as unavailable:
                 fallback(unavailable.personal_id)
+                return
+            if new_account:
+                if (
+                    not isinstance(result, dict)
+                    or result.get("ok") is not True
+                    or result.get("state") != state
+                    or not isinstance(result.get("code"), str)
+                    or not result["code"]
+                    or not oauth.workspace_matches()
+                ):
+                    raise ValueError("workspace")
+                completed("complete", workspaceId=oauth.selected_workspace, result=result)
                 return
             if not isinstance(result, dict) or not result.get("ok"):
                 return oauth.failed_authorization

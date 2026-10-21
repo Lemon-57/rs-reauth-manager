@@ -60,6 +60,9 @@ pub async fn complete(
     snapshot: &mut Value,
     output: &Value,
 ) -> Result<(String, bool), PluginFault> {
+    if snapshot["newAccount"] == true {
+        return complete_new_account(host, snapshot, output).await;
+    }
     let event = output["event"].as_str().unwrap_or_default();
     let forced = event == "forced_workspace";
     let free = matches!(event, "free_fallback" | "forced_free");
@@ -275,6 +278,101 @@ pub async fn complete(
         "RS 原生 OAuth 已换取、保存 RT，身份及配置已读回确认"
     };
     Ok((message.into(), free))
+}
+
+async fn complete_new_account(
+    host: &HostClient,
+    snapshot: &mut Value,
+    output: &Value,
+) -> Result<(String, bool), PluginFault> {
+    if output["event"] != "complete" || output.get("tokens").is_some() {
+        return Err(fault("新增账号必须取得 RS 原生授权回调，未提交完成接口"));
+    }
+    let callback = output["callbackUrl"]
+        .as_str()
+        .ok_or_else(|| fault("新增账号授权码回调缺失，未提交原生完成接口"))?;
+    let flow = snapshot["flowId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| fault("新增账号 OAuth flow 缺失"))?;
+    let settings = snapshot["settings"].clone();
+    let done = admin(
+        host,
+        "POST",
+        "/api/admin/accounts/oauth/complete",
+        Some(json!({
+            "provider":"openai",
+            "flowId":flow,
+            "callbackUrl":callback,
+            "settings":settings
+        })),
+    )
+    .await
+    .map_err(|error| {
+        fault(&format!(
+            "RS 新增 OAuth 完成接口未确认：{}，账号未完成写入",
+            error.message
+        ))
+    })?;
+    let id = done["accountId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| fault("RS 新增 OAuth 未返回账号 ID"))?;
+    let account = detail(host, id).await?;
+    if account["provider"] != "openai"
+        || account["authenticationKind"] != "oauth"
+        || account["enabled"] != false
+        || account["email"].as_str().is_none_or(|email| {
+            !email.eq_ignore_ascii_case(snapshot["email"].as_str().unwrap_or_default())
+        })
+        || account["planType"].as_str().is_none_or(|plan| {
+            !matches!(
+                plan.trim().to_ascii_lowercase().as_str(),
+                "team" | "business"
+            )
+        })
+        || require_idle(&account).is_err()
+    {
+        return Err(fault("新增账号身份、Team 套餐或停用状态读回不一致"));
+    }
+    let expected_groups = settings["groupIds"].as_array().cloned().unwrap_or_default();
+    let actual_groups = account["groups"]
+        .as_array()
+        .ok_or_else(|| fault("新增账号分组读回格式无效"))?;
+    let mut actual_ids = actual_groups
+        .iter()
+        .filter_map(|group| group["id"].as_str())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut expected_ids = expected_groups
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    actual_ids.sort_unstable();
+    expected_ids.sort_unstable();
+    if actual_ids != expected_ids || account["notes"] != settings["notes"] {
+        return Err(fault("新增账号分组或三字段备注读回不一致"));
+    }
+    let credential = recovery::credential(host, id).await?;
+    let tokens = recovery::tokens(&credential);
+    let check = json!({"event":"same_workspace","workspaceId":account["accountId"],
+        "originalWorkspaceId":account["accountId"],"tokens":tokens});
+    recovery::validate(&check, &crate::settings(&account))?;
+    if credential.credential_revision != account["_credentialRevision"].as_u64().unwrap_or(0)
+        || output["workspaceId"] != account["accountId"]
+        || crate::proxy(host, &account).await? != snapshot["proxy"]
+    {
+        return Err(fault("新增账号凭据版本、所选工作区或固定代理不一致"));
+    }
+    snapshot["postAuthorizationSettings"] = crate::settings(&account);
+    snapshot["resumeAfterCleanup"] = json!(false);
+    snapshot["createdAccountId"] = json!(id);
+    Ok((
+        "RS 原生 OAuth 已创建并保存 Team RT，备注与 GPT Pro 分组已读回确认；账号保持停用等待核对"
+            .into(),
+        false,
+    ))
 }
 
 #[cfg(test)]

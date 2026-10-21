@@ -191,6 +191,7 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
             expected_revision: a["_credentialRevision"].as_u64(),
             logout_others: true,
             cleanup_started: false,
+            new_account: false,
         });
         break;
     }

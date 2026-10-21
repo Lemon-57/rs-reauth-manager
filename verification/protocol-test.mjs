@@ -11,6 +11,7 @@ const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLS
 const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace3`,email:`${id}@example.com`,authenticationKind:'oauth',userId:'original-user',enabled:id!=='disabled',planType:'team',status:'error',notes:`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`,outboundProxyEndpoint:'http://127.0.0.1:21001',accountId:'original-workspace',groups:[{id:'g1',name:'Team'}],weight:3,concurrencyLimit:null,modelAccess:{mode:'all'},hasRefreshToken:true,capacity:{usedSlots:0},errorReason:null})
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[]
+const importFlows=new Map()
 let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
@@ -57,7 +58,21 @@ async function callback(meta,payload) {
  }
  if(meta.method==='host.http.dispatch') {
   const url=new URL(meta.params.uri,'http://mock.invalid');let dataReply,status=200,code=200
-  if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
+  if(url.pathname==='/api/admin/accounts/oauth/start'&&!data.accountId){
+   assert.deepEqual(Object.keys(data).sort(),['name','outboundProxyUrl','provider'])
+   assert.equal(data.outboundProxyUrl,'http://fixture:pass@127.0.0.1:21001')
+   const id=data.name.slice('team+'.length).split('@')[0],flowId='import_'+id
+   importFlows.set(flowId,id);starts.push(structuredClone(data));dataReply={flowId,authorizationUrl:nativeAuthorization};status=201
+  }else if(url.pathname==='/api/admin/accounts/oauth/complete'&&data.settings){
+   assert.deepEqual(Object.keys(data).sort(),['callbackUrl','flowId','provider','settings'])
+   assert.equal(data.settings.enabled,false);assert.equal(data.callbackUrl,'http://127.0.0.1:1455/auth/callback?state=fixture&code=secret-code')
+   const id=importFlows.get(data.flowId);assert.ok(id);const a=add(id)
+   Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:data.settings.groupIds.map(id=>({id,name:'Team'})),concurrencyLimit:data.settings.concurrencyLimit,weight:data.settings.weight,modelAccess:data.settings.modelAccess})
+   credentials.set(a.id,credential(a));completes.push(structuredClone(data))
+   if(id==='new_wrong_user'){const c=credentials.get(a.id),p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'));p[AUTH].chatgpt_user_id='wrong-user';c.facts.material.access_token=jwt(p)}
+   if(id==='new_missing_rt')credentials.get(a.id).facts.material.refresh_token=''
+   dataReply={accountId:a.id}
+  }else if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
   else if(url.pathname==='/api/admin/accounts/detail')dataReply={account:accounts.find(a=>a.id===url.searchParams.get('accountId')),credentialConfiguration:{transport:'http'}}
   else if(url.pathname==='/api/admin/accounts/export') {
    assert.equal(url.searchParams.get('confirm'),'export_sensitive_accounts');const id=url.searchParams.get('accountIds');assert.ok(!id.includes(','))
@@ -154,8 +169,29 @@ let passed=0
 const check=name=>{passed++;console.log('PASS '+name)}
 try {
  await start()
- const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,10)
+ const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,11)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
+ for(const id of ['new_team','new_wrong_user','new_missing_rt']){
+  const req={requestId:randomUUID(),email:id+'@example.com',notes:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ',proxyUrl:'http://fixture:pass@127.0.0.1:21001',groupIds:['g1']}
+  const n=starts.length,c=completes.length
+  assert.equal((await request('import',req)).status,200)
+  const duplicate=await request('import',req);assert.equal(duplicate.status,200);assert.equal(starts.length,n+1)
+  let done
+  for(let i=0;i<60;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
+  assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,false)
+  if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted,true);assert.ok(refreshes.includes(id))}
+  else{assert.equal(done.status,'review',done.message);const before=[starts.length,completes.length];await tick();assert.deepEqual([starts.length,completes.length],before)}
+  const count=starts.length;assert.equal((await request('import',{...req,requestId:randomUUID(),email:'other@example.com',notes:'other@example.com----fixture-password----GEZDGNBVGY3TQOJQ'})).status,400);assert.equal(starts.length,count)
+  accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check(`${id}: new accounts use native start/complete, validate AT and ID Token, retain pause and never replay`)
+ }
+ {
+  const n=starts.length
+  const req={requestId:randomUUID(),email:'invalid@example.com',notes:'invalid@example.com----fixture----not-valid-2FA',proxyUrl:'http://fixture:pass@127.0.0.1:21001',groupIds:['g1']}
+  assert.equal((await request('import',req)).status,400);assert.equal(starts.length,n)
+  check('Malformed new-account credentials never start an OAuth flow')
+ }
+
  for(const id of ['good','disabled','free','legacy_principal']) {
   const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'){a.planType='free';credentials.set(id,credential(a))}
   const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length

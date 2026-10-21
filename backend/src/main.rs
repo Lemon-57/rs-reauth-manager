@@ -48,6 +48,8 @@ struct Job {
     logout_others: bool,
     #[serde(default)]
     cleanup_started: bool,
+    #[serde(default)]
+    new_account: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkspaceChoice {
@@ -102,6 +104,16 @@ struct FreeFallbackSubmit {
     confirmation: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportSubmit {
+    request_id: String,
+    email: String,
+    notes: String,
+    proxy_url: String,
+    group_ids: Vec<String>,
+}
+
 fn workspace_choices(output: &Value) -> Vec<WorkspaceChoice> {
     let Some(items) = output["workspaces"].as_array() else {
         return vec![];
@@ -135,6 +147,7 @@ fn registration() -> ManagementRegistration {
             ("GET", "api/accounts"),
             ("GET", "api/jobs"),
             ("POST", "api/submit"),
+            ("POST", "api/import"),
             ("POST", "api/automation"),
             ("POST", "api/cancel"),
             ("POST", "api/delete"),
@@ -187,6 +200,35 @@ fn notes_valid(a: &Value) -> bool {
         && !parts[1].is_empty()
         && !parts[2].trim().is_empty()
         && !notes.contains(['\r', '\n', '\0'])
+}
+
+fn import_notes_valid(email: &str, notes: &str) -> bool {
+    if notes.len() > 2000 || notes.contains(['\r', '\n', '\0']) {
+        return false;
+    }
+    let parts: Vec<_> = notes.trim().split("----").collect();
+    if parts.len() != 3
+        || !parts[0].trim().eq_ignore_ascii_case(email.trim())
+        || parts[1].is_empty()
+    {
+        return false;
+    }
+    let secret = parts[2].trim().replace(' ', "").to_ascii_uppercase();
+    let core = secret.trim_end_matches('=');
+    core.len() >= 16
+        && matches!(core.len() % 8, 0 | 2 | 4 | 5 | 7)
+        && core.bytes().all(|c| matches!(c, b'A'..=b'Z' | b'2'..=b'7'))
+        && (!secret.contains('=') || secret.len() % 8 == 0)
+}
+
+fn import_proxy_valid(proxy: &str) -> bool {
+    let Ok(url) = url::Url::parse(proxy) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        && url.host_str().is_some()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 fn settings(a: &Value) -> Value {
     json!({"id":a["id"],"email":a["email"],"name":a["name"],"enabled":a["enabled"],"notes":a["notes"],"groups":a["groups"],"proxy":a["outboundProxyEndpoint"],"weight":a["weight"],"concurrencyLimit":a["concurrencyLimit"],"modelAccess":a["modelAccess"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"]})
@@ -464,7 +506,16 @@ impl Manager {
                     job.step = "saving".into();
                     current.snapshot["flowId"] = json!(current.flow);
                     match native::complete(host,job,&mut current.snapshot,&output).await {
-                        Ok((message,free))=>{job.finish("success",&message);if free {job.step="free".into();}},
+                        Ok((message,free))=>{
+                            if job.new_account {
+                                job.account_id = current.snapshot["createdAccountId"]
+                                    .as_str()
+                                    .ok_or_else(|| fault("新增账号 ID 未确认"))?
+                                    .to_owned();
+                            }
+                            job.finish("success",&message);
+                            if free {job.step="free".into();}
+                        },
                         Err(error)=>job.finish("review",&format!("原生授权未确认：{}；请核对账号启停及提交回执，不会自动改走插件换取 RT",error.message)),
                     }
                 } else {
@@ -664,6 +715,154 @@ async fn handle(
         manager.tick(&call.host).await?;
         return Ok(json!({"ok":true}));
     }
+    if call.request.path == "api/import" {
+        let request: ImportSubmit =
+            serde_json::from_slice(&call.payload).map_err(|_| fault("新增账号参数无效"))?;
+        if uuid::Uuid::parse_str(&request.request_id).is_err()
+            || request.email.trim().is_empty()
+            || request.email.len() > 320
+            || request.email.split('@').count() != 2
+            || request
+                .email
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+            || !import_notes_valid(&request.email, &request.notes)
+            || !import_proxy_valid(&request.proxy_url)
+            || request.group_ids.is_empty()
+            || request.group_ids.len() > 16
+            || request.group_ids.iter().any(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            })
+            || request
+                .group_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != request.group_ids.len()
+        {
+            return Err(fault("新增账号参数或三字段备注无效"));
+        }
+        let (mut queue, version) = host::load(&call.host).await?;
+        if queue
+            .jobs
+            .iter()
+            .any(|job| job.request_id == request.request_id)
+        {
+            return Ok(json!({"jobs":queue.jobs}));
+        }
+        if manager.worker.is_some() || queue.jobs.iter().any(Job::active) {
+            return Err(fault("已有授权任务进行中，请等待空闲后再新增账号"));
+        }
+        let accounts = directory(&call.host).await?;
+        if accounts.iter().any(|a| {
+            a["email"]
+                .as_str()
+                .is_some_and(|email| email.eq_ignore_ascii_case(request.email.trim()))
+        }) {
+            return Err(fault("账号邮箱已存在，拒绝重复新增"));
+        }
+        let mut endpoint =
+            url::Url::parse(&request.proxy_url).map_err(|_| fault("新增账号代理格式无效"))?;
+        endpoint
+            .set_username("")
+            .map_err(|_| fault("新增账号代理格式无效"))?;
+        endpoint
+            .set_password(None)
+            .map_err(|_| fault("新增账号代理格式无效"))?;
+        if accounts.iter().any(|account| {
+            account["outboundProxyEndpoint"]
+                .as_str()
+                .and_then(|value| url::Url::parse(value).ok())
+                .is_some_and(|value| value == endpoint)
+        }) {
+            return Err(fault("该代理已绑定其他账号，拒绝共享出口"));
+        }
+        let start = admin(
+            &call.host,
+            "POST",
+            "/api/admin/accounts/oauth/start",
+            Some(json!({
+                "provider":"openai",
+                "name":format!("team+{}", request.email.trim()),
+                "outboundProxyUrl":request.proxy_url
+            })),
+        )
+        .await?;
+        let flow = start["flowId"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| fault("RS 新增 OAuth 流程无效"))?
+            .to_owned();
+        let job = Job {
+            request_id: request.request_id.clone(),
+            account_id: String::new(),
+            status: "running".into(),
+            step: "preparing".into(),
+            message: format!("正在新增 {}", request.email.trim()),
+            started_at: Some(now()),
+            finished_at: None,
+            workspace_choices: vec![],
+            force_workspace_id: None,
+            free_fallback: false,
+            automatic: false,
+            expected_revision: None,
+            logout_others: true,
+            cleanup_started: false,
+            new_account: true,
+        };
+        queue.jobs.push(job);
+        host::save(&call.host, &queue, version).await?;
+        let input = json!({
+            "notes":request.notes.clone(),
+            "email":request.email.trim(),
+            "proxy":request.proxy_url.clone(),
+            "authorizationUrl":start["authorizationUrl"],
+            "accountId":"",
+            "userId":"",
+            "planType":"team",
+            "automatic":false,
+            "newAccount":true
+        });
+        let snapshot = json!({
+            "newAccount":true,
+            "flowId":flow,
+            "proxy":request.proxy_url.clone(),
+            "email":request.email.trim(),
+            "settings":{
+                "enabled":false,
+                "concurrencyLimit":null,
+                "weight":1,
+                "groupIds":request.group_ids,
+                "notes":request.notes.clone(),
+                "modelAccess":{"mode":"all","models":[]}
+            }
+        });
+        match manager
+            .runtime
+            .start(input, flow, snapshot, request.request_id.clone())
+            .await
+        {
+            Ok(worker) => manager.worker = Some(worker),
+            Err(error) => {
+                let (mut latest, version) = host::load(&call.host).await?;
+                if let Some(job) = latest
+                    .jobs
+                    .iter_mut()
+                    .find(|job| job.request_id == request.request_id)
+                {
+                    job.finish("failed", &error.message);
+                }
+                host::save(&call.host, &latest, version).await?;
+                return Err(error);
+            }
+        }
+        let (queue, _) = host::load(&call.host).await?;
+        return Ok(json!({"jobs":queue.jobs}));
+    }
     let (mut queue, version) = host::load(&call.host).await?;
     match call.request.path.as_str() {
         "api/delete" => {
@@ -753,6 +952,7 @@ async fn handle(
                     expected_revision: None,
                     logout_others: true,
                     cleanup_started: false,
+                    new_account: false,
                 });
             }
         }
@@ -821,6 +1021,7 @@ async fn handle(
                 expected_revision: None,
                 logout_others: true,
                 cleanup_started: false,
+                new_account: false,
             });
         }
         "api/free-fallback" => {
@@ -874,6 +1075,7 @@ async fn handle(
                 expected_revision: None,
                 logout_others: true,
                 cleanup_started: false,
+                new_account: false,
             });
         }
         "api/cancel" => {

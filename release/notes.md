@@ -1,3 +1,9 @@
+# v0.1.30
+
+新增受保护的单号 `api/import` 插件入口，用于新增 OpenAI OAuth 账号：完整目录去重后，通过 RS 原生 OAuth start 建立 flow，插件使用三字段备注和分配的固定代理取得授权码，再由 RS 原生 OAuth complete 一次性保存 RT、备注、停用状态和目标分组。插件不保存新增账号密码或 2FA，不自行交换 RT，也不复用其他账号代理。
+
+新增账号完成后必须读回邮箱、用户/工作区、Team/Business 套餐、RT、备注、代理和分组；默认保持停用，待人工核对后再启用。
+
 # v0.1.29
 
 修复账号原本处于 RS `quota_exhausted` 或 `rate_limited` 时，授权完成、设备退出及 RT 刷新均成功，但最终调度状态回读被错误判为未确认的问题。最终校验现在接受 RS 的稳定状态 `normal`、`disabled`、`quota_exhausted`、`rate_limited`，仍拒绝 `error`、未知状态和凭据/身份不一致。

@@ -30,6 +30,7 @@ if name.startswith('force_') and not data.get('forceWorkspaceId'):
 if name=='free_fallback_no_candidates' and not data.get('forceFree'):
     emit({'event':'error','code':'workspace','workspaces':[]});sys.exit(0)
 output={'event':'complete','callbackUrl':'http://127.0.0.1:1455/auth/callback?state=fixture&code=secret-code'}
+if data.get('newAccount'):output['workspaceId']='original-workspace'
 if name.startswith('fb_'):output.update(event='free_fallback',workspaceId='personal-workspace',originalWorkspaceId=data['accountId'],originalWorkspaceUnavailable=True)
 if name.startswith('up_'):output.update(event='team_upgrade',workspaceId='team-workspace',originalWorkspaceId=data['accountId'],uniqueTeamConfirmed=True)
 if data.get('forceWorkspaceId'):output.update(event='forced_workspace',workspaceId=data['forceWorkspaceId'],originalWorkspaceId=data['accountId'],administratorConfirmed=True)

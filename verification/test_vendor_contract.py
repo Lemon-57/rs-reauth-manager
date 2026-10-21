@@ -36,7 +36,7 @@ class OfflineSession:
 
 
 class BoundWorkspacePageTests(unittest.TestCase):
-    def execute(self, cookie, html, *, selection_status=302, selection_error=False):
+    def execute(self, cookie, html, *, selection_status=302, selection_error=False, new_account=False):
         self.messages, self.calls = [], []
         testcase = self
         consent = 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent'
@@ -65,11 +65,26 @@ class BoundWorkspacePageTests(unittest.TestCase):
                 testcase.assertTrue(url.endswith('/client_auth_session_dump'))
                 return types.SimpleNamespace(status_code=403, url=url, headers={}, text='', json=lambda: {})
         data = {'notes': f'{EMAIL}----fixture-password----{SECRET}', 'email': EMAIL, 'proxy': 'http://fixture:pass@127.0.0.1:21001', 'authorizationUrl': URL, 'accountId': 'original-workspace', 'userId': 'original-user'}
+        if new_account:
+            data.update(newAccount=True, accountId='', userId='', planType='team')
         def session(**kwargs):
             self.assertEqual(kwargs['proxy'], data['proxy'])
             return Session()
         with patch.object(chatgpt_client, 'create_http_session', side_effect=session), patch.object(oauth_client, 'create_http_session', side_effect=session), patch.object(socket, 'create_connection', side_effect=AssertionError('Network forbidden')), patch.object(runner, 'emit', side_effect=lambda event, **fields: self.messages.append({'event': event, **fields})):
             runner.run(data)
+
+    def test_new_account_selects_only_one_explicit_team_workspace_on_rs_flow(self):
+        self.execute({'workspaces': []}, '{"workspaces":[{"id":"original-workspace","kind":"organization"}]}', new_account=True)
+        self.assertEqual(self.messages[-1]['event'], 'complete')
+        self.assertEqual(self.messages[-1]['workspaceId'], 'original-workspace')
+        self.assertNotIn('tokens', self.messages[-1])
+        self.assertEqual(sum(url.endswith('/workspace/select') for _, url in self.calls), 1)
+
+    def test_new_account_rejects_personal_and_ambiguous_teams_without_callback(self):
+        for html in ['{"workspaces":[{"id":"personal","is_personal":true}]}', '{"workspaces":[{"id":"team-a","kind":"organization"},{"id":"team-b","kind":"organization"}]}']:
+            self.execute({'workspaces': []}, html, new_account=True)
+            self.assertEqual(self.messages[-1]['event'], 'error')
+            self.assertFalse(any(url.endswith('/workspace/select') for _, url in self.calls))
 
     def test_rejected_workspace_with_callback_cannot_become_binding_proof(self):
         self.execute({'workspace_id': 'original-workspace'}, '{}', selection_status=403)

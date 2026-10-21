@@ -19,7 +19,7 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前源码版本 | `0.1.29`，公开版本以 Releases 为准 |
+| 当前源码版本 | `0.1.30`，公开版本以 Releases 为准 |
 | 宿主兼容清单 | `>=3.29.1, <3.30.0` |
 | 插件合同 | RPC v4、management v2、maintenance v1，manifestVersion 仍为 2 |
 | 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |
@@ -111,7 +111,7 @@ Free、Plus、Pro、Team、Business 等全部套餐的 OAuth 账号均可列出�
 
 同一挑战的 2FA 校验最多提交三次不同动态码，仅对明确的验证码无效或过期换码；重试等待预算为 TOTP 刷新周期加五秒余量。登录身份、密码或 MFA 步骤明确返回 HTTP 400/409 的 `invalid_state` 时，放弃旧挑战和 Cookie，使用原代理最多重建一次登录会话；所有授权均保留 RS 的 state、PKCE 和待完成流程。已提交的动态码在同一任务内不重复使用
 429、封禁、付款、密码错误、人工验证、无具体错误码的 409、传输异常、授权回调校验失败和令牌交换失败均不自动重登或猜测换码。新会话仍失败时同时显示两次原因，不重放凭据写回，任务失败后不自动重新排队；单号 420 秒总时限不因恢复而延长
-所有授权复用 RS 已生成的 state、PKCE、client_id 与回调地址，以及账号固定代理和现有登录协议。插件不得生成另一套 PKCE、调用上游 token 接口交换授权码，或用 SDK 写入自行换取的 RT。以后新增账号也必须沿用这一原生链路，项目 AGENTS.md 已将其设为持久规则
+所有授权复用 RS 已生成的 state、PKCE、client_id 与回调地址，以及账号固定代理和现有登录协议。插件不得生成另一套 PKCE、调用上游 token 接口交换授权码，或用 SDK 写入自行换取的 RT。新增账号使用受保护的 `api/import` 入口，仍由 RS 原生 complete 保存 RT、备注和分组；以后新增账号也必须沿用这一原生链路，项目 AGENTS.md 已将其设为持久规则
 
 后端使用 RS v3.29.1 的公开 SDK，固定提交 `743a3aba70a4f78f27fb53d80a6e719599d2fe5e`，打包 CLI 使用同一合同源码构建
 界面使用官方 `@codex-proxy/ui` v0.4.1 编译发行包，并参考 [插件工作台示例](https://github.com/zyycn/codex-proxy-plugins) 组织公开宿主桥、请求层、业务解码和 composable
