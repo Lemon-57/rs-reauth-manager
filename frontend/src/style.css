@@ -34,3 +34,4 @@ body { margin: 0; min-width: 0; min-height: inherit; font-size: var(--cp-font-si
 .import-results > summary { cursor: pointer; }
 .import-results[open] > summary { margin-bottom: 8px; }
 .refresh-status { margin: 4px 0 8px; font-size: 12px; }
+.table-controls { display: flex; justify-content: flex-end; margin-bottom: 8px; }
