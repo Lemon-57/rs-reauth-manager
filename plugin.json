@@ -3,7 +3,7 @@
   "publisher": "personal",
   "name": "reauth-manager",
   "displayName": "账号重新授权",
-  "version": "0.1.35",
+  "version": "0.1.43",
   "description": "沿用账号备注及绑定代理重新授权并写回原账号",
   "license": "MIT",
   "engines": {
@@ -19,7 +19,14 @@
   },
   "configurationSchema": {
     "type": "object",
-    "properties": {},
+    "properties": {
+      "protectedManagementUrl": {
+        "type": "string",
+        "default": "",
+        "title": "本机受保护管理入口",
+        "description": "例如 http://127.0.0.1:18138，仅用于新增账号导入，不接受上游或代理 URL"
+      }
+    },
     "additionalProperties": false
   },
   "resources": {

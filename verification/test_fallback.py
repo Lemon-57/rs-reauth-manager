@@ -99,7 +99,7 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
     def execute(self, plan='free', workspaces=None, *, html_only=False, token_plan='team', wrong_user=False, page_workspaces=None, automatic=False, token_workspace=None, recorded_workspace=None):
         self.messages, self.calls = [], []
         source = recorded_workspace or ('personal-workspace' if plan == 'free' else 'old-team')
-        target = source if automatic else 'new-team' if plan == 'free' else 'personal-workspace'
+        target = 'new-team' if plan == 'free' else 'personal-workspace'
         workspaces = workspaces if workspaces is not None else [
             {'id': 'personal-workspace', 'type': 'personal', 'plan_type': 'free'},
             *([{'id': 'new-team', 'type': 'team', 'plan_type': 'team'}] if plan == 'free' else []),
@@ -270,9 +270,9 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
         self.assertEqual([b['workspace_id'] for _,u,b in self.calls if u.endswith('/workspace/select')],['old-team'])
         self.assertFalse(any(u.endswith('/oauth/token') for _,u,_ in self.calls))
 
-    def test_unattended_free_does_not_upgrade_to_team(self):
+    def test_unattended_free_uses_same_unique_team_upgrade(self):
         self.execute(plan='free',token_plan='free',automatic=True)
-        self.assertEqual(self.messages[-1]['event'],'complete')
+        self.assertEqual(self.messages[-1]['event'],'team_upgrade')
         self.assertNotIn('tokens',self.messages[-1])
 
     def test_unattended_emits_no_credentials_before_native_validation(self):
@@ -281,10 +281,31 @@ class AutomaticWorkspaceTransitions(unittest.TestCase):
         self.assertNotIn('tokens',self.messages[-1])
         self.assertFalse(any(u.endswith('/oauth/token') for _,u,_ in self.calls))
 
-    def test_unattended_missing_original_workspace_never_downgrades(self):
+    def test_unattended_missing_original_workspace_uses_same_free_recovery(self):
         self.execute(plan='team', token_plan='free', automatic=True)
-        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['event'], 'free_fallback')
         self.assertFalse(any(url.endswith('/oauth/token') for _, url, _ in self.calls))
+
+    def test_manual_and_automatic_have_identical_workspace_outputs_and_requests(self):
+        cases = [
+            dict(plan='free', workspaces=[{'id':'personal-workspace','type':'personal'},{'id':'new-team','type':'team'}]),
+            dict(plan='team', token_plan='free', workspaces=[{'id':'personal-workspace','type':'personal'}]),
+            dict(plan='team', workspaces=[{'id':'old-team','type':'team'},{'id':'another-team','type':'team'}]),
+            dict(plan='free', workspaces=[{'id':'personal-workspace','type':'personal'},{'id':'one-team','type':'team'},{'id':'two-team','type':'team'}]),
+        ]
+        for case in cases:
+            outputs, requests = [], []
+            for automatic in [False, True]:
+                self.execute(automatic=automatic, **case)
+                output=dict(self.messages[-1])
+                if 'deviceId' in output:
+                    import uuid
+                    uuid.UUID(output.pop('deviceId'))
+                outputs.append(output)
+                requests.append(self.calls[:])
+            self.assertEqual(outputs[0], outputs[1])
+            self.assertEqual(requests[0], requests[1])
+            self.assertFalse(any(url.endswith('/oauth/token') for _,url,_ in requests[0]))
 
 
 class RealVendorFreeRecovery(unittest.TestCase):

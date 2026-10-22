@@ -5,7 +5,46 @@ use gateway_plugin_sdk::{PluginFault, call::host::AuthCredential, client::HostCl
 use serde_json::{Value, json};
 
 const AUTH: &str = "https://api.openai.com/auth";
-const IDENTITY_ERROR: &str = "工作区授权身份校验失败，未更改账号或提交凭据";
+const IDENTITY_ERROR: &str = "授权身份、工作区、套餐或令牌有效期未确认，请核对已保存结果";
+
+pub(crate) fn missing_workspace(original: &Value) -> bool {
+    original["planType"]
+        .as_str()
+        .is_some_and(|p| p.eq_ignore_ascii_case("free"))
+        && original["accountId"]
+            .as_str()
+            .is_none_or(|w| w.trim().is_empty())
+}
+
+// 旧 RT 可以没有 ChatGPT 工作区声明；仅用于绑定已有用户，不能据此启用或归组
+pub(crate) fn validate_binding(tokens: &Value, original: &Value) -> Result<String, PluginFault> {
+    text(tokens, "refresh_token")?;
+    let identity = claims(text(tokens, "id_token")?)?;
+    let access = claims(text(tokens, "access_token")?)?;
+    let email = identity["email"]
+        .as_str()
+        .or_else(|| identity["https://api.openai.com/profile"]["email"].as_str());
+    if !email
+        .is_some_and(|e| e.eq_ignore_ascii_case(original["email"].as_str().unwrap_or_default()))
+    {
+        return Err(fault("已保存 RT 的邮箱身份未确认，账号保持暂停"));
+    }
+    let user = text(original, "userId")?;
+    for c in [&identity, &access] {
+        if c[AUTH]["chatgpt_user_id"]
+            .as_str()
+            .or_else(|| c[AUTH]["user_id"].as_str())
+            != Some(user)
+        {
+            return Err(fault("已保存 RT 的用户身份不一致，账号保持暂停"));
+        }
+    }
+    let subject = text(&identity, "sub")?;
+    if access["sub"].as_str() != Some(subject) {
+        return Err(fault("已保存 RT 的双令牌主体不一致，账号保持暂停"));
+    }
+    Ok(subject.to_owned())
+}
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
     value[key]
@@ -50,14 +89,20 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
         && original["planType"]
             .as_str()
             .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"));
+    let recovered = output["event"] == "workspace_recovered"
+        && missing_workspace(original)
+        && output["uniqueWorkspaceConfirmed"] == true
+        && matches!(output["selectedPlan"].as_str(), Some("free" | "team"));
     if (!same
         && !forced
         && !forced_free
         && !upgraded
+        && !recovered
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
         || (same && workspace != text(original, "accountId")?)
         || (!same
+            && !recovered
             && workspace == text(original, "accountId")?
             && !upgraded
             && !(forced_free
@@ -98,7 +143,16 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
                                         p.to_ascii_lowercase().as_str(),
                                         "team" | "business"
                                     ))
-                                || (!upgraded && p.eq_ignore_ascii_case("free")))))
+                                || (recovered
+                                    && if output["selectedPlan"] == "team" {
+                                        matches!(
+                                            p.to_ascii_lowercase().as_str(),
+                                            "team" | "business"
+                                        )
+                                    } else {
+                                        p.eq_ignore_ascii_case("free")
+                                    })
+                                || (!upgraded && !recovered && p.eq_ignore_ascii_case("free")))))
             })
         {
             return Err(fault(IDENTITY_ERROR));
@@ -205,4 +259,29 @@ fn subject_with_workspace_check(
         return Err(fault("原账号 ID 与访问令牌主体不一致"));
     }
     Ok(subjects.remove(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn token(user: &str, subject: &str) -> String {
+        let value = json!({"email":"fixture@example.com","sub":subject,"exp":now()/1000+3600,AUTH:{"user_id":user}});
+        format!(
+            "fixture.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        )
+    }
+    #[test]
+    fn unbound_rt_proves_user_only_and_cannot_pass_workspace_validation() {
+        let original = json!({"email":"fixture@example.com","userId":"user","planType":"free","accountId":null});
+        let tokens = json!({"id_token":token("user","subject"),"access_token":token("user","subject"),"refresh_token":"fixture-rt"});
+        assert!(missing_workspace(&original));
+        assert_eq!(validate_binding(&tokens, &original).unwrap(), "subject");
+        assert!(validate(&json!({"event":"same_workspace","workspaceId":null,"originalWorkspaceId":null,"tokens":tokens}),&original).is_err());
+        for (user, sub) in [("wrong-user", "subject"), ("user", "wrong-subject")] {
+            let mut changed = tokens.clone();
+            changed["access_token"] = json!(token(user, sub));
+            assert!(validate_binding(&changed, &original).is_err());
+        }
+    }
 }

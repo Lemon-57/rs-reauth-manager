@@ -39,6 +39,7 @@ pub async fn restore(
     {
         return Err(fault("恢复调度前账号配置、凭据或在途状态变化，请人工核对"));
     }
+    let expected = crate::grouping::assign(host, id, expected, revision).await?;
     if enabled {
         admin(
             host,
@@ -74,11 +75,16 @@ pub async fn complete(
     let forced = event == "forced_workspace";
     let free = matches!(event, "free_fallback" | "forced_free");
     let team = event == "team_upgrade";
+    let recovered = event == "workspace_recovered";
     if !matches!(
         event,
-        "complete" | "free_fallback" | "forced_free" | "forced_workspace" | "team_upgrade"
+        "complete"
+            | "free_fallback"
+            | "forced_free"
+            | "forced_workspace"
+            | "team_upgrade"
+            | "workspace_recovered"
     ) || output.get("tokens").is_some()
-        || (job.automatic && event != "complete")
         || (forced
             && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
                 || output["administratorConfirmed"] != true))
@@ -90,15 +96,24 @@ pub async fn complete(
                 || !snapshot["settings"]["planType"]
                     .as_str()
                     .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"))))
+        || (recovered
+            && (snapshot["recoverWorkspace"] != true
+                || !recovery::missing_workspace(&snapshot["settings"])
+                || output["uniqueWorkspaceConfirmed"] != true
+                || !matches!(output["selectedPlan"].as_str(), Some("free" | "team"))))
     {
         return Err(fault(
             "授权类型与原账号或管理员确认不一致，未提交原生完成接口",
         ));
     }
     let original = snapshot["settings"].clone();
-    if ["email", "userId", "accountId", "planType"]
+    if ["email", "userId", "planType"]
         .iter()
         .any(|key| original[*key].as_str().is_none_or(|v| v.trim().is_empty()))
+        || (!recovered
+            && original["accountId"]
+                .as_str()
+                .is_none_or(|v| v.trim().is_empty()))
     {
         return Err(fault("原账号身份、工作区或套餐不完整，未提交原生完成接口"));
     }
@@ -109,16 +124,15 @@ pub async fn complete(
     {
         return Err(fault("登录期间账号配置或凭据变化，未提交原生完成接口"));
     }
-    if job.automatic && !crate::automatic::ready(&current) {
-        return Err(fault("自动授权条件已经变化，未提交原生完成接口"));
-    }
     let old = recovery::credential(host, &job.account_id).await?;
     if Some(old.credential_revision) != snapshot["credentialRevision"].as_u64()
         || old.facts.upstream_user_id.as_deref() != original["userId"].as_str()
     {
         return Err(fault("原账号身份或凭据版本未确认，未提交原生完成接口"));
     }
-    let old_subject = if team {
+    let old_subject = if recovered {
+        recovery::validate_binding(&recovery::tokens(&old), &original)?
+    } else if team {
         recovery::subject_for_team_upgrade(&old)?
     } else {
         recovery::subject(&old)?
@@ -188,9 +202,7 @@ pub async fn complete(
         || selected.is_some_and(|s| s != actual)
         || Some(old_subject.as_str()) != identity["sub"].as_str()
     {
-        return Err(fault(
-            "原生保存的授权主体或工作区不一致，账号保持暂停，未退出设备",
-        ));
+        return Err(fault("原生保存的授权主体或工作区不一致，账号保持暂停"));
     }
     let mut checked = output.clone();
     checked["event"] = json!(if event == "complete" {
@@ -266,20 +278,19 @@ pub async fn complete(
     {
         return Err(fault("原生授权最终状态未确认，账号保持暂停"));
     }
-    let resume = team || (!free && !forced && original["enabled"] == true);
+    let expected =
+        crate::grouping::assign(host, &job.account_id, &expected, saved.credential_revision)
+            .await?;
+    let recovered_team = recovered && crate::grouping::team(&expected);
+    let free = free || (recovered && !recovered_team);
+    let resume = (team || recovered_team || (!free && !forced && original["enabled"] == true))
+        && !(job.automatic && original["enabled"] == false);
     snapshot["postAuthorizationSettings"] = expected.clone();
-    snapshot["resumeAfterCleanup"] = json!(resume);
-    if !job.logout_others {
-        restore(
-            host,
-            &job.account_id,
-            &expected,
-            saved.credential_revision,
-            resume,
-        )
-        .await?;
-    }
-    let message = if team {
+    snapshot["resumeEnabled"] = json!(resume);
+    snapshot["authorizedCredentialRevision"] = json!(saved.credential_revision);
+    let message = if recovered_team {
+        "RS 原生 OAuth 已补齐并验证唯一 Team 工作区"
+    } else if team {
         "原生授权已切换到唯一 Team 工作区"
     } else if free {
         "原生授权已退回同一用户 Free，已停止调度"
@@ -288,7 +299,12 @@ pub async fn complete(
     } else {
         "RS 原生 OAuth 已换取、保存 RT，身份及配置已读回确认"
     };
-    Ok((message.into(), free))
+    let message = if crate::grouping::team(&expected) {
+        format!("{message}；已移入 GPT Pro 分组")
+    } else {
+        message.into()
+    };
+    Ok((message, free))
 }
 
 async fn complete_new_account(
@@ -307,24 +323,25 @@ async fn complete_new_account(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| fault("新增账号 OAuth flow 缺失"))?;
     let settings = snapshot["settings"].clone();
-    let done = admin(
-        host,
-        "POST",
-        "/api/admin/accounts/oauth/complete",
-        Some(json!({
-            "provider":"openai",
-            "flowId":flow,
-            "callbackUrl":callback,
-            "settings":settings
-        })),
-    )
-    .await
-    .map_err(|error| {
-        fault(&format!(
-            "RS 新增 OAuth 完成接口未确认：{}，账号未完成写入",
-            error.message
-        ))
-    })?;
+    let body =
+        json!({"provider":"openai","flowId":flow,"callbackUrl":callback,"settings":settings});
+    let done = if snapshot["protectedTransport"].is_object() {
+        crate::onboarding::request(
+            host,
+            &snapshot["protectedTransport"],
+            "/api/admin/accounts/oauth/complete",
+            body,
+        )
+        .await?
+    } else {
+        admin(
+            host,
+            "POST",
+            "/api/admin/accounts/oauth/complete",
+            Some(body),
+        )
+        .await?
+    };
     let id = done["accountId"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -337,14 +354,14 @@ async fn complete_new_account(
             !email.eq_ignore_ascii_case(snapshot["email"].as_str().unwrap_or_default())
         })
         || account["planType"].as_str().is_none_or(|plan| {
-            !matches!(
+            !(matches!(
                 plan.trim().to_ascii_lowercase().as_str(),
                 "team" | "business"
-            )
+            ) || (snapshot["allowFreeNew"] == true && plan.trim().eq_ignore_ascii_case("free")))
         })
         || require_idle(&account).is_err()
     {
-        return Err(fault("新增账号身份、Team 套餐或停用状态读回不一致"));
+        return Err(fault("新增账号身份、套餐或停用状态读回不一致"));
     }
     let expected_groups = settings["groupIds"].as_array().cloned().unwrap_or_default();
     let actual_groups = account["groups"]
@@ -376,11 +393,26 @@ async fn complete_new_account(
     {
         return Err(fault("新增账号凭据版本、所选工作区或固定代理不一致"));
     }
-    snapshot["postAuthorizationSettings"] = crate::settings(&account);
-    snapshot["resumeAfterCleanup"] = json!(true);
     snapshot["createdAccountId"] = json!(id);
+    let verified_settings = crate::grouping::assign(
+        host,
+        id,
+        &crate::settings(&account),
+        credential.credential_revision,
+    )
+    .await?;
+    snapshot["postAuthorizationSettings"] = verified_settings;
+    let team = account["planType"]
+        .as_str()
+        .is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "team" | "business"));
+    snapshot["resumeEnabled"] = json!(team);
+    snapshot["authorizedCredentialRevision"] = json!(credential.credential_revision);
     Ok((
-        "RS 原生 OAuth 已创建并保存 Team RT，备注与 GPT Pro 分组已读回确认".into(),
+        if team {
+            "RS 原生 OAuth 已创建并保存 Team RT，备注与分组已读回确认".into()
+        } else {
+            "RS 原生 OAuth 已保存 Free RT，未发现唯一 Team 成员资格，账号保持暂停".into()
+        },
         false,
     ))
 }

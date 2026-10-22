@@ -17,6 +17,9 @@ function job(value: unknown): value is Job {
     && nullableTime(value.startedAt) && nullableTime(value.finishedAt)
     && (value.workspaceChoices === undefined || Array.isArray(value.workspaceChoices) && value.workspaceChoices.length <= 30 && value.workspaceChoices.every(w => isRecord(w) && typeof w.id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(w.id)))
     && (value.forceWorkspaceId === undefined || nullableString(value.forceWorkspaceId))
+    && (value.newAccount === undefined || typeof value.newAccount === 'boolean')
+    && (value.implementationVersion === undefined || typeof value.implementationVersion === 'string')
+    && (value.importInfo === undefined || isRecord(value.importInfo) && Number.isInteger(value.importInfo.line) && (value.importInfo.line as number) > 0 && typeof value.importInfo.email === 'string')
     && (value.automatic === undefined || typeof value.automatic === 'boolean')
 }
 export function parseAccounts(value: unknown): { accounts: Account[] } {

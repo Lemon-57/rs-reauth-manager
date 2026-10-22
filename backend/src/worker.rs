@@ -237,16 +237,20 @@ impl Runtime {
                             Some("session_restart") => "session_restart",
                             Some("login") => "login",
                             Some("mfa") => "mfa",
-                            Some("other_sessions") => "other_sessions",
                             Some("verify_refresh") => "verify_refresh",
                             _ => "running",
                         }
                         .into();
                     }
                     Some(
-                        "complete" | "free_fallback" | "forced_workspace" | "forced_free"
-                        | "team_upgrade" | "same_workspace" | "sessions_cleaned"
-                        | "sessions_verified" | "error",
+                        "complete"
+                        | "free_fallback"
+                        | "forced_workspace"
+                        | "forced_free"
+                        | "team_upgrade"
+                        | "workspace_recovered"
+                        | "same_workspace"
+                        | "error",
                     ) => {
                         data.result = Some(value);
                         break;

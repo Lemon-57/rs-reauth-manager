@@ -35,6 +35,7 @@ with tarfile.open(path) as archive:
         if name == "web/app.js":
             assert b"acct_preview_" not in raw and b"fixture-password" not in raw
     with tarfile.open(fileobj=io.BytesIO(archive.extractfile("runtime/runtime.tar.gz").read())) as runtime:
+        assert "protocol/sessions.py" not in runtime.getnames(), "Removed device module must not be packaged"
         for source in (ROOT / "protocol").rglob("*"):
             if source.is_file() and "__pycache__" not in source.parts and source.suffix != ".pyc":
                 raw = source.read_bytes()

@@ -37,6 +37,7 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "session" => "初始化登录会话",
         "session_lookup" => "读取登录会话及工作区",
         "other_sessions" => "登出其他设备",
+        "session_verify" => "复核本次设备目录",
         "login" => "提交登录身份",
         "password" => "密码验证",
         "mfa_factor" => "识别 2FA 验证器",

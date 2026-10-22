@@ -14,6 +14,7 @@ const job = (id, status, batch = 'history') => ({ accountId: id, requestId: `${b
 let jobs = [job('healthy', 'success'), job('error', 'failed'), job('error', 'failed', 'older')]
 let outcomes = {}, throwAfterSubmit = false, throwAfterForce = false, throwAfterFree = false, freeGate = null, submitGate = null, calls = [], latestBatch = null, checks = 0, mounted
 let automationEnabled = false, loseAutomation = false, failDirectory = false, jobsGate = null
+let throwAfterImport = false
 let deleteGate = null, throwAfterDelete = false, wrongDeleteResult = false
 const clone = value => structuredClone(value)
 const reply = body => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer })
@@ -22,6 +23,13 @@ globalThis.window = { codexProxyPlugin: { version: 2, theme: 'light', request: a
   if (input.path === 'api/accounts') { if (failDirectory) throw new Error('fixture account directory timeout'); return reply({ accounts }) }
   if (input.path === 'api/jobs') { const enabled = automationEnabled; if (jobsGate) await jobsGate.promise; return reply({ jobs, automation: { enabled } }) }
   const body = input.body ? JSON.parse(input.body) : {}
+  if (input.path === 'api/import-line') {
+    assert.deepEqual(body.groupIds,[])
+    const entries=body.line.split(/\r?\n/).map((line,index)=>({line,index})).filter(item=>item.line.trim())
+    jobs.push(...entries.map((item,i)=>({...job('imported'+i,'success',body.requestId),importInfo:{line:item.index+1,email:item.line.split('----')[0]}})))
+    if (throwAfterImport) throw new Error('fixture import response lost')
+    return reply({jobs})
+  }
   if (input.path === 'api/automation') { assert.deepEqual(Object.keys(body), ['enabled']); automationEnabled = body.enabled; if (loseAutomation) throw new Error('fixture setting response lost'); return reply({ jobs, automation: { enabled: automationEnabled } }) }
   if (input.path === 'api/delete') {
     assert.deepEqual(Object.keys(body), ['accountIds'])
@@ -278,5 +286,67 @@ try {
   assert.match(state.error.value,/fixture account directory timeout/)
   failDirectory = false
   check('Account directory timeout cannot hide the saved automatic setting or present an enabled backend as disabled')
+  state.openImport();state.importText.value='fixture@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-rt'
+  await state.submitImport()
+  assert.equal(state.importText.value,'');assert.equal(state.showImport.value,false)
+  assert.equal(calls.filter(c=>c.path==='api/import-line').length,1)
+  state.openImport();state.importText.value='fixture@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-rt'
+  throwAfterImport=true;await state.submitImport()
+  assert.equal(state.importText.value,'');assert.match(state.importError.value,/未自动重新提交/)
+  assert.equal(calls.filter(c=>c.path==='api/import-line').length,2)
+  await state.load();assert.equal(calls.filter(c=>c.path==='api/import-line').length,2)
+  state.importText.value='private-input';state.closeImport();assert.equal(state.importText.value,'')
+  state.openImport();state.importText.value='bad';const importCallCount=calls.length;await state.submitImport();assert.equal(calls.length,importCallCount)
+  state.closeImport()
+  check('Import clears secrets on submit/close, rejects invalid input locally and reconciles a lost response without replay')
+  throwAfterImport=false
+  const mixed='first@example.com----fixture-password----GEZDGNBVGY3TQOJQ\r\n\r\nsecond@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-rt'
+  state.openImport();state.importText.value=mixed
+  assert.equal(state.importLineCount.value,2);await state.submitImport()
+  const submitted=calls.filter(c=>c.path==='api/import-line').at(-1)
+  assert.equal(JSON.parse(submitted.body).line,mixed.replace(/\r\n/g,'\n'))
+  assert.deepEqual(state.recentImports.value.map(j=>j.importInfo.line),[1,3])
+  assert.equal(state.importText.value,'')
+  const importModule=await server.ssrLoadModule('/src/importInput.ts')
+  assert.throws(()=>importModule.validateImportLine(mixed+'\ninvalid-private-input'),/第 4 行/)
+  assert.throws(()=>importModule.validateImportLine(mixed.split('\r\n')[0]+'\n'+mixed.split('\r\n')[0].toUpperCase()),/重复/)
+  assert.throws(()=>importModule.validateImportLine(Array.from({length:101},(_,i)=>`row${i}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`).join('\n')),/100/)
+  check('Multiline UI submits one mixed batch, preserves physical row numbers and displays independent results without retaining secrets')
+
+  const format = await server.ssrLoadModule('/src/format.ts')
+  const savedAccount=account('saved',{status:'normal',planType:'team',groups:[{id:'pro',name:'GPT Pro'}]})
+  const originalImport={...job('saved','review','original-import'),importInfo:{line:1,email:'SAVED@example.com'},implementationVersion:'0.1.40',message:'工作区授权身份校验失败，未更改账号或提交凭据'}
+  const laterReview={...job('saved','review','later-manual'),message:'账号仍有在途请求',implementationVersion:'0.1.42'}
+  const originalSnapshot=clone(originalImport)
+  let view=format.importResult(originalImport,[savedAccount],laterReview)
+  assert.equal(view.saved,true);assert.equal(view.label,'已入库');assert.equal(view.tone,'success')
+  assert.match(view.current,/Team.*正常.*GPT Pro/);assert.match(view.original,/0\.1\.40.*历史授权核验/);assert.match(view.followup,/在途请求/)
+  assert.ok(!view.original.includes('未更改账号或提交凭据'));assert.match(view.note,/后续核验未完成/)
+  assert.deepEqual(originalImport,originalSnapshot)
+  check('A saved normal account is distinguished from its failed historical authorization without rewriting that task or claiming authorization success')
+  for(const current of [{...savedAccount,enabled:false},{...savedAccount,status:'error'}]) {
+    view=format.importResult(originalImport,[current]);assert.equal(view.saved,true);assert.equal(view.label,'已入库');assert.notEqual(view.tone,'success')
+    assert.match(view.current,current.enabled?/异常/:/停用/)
+  }
+  check('Imported but paused or erroneous accounts retain their actual current state without being presented as successful authorization')
+  for(const rows of [[],[{...savedAccount,id:'replacement'}],[{...savedAccount,email:'someone-else@example.com'}]]) {
+    view=format.importResult(originalImport,rows);assert.equal(view.saved,false);assert.match(view.label,/待核对/);assert.notEqual(view.tone,'success')
+  }
+  view=format.importResult({...originalImport,accountId:'',status:'queued',step:'queued'},[])
+  assert.equal(view.saved,false);assert.match(view.label,/处理中/);assert.match(view.current,/尚未读回/)
+  check('Absent accounts, email mismatches and replacement IDs cannot falsely confirm an import; queued rows stay pending')
+  view=format.importResult(originalImport,[savedAccount],job('saved','success','later-success'))
+  assert.match(view.note,/后续授权任务已完成/);assert.deepEqual(originalImport,originalSnapshot)
+  const totalsBefore=[state.success.value,state.failed.value]
+  accounts=[savedAccount];jobs=[originalImport,laterReview];automationEnabled=false
+  const writes=calls.filter(c=>c.method==='POST').length
+  await state.load()
+  assert.equal(state.importView(state.recentImports.value[0]).label,'已入库')
+  assert.equal(state.importsActive.value,false);assert.deepEqual([state.success.value,state.failed.value],totalsBefore)
+  assert.equal(calls.filter(c=>c.method==='POST').length,writes)
+  assert.deepEqual(jobs,[originalSnapshot,laterReview])
+  check('Reopening reconciles the import panel through read-only account and task requests while keeping session batch totals and stored history intact')
+
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }
+

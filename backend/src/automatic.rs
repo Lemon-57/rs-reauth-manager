@@ -95,7 +95,7 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
         .jobs
         .iter()
         .rev()
-        .filter(|j| seen.insert(j.account_id.clone()))
+        .filter(|j| !j.account_id.is_empty() && seen.insert(j.account_id.clone()))
     {
         if matches!(
             job.status.as_str(),
@@ -189,9 +189,11 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
             free_fallback: false,
             automatic: true,
             expected_revision: a["_credentialRevision"].as_u64(),
-            logout_others: true,
+            logout_others: false,
             cleanup_started: false,
             new_account: false,
+            import_info: None,
+            implementation_version: None,
         });
         break;
     }

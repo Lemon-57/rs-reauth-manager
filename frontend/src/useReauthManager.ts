@@ -1,9 +1,38 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './api'
-import { isActive, isUnfinished, needsReauth, planKey, planLabel } from './format'
+import { importResult, isActive, isUnfinished, needsReauth, planKey, planLabel } from './format'
 import type { Account, Job } from './types'
+import { validateImportLine } from './importInput'
 
 export function useReauthManager() {
+  const importLineCount = computed(() => importText.value.split(/\r?\n/).filter(line => line.trim()).length)
+  const showImport = ref(false), importText = ref(''), importError = ref('')
+  function openImport() { importText.value = ''; importError.value = ''; showImport.value = true }
+  function closeImport() { if (!busy.value) { importText.value = ''; importError.value = ''; showImport.value = false } }
+  async function submitImport() {
+    if (busy.value) return
+    let line: string
+    try { line = validateImportLine(importText.value) } catch (e) { importError.value = (e as Error).message; return }
+    const requestId = crypto.randomUUID()
+    busy.value = true; importError.value = ''; error.value = ''; batchId.value = requestId; batchJobs.value = []
+    // No local/session storage, clipboard reads or logging. Clear the editor before sending.
+    importText.value = ''
+    try {
+      receiveJobs((await api.importLine(line, requestId)).jobs)
+      showImport.value = false
+      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      await api.tick()
+    } catch (e) {
+      importError.value = `${(e as Error).message}，未自动重新提交，请先核对账号与任务`
+      error.value = importError.value
+      try { receiveJobs((await api.jobs()).jobs) } catch { /* Read back only; never replay a submitted RT. */ }
+    } finally {
+      line = ''
+      try { accounts.value = (await api.accounts()).accounts } catch { error.value ||= '导入后列表读取未确认，请刷新核对' }
+      busy.value = false
+    }
+  }
+  watch(showImport, open => { if (!open) { importText.value = ''; importError.value = '' } })
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
   const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
@@ -34,7 +63,17 @@ export function useReauthManager() {
   }
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
   let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
+  const recentImports = computed(() => {
+    const imports = jobs.value.filter(job => job.importInfo)
+    const last = imports.at(-1)
+    if (!last) return []
+    const prefix = last.requestId.split(':')[0] + ':'
+    return imports.filter(job => job.requestId.startsWith(prefix))
+  })
   const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
+  const importViews = computed(() => new Map(recentImports.value.map(job => [job.requestId, importResult(job, accounts.value, latestByAccount.value.get(job.accountId))])))
+  const importView = (job: Job) => importViews.value.get(job.requestId) || importResult(job, accounts.value, latestByAccount.value.get(job.accountId))
+  const importsActive = computed(() => recentImports.value.some(isActive))
   const batchByAccount = computed(() => new Map(batchJobs.value.map(j => [j.accountId, j])))
   const jobOf = (a: Account) => {
     const job = latestByAccount.value.get(a.id)
@@ -77,7 +116,7 @@ export function useReauthManager() {
   const success = computed(() => batchJobs.value.filter(j => j.status === 'success').length)
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
   const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
-  const planOptions = computed(() => [{ value: 'all', label: '全部会员' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
+  const planOptions = computed(() => [{ value: 'all', label: '全部订阅' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
   const filtered = computed(() => accounts.value.filter(a => {
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
@@ -183,6 +222,6 @@ export function useReauthManager() {
     finally { polling = false; if (!destroyed) timer = setTimeout(poll, active.value ? 3000 : 15000) }
   }
   onMounted(async () => { await load(); await poll() })
-  onUnmounted(() => { destroyed = true; clearTimeout(timer) })
-  return { automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
+  return { importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

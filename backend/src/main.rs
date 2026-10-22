@@ -4,10 +4,12 @@ mod automatic;
 mod control;
 mod deletion;
 mod diagnostics;
+mod grouping;
 mod host;
 mod native;
+mod onboarding;
 mod recovery;
-mod sessions;
+mod verification;
 mod worker;
 
 use gateway_plugin_sdk::{
@@ -26,7 +28,18 @@ use tokio::sync::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ImportInfo {
+    line: usize,
+    email: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_info: Option<ImportInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    implementation_version: Option<String>,
     request_id: String,
     account_id: String,
     status: String,
@@ -73,6 +86,8 @@ pub struct Queue {
     automation: automatic::Automation,
 }
 struct Manager {
+    imports: std::collections::VecDeque<onboarding::Pending>,
+    protected_management_url: String,
     runtime: worker::Runtime,
     worker: Option<worker::Worker>,
     recovered: bool,
@@ -148,6 +163,7 @@ fn registration() -> ManagementRegistration {
             ("GET", "api/jobs"),
             ("POST", "api/submit"),
             ("POST", "api/import"),
+            ("POST", "api/import-line"),
             ("POST", "api/automation"),
             ("POST", "api/cancel"),
             ("POST", "api/delete"),
@@ -389,7 +405,7 @@ impl Manager {
         for job in &mut queue.jobs {
             if job.active() {
                 let message = if job.cleanup_started {
-                    "设备退出流程被中断，账号可能已暂停；请核对设备、RT 与启停状态，不会自动重试"
+                    "历史任务被中断，账号可能已暂停；请核对已保存 RT 与启停状态，不会自动重试"
                 } else {
                     "插件进程已重启，原生授权或启停状态可能尚未确认，请先核对账号与提交回执后手动处理"
                 };
@@ -435,65 +451,7 @@ impl Manager {
             };
             let job = &mut queue.jobs[position];
             if let Some(output) = output {
-                if current.snapshot["phase"] == "cleanup" {
-                    let launched =
-                        match sessions::refresh(host, &job.account_id, &current.snapshot, &output)
-                            .await
-                        {
-                            Ok((input, snapshot)) => {
-                                self.runtime
-                                    .start(
-                                        input,
-                                        current.flow.clone(),
-                                        snapshot,
-                                        current.request_id.clone(),
-                                    )
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        };
-                    match launched {
-                        Ok(mut worker) => {
-                            worker.started = current.started;
-                            self.worker = Some(worker);
-                            job.step = "verify_refresh".into();
-                            host::save(host, &queue, version).await?;
-                            return Ok(());
-                        }
-                        Err(error) => job.finish(
-                            "review",
-                            &format!(
-                                "{}；请核对设备、原生 RT 与账号启停，不会自动重放",
-                                error.message
-                            ),
-                        ),
-                    }
-                } else if current.snapshot["phase"] == "verify" {
-                    match sessions::finish(host, &job.account_id, &current.snapshot, &output).await
-                    {
-                        Ok(()) => {
-                            let message = format!(
-                                "{}；已登出其他设备，本次 RT 刷新及写回已确认",
-                                current.snapshot["successMessage"]
-                                    .as_str()
-                                    .unwrap_or("新授权已写回")
-                            );
-                            job.finish("success", &message);
-                            if current.snapshot["successStep"] == "free" {
-                                job.step = "free".into();
-                            }
-                        }
-                        Err(error) => {
-                            let diagnostic = diagnostics::message(&output, &error.message);
-                            job.finish(
-                                "review",
-                                &format!(
-                                    "{diagnostic}；请核对账号启停、设备退出与 RT 状态，不会自动重试"
-                                ),
-                            );
-                        }
-                    }
-                } else if matches!(
+                if matches!(
                     output["event"].as_str(),
                     Some(
                         "complete"
@@ -501,22 +459,32 @@ impl Manager {
                             | "forced_workspace"
                             | "forced_free"
                             | "team_upgrade"
+                            | "workspace_recovered"
                     )
                 ) {
                     job.step = "saving".into();
                     current.snapshot["flowId"] = json!(current.flow);
-                    match native::complete(host,job,&mut current.snapshot,&output).await {
-                        Ok((message,free))=>{
+                    match native::complete(host, job, &mut current.snapshot, &output).await {
+                        Ok((message, free)) => {
                             if job.new_account {
                                 job.account_id = current.snapshot["createdAccountId"]
                                     .as_str()
                                     .ok_or_else(|| fault("新增账号 ID 未确认"))?
                                     .to_owned();
                             }
-                            job.finish("success",&message);
-                            if free {job.step="free".into();}
-                        },
-                        Err(error)=>job.finish("review",&format!("原生授权未确认：{}；请核对账号启停及提交回执，不会自动改走插件换取 RT",error.message)),
+                            job.finish("success", &message);
+                            if free {
+                                job.step = "free".into();
+                            }
+                        }
+                        Err(error) => {
+                            if job.new_account
+                                && let Some(id) = current.snapshot["createdAccountId"].as_str()
+                            {
+                                job.account_id = id.to_owned();
+                            }
+                            job.finish("review",&format!("原生授权或 Team 归组未确认：{}；请核对账号启停及提交回执，不会自动改走插件换取 RT",error.message));
+                        }
                     }
                 } else {
                     let message = diagnostics::message(
@@ -529,52 +497,29 @@ impl Manager {
                         job.workspace_choices = workspace_choices(&output);
                     }
                 }
-                if job.status == "success"
-                    && job.logout_others
-                    && current.snapshot["phase"].is_null()
-                {
+                if job.status == "success" {
                     let id = job.account_id.clone();
                     let success_message = job.message.clone();
                     let success_step = job.step.clone();
                     job.status = "running".into();
-                    job.step = "other_sessions".into();
+                    job.step = "verify_refresh".into();
                     job.finished_at = None;
-                    job.cleanup_started = true;
-                    // 暂停或撤销前先持久化操作意图
                     host::save(host, &queue, version).await?;
-                    let prepared = sessions::prepare(
-                        host,
-                        &id,
-                        &output["deviceId"],
-                        &current.snapshot,
-                        &output,
-                    )
-                    .await;
-                    let launched = match prepared {
-                        Ok((input, mut snapshot)) => {
-                            snapshot["successMessage"] = json!(success_message);
-                            snapshot["successStep"] = json!(success_step);
-                            self.runtime
-                                .start(
-                                    input,
-                                    current.flow.clone(),
-                                    snapshot,
-                                    current.request_id.clone(),
-                                )
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let verified = verification::finish(host, &id, &current.snapshot).await;
                     let (mut latest, version) = host::load(host).await?;
-                    match launched {
-                        Ok(mut worker) => {
-                            worker.started = current.started;
-                            self.worker = Some(worker);
+                    match verified {
+                        Ok(()) => {
+                            let message =
+                                format!("{success_message}；本次原生 RT 刷新及保存已确认");
+                            latest.jobs[position].finish("success", &message);
+                            if success_step == "free" {
+                                latest.jobs[position].step = "free".into();
+                            }
                         }
                         Err(error) => latest.jobs[position].finish(
                             "review",
                             &format!(
-                                "新授权已写回，设备退出未完成：{}；请核对账号启停状态",
+                                "{}；请核对已保存 RT 与账号启停，不会自动重放",
                                 error.message
                             ),
                         ),
@@ -584,7 +529,7 @@ impl Manager {
                 }
             } else if now().saturating_sub(current.started) > 420000 {
                 let message = if job.cleanup_started {
-                    "设备退出或 RT 验证超时，账号保持暂停，请人工核对，不会自动重试"
+                    "授权或 RT 验证超时，账号保持暂停，请人工核对，不会自动重试"
                 } else {
                     "协议登录超时，未自动重试"
                 };
@@ -612,7 +557,7 @@ impl Manager {
                 };
                 if exhausted {
                     let message = if job.cleanup_started {
-                        "设备退出进程异常结束，账号保持暂停，请核对设备与 RT 状态"
+                        "授权进程异常结束，账号保持暂停，请核对已保存 RT 状态"
                     } else {
                         "协议进程已退出，未取得有效回调"
                     };
@@ -639,6 +584,9 @@ impl Manager {
             host::save(host, &queue, version).await?;
             return Ok(());
         }
+        if onboarding::advance(self, host).await? {
+            return Ok(());
+        }
         if queue.automation.enabled && !queue.jobs.iter().any(Job::active) {
             let result = automatic::scan(host, &mut queue).await;
             host::save(host, &queue, version).await?;
@@ -651,21 +599,25 @@ impl Manager {
             job.status = "running".into();
             job.step = "preparing".into();
             job.started_at = Some(now());
+            job.implementation_version = Some(env!("CARGO_PKG_VERSION").into());
             // 凭据发送前先持久化意图，中断任务不自动恢复
             host::save(host, &queue, version).await?;
             let result=async {
                 self.runtime.prepare().await?;
                 let job=&queue.jobs[position];let a=detail(host,&job.account_id).await?;
                 require_idle(&a)?;
+                if job.expected_revision.is_some_and(|revision| a["_credentialRevision"].as_u64() != Some(revision)) { return Err(fault("导入后凭据版本已变化，未重新登录")); }
                 if job.automatic && (!control::enabled(host, queue.automation.enabled).await? || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {
                     return Err(fault("自动授权条件或账号版本已变化，未发起登录，不会自动重试"))
                 }
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
                 let proxy=proxy(host,&a).await?;
+                let recover_workspace = recovery::missing_workspace(&settings(&a)) && job.force_workspace_id.is_none() && !job.free_fallback;
+                if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_binding(&recovery::tokens(&old), &settings(&a))?; }
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
-                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback,"automatic":job.automatic});
-                self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"]}),job.request_id.clone()).await
+                let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback,"automatic":job.automatic,"recoverWorkspace":recover_workspace});
+                self.runtime.start(input,flow,json!({"settings":settings(&a),"credentialRevision":a["_credentialRevision"],"recoverWorkspace":recover_workspace}),job.request_id.clone()).await
             }.await;
             match result {
                 Ok(worker) => self.worker = Some(worker),
@@ -684,7 +636,14 @@ async fn handle(
     call: TypedCall<ManagementRequest>,
 ) -> Result<Value, PluginFault> {
     manager.recover(&call.host).await?;
-    if !call.request.query.is_empty() || call.payload.len() > 16384 {
+    if !call.request.query.is_empty()
+        || call.payload.len()
+            > if call.request.path == "api/import-line" {
+                524288
+            } else {
+                16384
+            }
+    {
         return Err(fault("插件请求参数无效"));
     }
     if call.request.method == "GET" {
@@ -714,6 +673,9 @@ async fn handle(
         }
         manager.tick(&call.host).await?;
         return Ok(json!({"ok":true}));
+    }
+    if call.request.path == "api/import-line" {
+        return onboarding::submit(manager, &call).await;
     }
     if call.request.path == "api/import" {
         let request: ImportSubmit =
@@ -810,9 +772,11 @@ async fn handle(
             free_fallback: false,
             automatic: false,
             expected_revision: None,
-            logout_others: true,
+            logout_others: false,
             cleanup_started: false,
             new_account: true,
+            import_info: None,
+            implementation_version: Some(env!("CARGO_PKG_VERSION").into()),
         };
         queue.jobs.push(job);
         host::save(&call.host, &queue, version).await?;
@@ -950,9 +914,11 @@ async fn handle(
                     free_fallback: false,
                     automatic: false,
                     expected_revision: None,
-                    logout_others: true,
+                    logout_others: false,
                     cleanup_started: false,
                     new_account: false,
+                    import_info: None,
+                    implementation_version: None,
                 });
             }
         }
@@ -1019,9 +985,11 @@ async fn handle(
                 free_fallback: false,
                 automatic: false,
                 expected_revision: None,
-                logout_others: true,
+                logout_others: false,
                 cleanup_started: false,
                 new_account: false,
+                import_info: None,
+                implementation_version: None,
             });
         }
         "api/free-fallback" => {
@@ -1073,9 +1041,11 @@ async fn handle(
                 free_fallback: true,
                 automatic: false,
                 expected_revision: None,
-                logout_others: true,
+                logout_others: false,
                 cleanup_started: false,
                 new_account: false,
+                import_info: None,
+                implementation_version: None,
             });
         }
         "api/cancel" => {
@@ -1093,7 +1063,7 @@ async fn handle(
                         .is_none_or(|id| id == &job.request_id)
                 {
                     let message = if job.cleanup_started {
-                        "设备退出已取消，账号可能已暂停，部分设备可能已退出；请人工核对，不会自动重放"
+                        "历史任务已取消，账号可能已暂停；请人工核对已保存授权，不会自动重放"
                     } else {
                         "已取消，不会重新提交授权回调"
                     };
@@ -1110,6 +1080,7 @@ async fn handle(
         }
         _ => return Err(fault("路由不存在")),
     }
+    onboarding::prune(manager, &queue);
     host::save(&call.host, &queue, version).await?;
     Ok(json!({"jobs":queue.jobs}))
 }
@@ -1128,6 +1099,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(SessionError::Handshake.into());
     }
     let manager = Arc::new(Mutex::new(Manager {
+        imports: std::collections::VecDeque::new(),
+        protected_management_url: session.handshake().configuration["protectedManagementUrl"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned(),
         runtime: worker::Runtime::new(),
         worker: None,
         recovered: false,

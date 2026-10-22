@@ -65,9 +65,17 @@ class ProtocolTests(unittest.TestCase):
             results.append(self.messages[-1])
         self.assertEqual(results[0],results[1])
 
+    def test_removed_device_actions_are_rejected_before_any_login(self):
+        import io
+        for action in ['cleanup_sessions','verify_sessions']:
+            events=[]
+            with patch.object(sys,'stdin',io.StringIO(json.dumps({'action':action}))), patch.object(runner,'run',side_effect=AssertionError('Login forbidden')), patch.object(runner,'emit',side_effect=lambda event,**fields:events.append({'event':event,**fields})):
+                runner.main()
+            self.assertEqual(events[-1]['event'],'error')
+
     def test_protocol_adapters_cannot_generate_pkce_or_call_token_endpoint(self):
         import ast
-        for name in ['runner.py','fallback.py','sessions.py']:
+        for name in ['runner.py','fallback.py']:
             source=(ROOT/'protocol'/name).read_text(encoding='utf-8')
             tree=ast.parse(source)
             calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]
@@ -77,7 +85,7 @@ class ProtocolTests(unittest.TestCase):
 
     def setUp(self):
         self.messages = []
-        self.data = {"notes": f"{EMAIL}----fixture-password----{SECRET}", "email": EMAIL, "proxy": "http://fixture:pass@127.0.0.1:21001", "authorizationUrl": URL, "accountId": "original-workspace"}
+        self.data = {"notes": f"{EMAIL}----fixture-password----{SECRET}", "email": EMAIL, "proxy": "http://fixture:pass@127.0.0.1:21001", "authorizationUrl": URL, "accountId": "original-workspace", "userId":"original-user", "planType":"team"}
         self.chat = types.ModuleType("vendor.lib.chatgpt_client")
         self.chat.ChatGPTClient = Chat
         self.oauth = types.ModuleType("vendor.lib.oauth_client")
@@ -97,6 +105,64 @@ class ProtocolTests(unittest.TestCase):
 
     def test_password_keeps_whitespace(self):
         self.assertEqual(runner.parse_notes(f"{EMAIL}---- space password ----{SECRET}", EMAIL)[1], " space password ")
+
+    def test_import_prefers_unique_team_and_accepts_explicit_free_without_exchanging_tokens(self):
+        self.data.update(newAccount=True, allowFreeNew=True, accountId='', userId='', planType='team')
+        def authorize(client, *args, **kwargs):
+            selected = client._extract_workspace_id_from_session()
+            self.assertTrue(selected)
+            client.bound_workspace = True
+            return {'ok': True, 'state': 'fixture', 'code': 'fixture-code'}
+        for entries, expected in [
+            ([{'id': 'personal', 'type': 'personal', 'plan_type': 'free'}], 'personal'),
+            ([{'id': 'personal', 'type': 'personal', 'plan_type': 'free'}, {'id': 'team', 'type': 'team'}], 'team'),
+        ]:
+            self.messages = []
+            OAuth.cookie = {'workspaces': entries}
+            with patch.object(OAuth, 'authorize_external_oauth_url', authorize):
+                self.run_login()
+            self.assertEqual(self.messages[-1]['event'], 'complete')
+            self.assertEqual(self.messages[-1]['workspaceId'], expected)
+            self.assertNotIn('tokens', self.messages[-1])
+
+    def test_new_import_never_selects_arbitrarily_between_teams(self):
+        self.data.update(newAccount=True, allowFreeNew=True, accountId='', userId='', planType='team')
+        OAuth.cookie = {'workspaces': [{'id': 'team1', 'type': 'team'}, {'id': 'team2', 'type': 'team'}]}
+        def authorize(client, *args, **kwargs):
+            client._extract_workspace_id_from_session()
+        with patch.object(OAuth, 'authorize_external_oauth_url', authorize):
+            self.run_login()
+        self.assertEqual(self.messages[-1]['event'], 'error')
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+
+    def test_existing_unbound_user_uses_same_unique_selection_and_native_callback(self):
+        self.data.update(recoverWorkspace=True, accountId=None, planType='free')
+        def authorize(client, *args, **kwargs):
+            selected = client._extract_workspace_id_from_session()
+            self.assertTrue(selected)
+            client.bound_workspace = True
+            return {'ok': True, 'state': 'fixture', 'code': 'fixture-code'}
+        for entries, expected in [
+            ([{'id': 'personal', 'type': 'personal', 'plan_type': 'free'}], 'personal'),
+            ([{'id': 'personal', 'type': 'personal'}, {'id': 'team', 'kind': 'organization'}], 'team'),
+        ]:
+            self.messages = []
+            OAuth.cookie = {'workspaces': entries}
+            with patch.object(OAuth, 'authorize_external_oauth_url', authorize):
+                self.run_login()
+            self.assertEqual(self.messages[-1]['event'], 'workspace_recovered')
+            self.assertEqual(self.messages[-1]['workspaceId'], expected)
+            self.assertNotIn('tokens', self.messages[-1])
+
+    def test_unbound_recovery_rejects_ambiguous_teams_and_bound_override(self):
+        self.data.update(recoverWorkspace=True, accountId=None, planType='free')
+        OAuth.cookie = {'workspaces': [{'id': 'one', 'type': 'team'}, {'id': 'two', 'type': 'team'}]}
+        with patch.object(OAuth, 'authorize_external_oauth_url', lambda client,*a,**k: client._extract_workspace_id_from_session()):
+            self.run_login()
+        self.assertEqual(self.messages[-1]['code'], 'workspace')
+        self.data['accountId']='original-workspace'
+        with self.assertRaises(ValueError):
+            self.run_login()
 
     def test_mfa_invalid_rejected(self):
         with self.assertRaises(ValueError):

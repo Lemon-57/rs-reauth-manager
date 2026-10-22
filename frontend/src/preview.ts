@@ -8,6 +8,9 @@ export function installPreview() {
   let jobs: Job[] = [{ requestId: 'preview-workspace:acct_preview_0', accountId: 'acct_preview_0', status: 'failed', step: 'workspace', message: '无法匹配原账号工作区，已停止写回', startedAt: Date.now() - 10000, finishedAt: Date.now(), workspaceChoices: [{ id: 'preview-other-team' }, { id: 'preview-personal-free' }] }]
   const diagnostics = ['提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误（HTTP 409） [上游错误码 invalid_state]\n首次登录失败：提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效（HTTP 409）\n已重建一次登录会话，本次仍失败，不再自动重登\n错误码：fixture_' + 'diagnostic_'.repeat(18) + '完整错误结尾', '提交 2FA 动态码：上游限制登录频率，不自动重试（最后响应 HTTP 429）', '密码验证：请求超时，保留原代理，不自动重试', '2FA 验证未通过，请检查原账号备注']
   jobs.push(...diagnostics.map((message, i): Job => ({ requestId: `preview-diagnostic:${i}`, accountId: `acct_preview_${i + 1}`, status: 'failed', step: 'failed', message, startedAt: Date.now() - 10000, finishedAt: Date.now() })))
+  accounts[1]!.groups = [{ id: 'preview-pro', name: 'GPT Pro' }]
+  jobs.push({ requestId: 'preview-import:import', accountId: 'acct_preview_1', importInfo: { line: 1, email: 'account-2@example.com' }, status: 'review', step: 'review', message: '工作区授权身份校验失败，未更改账号或提交凭据', startedAt: Date.now() - 3600000, finishedAt: Date.now() - 3590000, implementationVersion: '0.1.40' })
+  jobs.push({ requestId: 'preview-later:acct_preview_1', accountId: 'acct_preview_1', status: 'review', step: 'review', message: '账号仍有在途请求，未重复授权', startedAt: Date.now() - 60000, finishedAt: Date.now() - 50000, implementationVersion: '0.1.42' })
   let automationEnabled = false
   const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer })
   window.codexProxyPlugin = { version: 2, theme, async request(input) {
@@ -15,6 +18,11 @@ export function installPreview() {
     if (input.path === 'api/accounts') return encode({ accounts })
     if (input.path === 'api/jobs') return encode({ jobs, automation: { enabled: automationEnabled } })
     if (input.path === 'api/automation') { automationEnabled = body.enabled === true; return encode({ jobs, automation: { enabled: automationEnabled } }) }
+    if (input.path === 'api/import-line') {
+      const lines = (body.line as string).split(/\r?\n/).map((line, index) => ({ line, number: index + 1 })).filter(item => item.line.trim())
+      jobs.push(...lines.map((item, i): Job => ({ requestId: `${body.requestId}:import:${item.number}`, accountId: '', status: 'queued', step: 'queued', message: '示例待处理，不访问真实账号', startedAt: null, finishedAt: null, importInfo: { line: item.number, email: item.line.split('----')[0] || `preview-${i}@example.com` } })))
+      return encode({ jobs })
+    }
     if (input.path === 'api/delete') {
       const ids = body.accountIds as string[]
       accounts = accounts.filter(a => !ids.includes(a.id)); jobs = jobs.filter(j => !ids.includes(j.accountId))

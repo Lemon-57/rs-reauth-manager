@@ -19,3 +19,14 @@ body { margin: 0; min-width: 0; min-height: inherit; font-size: var(--cp-font-si
 @media(max-width: 700px) { .identity { align-items: flex-start; } .email { display: block; white-space: normal; } .mobile-details { display: grid; gap: 5px; margin-top: 6px; color: var(--cp-color-text-secondary); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; white-space: normal; } .identity-text { max-width: 220px; } }
 @media(max-width: 900px) { .commands { margin-left: 0; } } @media(max-width: 600px) { .counters { width: 100%; justify-content: space-between; gap: 8px; } .search { width: 100%; flex-basis: 100%; } .filter { flex: 1 1 130px; } .commands { width: 100%; justify-content: flex-end; gap: 6px; } .selection { flex-wrap: wrap; gap: 8px; } }
 @media(prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+.import-label { display: block; margin-bottom: 8px; } .import-input { width: 100%; box-sizing: border-box; resize: vertical; min-height: 100px; padding: 10px; border: 1px solid var(--cp-color-border); border-radius: var(--cp-border-radius-sm); background: var(--cp-color-bg-container); color: var(--cp-color-text); font: inherit; overflow-wrap: anywhere; } .import-input:focus { outline: 2px solid var(--cp-color-primary); outline-offset: 2px; } .import-formats { font-family: ui-monospace, monospace; font-size: 12px; }
+
+/* 宿主 iframe 随表格增高，导入弹窗仍只占宿主通知的可视高度 */
+[role="presentation"]:has(#account-import) { height: var(--cp-plugin-viewport-height, 100dvh); bottom: auto; }
+[role="presentation"]:has(#account-import) > [role="dialog"] { max-height: calc(var(--cp-plugin-viewport-height, 100dvh) - 24px); }
+@media(min-width: 640px) { [role="presentation"]:has(#account-import) > [role="dialog"] { max-height: calc(var(--cp-plugin-viewport-height, 100dvh) - 48px); } }
+
+.import-results { margin: 8px 0 16px; padding: 12px; border: 1px solid var(--cp-color-border); border-radius: var(--cp-border-radius-sm); } .import-results > p { margin: 0 0 8px; } .import-results ol { margin: 0; padding: 0; list-style: none; max-height: 280px; overflow: auto; } .import-results li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--cp-color-border-secondary); overflow-wrap: anywhere; } .import-results small { grid-column: 1 / -1; white-space: pre-wrap; }
+
+.import-history { grid-column: 1 / -1; font-size: 12px; } .import-history summary { cursor: pointer; } .import-history p { margin: 6px 0; white-space: pre-wrap; }

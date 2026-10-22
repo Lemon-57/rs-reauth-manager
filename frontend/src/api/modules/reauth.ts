@@ -2,6 +2,7 @@ import { request } from '../request'
 import { parseAccounts, parseDeletion, parseJobs, parseTick } from '../schemas/reauth'
 
 export const api = {
+  importLine: (line: string, requestId: string, groupIds: string[] = []) => request('POST', 'api/import-line', { line, requestId, groupIds }).then(parseJobs),
   accounts: () => request('GET', 'api/accounts').then(parseAccounts),
   jobs: () => request('GET', 'api/jobs').then(parseJobs),
   deleteAccounts: (accountIds: string[]) => request('POST', 'api/delete', { accountIds }).then(parseDeletion),
