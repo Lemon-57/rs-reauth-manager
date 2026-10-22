@@ -245,6 +245,7 @@ pub async fn complete(
             credential_revision: saved.credential_revision,
             facts: saved.facts.clone(),
         };
+        crate::executor::check(host).await?;
         let reply = host
             .call(
                 "host.auth.save",

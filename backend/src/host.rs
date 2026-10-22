@@ -50,6 +50,7 @@ pub async fn save(
     queue: &crate::Queue,
     version: Option<u64>,
 ) -> Result<(), PluginFault> {
+    crate::executor::check(host).await?;
     let reply = host.call("host.state.put", json!({"namespace":"reauth-manager","key":"queue","value":queue,"expected_version":version}), vec![]).await.map_err(|e| e.into_plugin_fault())?;
     let _: StatePutResult =
         serde_json::from_value(reply.result).map_err(|_| fault("任务保存失败"))?;
@@ -61,6 +62,9 @@ pub async fn admin(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, PluginFault> {
+    if method != "GET" {
+        crate::executor::check(host).await?;
+    }
     let (headers, body) = match body {
         Some(data) => (
             vec![MiddlewareHeader {

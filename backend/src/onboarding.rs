@@ -103,6 +103,7 @@ pub async fn request(
     body: Value,
 ) -> Result<Value, PluginFault> {
     // 仅允许固定管理路径，导入内容不能指定任意 URL
+    crate::executor::check(host).await?;
     if !matches!(
         path,
         "/_management/onboarding/start"

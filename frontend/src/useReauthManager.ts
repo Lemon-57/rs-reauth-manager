@@ -34,6 +34,8 @@ export function useReauthManager() {
   }
   watch(showImport, open => { if (!open) { importText.value = ''; importError.value = '' } })
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
+  const lastUpdated = ref<number | null>(null), readWarning = ref(''), tickWarning = ref('')
+  const refreshWarning = computed(() => readWarning.value || tickWarning.value)
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
   const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
   let automationChange = 0
@@ -62,7 +64,7 @@ export function useReauthManager() {
     }
   }
   const batchId = ref<string | null>(null), batchJobs = ref<Job[]>([])
-  let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false
+  let timer: ReturnType<typeof setTimeout> | undefined, destroyed = false, polling = false, ticking = false
   const recentImports = computed(() => {
     const imports = jobs.value.filter(job => job.importInfo)
     const last = imports.at(-1)
@@ -137,6 +139,7 @@ export function useReauthManager() {
   function receiveJobs(next: Job[]) {
     const changed = next.some(j => !isActive(j) && jobs.value.some(old => old.requestId === j.requestId && isActive(old)))
     jobs.value = next
+    lastUpdated.value = Date.now()
     if (batchId.value) {
       // Keep this page's outcomes even if another submission trims server history.
       const records = new Map(batchJobs.value.map(j => [j.requestId, j]))
@@ -211,17 +214,23 @@ export function useReauthManager() {
     if (destroyed || polling) return
     polling = true
     try {
-      if (!busy.value && !automationBusy.value && (active.value || automationEnabled.value)) {
+      if (!busy.value && !automationBusy.value) {
         const settingChange = automationChange
-        if (active.value) await api.tick()
+        // Progress is a separate request: a conflict or a slow tick must never block reads.
+        if (active.value && !ticking) {
+          ticking = true
+          void api.tick().catch(e => { if (!destroyed) tickWarning.value = (e as Error).message }).finally(() => { ticking = false })
+        }
         const state = await api.jobs()
         if (state.automation && !automationBusy.value && settingChange === automationChange) automationEnabled.value = state.automation.enabled
-        if (receiveJobs(state.jobs)) accounts.value = (await api.accounts()).accounts
+        receiveJobs(state.jobs)
+        accounts.value = (await api.accounts()).accounts
+        readWarning.value = ''; tickWarning.value = ''
       }
-    } catch (e) { error.value = (e as Error).message }
+    } catch (e) { readWarning.value = `状态读取失败，正在重试：${(e as Error).message}` }
     finally { polling = false; if (!destroyed) timer = setTimeout(poll, active.value ? 3000 : 15000) }
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
-  return { importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

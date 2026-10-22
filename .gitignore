@@ -28,4 +28,6 @@ verification/*
 !verification/bridge-test.mjs
 !verification/checkbox-test.mjs
 !verification/batch-test.mjs
+!verification/executor-test.py
+!verification/polling-test.mjs
 !verification/conventions.mjs

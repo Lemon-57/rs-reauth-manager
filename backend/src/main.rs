@@ -4,6 +4,7 @@ mod automatic;
 mod control;
 mod deletion;
 mod diagnostics;
+mod executor;
 mod grouping;
 mod host;
 mod native;
@@ -161,6 +162,8 @@ fn registration() -> ManagementRegistration {
         routes: [
             ("GET", "api/accounts"),
             ("GET", "api/jobs"),
+            ("GET", "api/executor"),
+            ("POST", "api/standby"),
             ("POST", "api/submit"),
             ("POST", "api/import"),
             ("POST", "api/import-line"),
@@ -635,7 +638,6 @@ async fn handle(
     manager: &mut Manager,
     call: TypedCall<ManagementRequest>,
 ) -> Result<Value, PluginFault> {
-    manager.recover(&call.host).await?;
     if !call.request.query.is_empty()
         || call.payload.len()
             > if call.request.path == "api/import-line" {
@@ -660,6 +662,7 @@ async fn handle(
     if call.request.method != "POST" {
         return Err(fault("请求方法不支持"));
     }
+    manager.recover(&call.host).await?;
     if call.request.path == "api/runtime-check" {
         if call.payload != b"{}" {
             return Err(fault("请求格式无效"));
@@ -1111,18 +1114,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let background = Arc::clone(&manager);
     let shutdown = Arc::clone(&manager);
     let controls = Arc::new(Mutex::new(()));
+    let executor = executor::Executor::new();
+    let background_executor = Arc::clone(&executor);
     let plugin = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .management(registration(), move |call| {
             let manager = Arc::clone(&manager);
             let controls = Arc::clone(&controls);
+            let executor = Arc::clone(&executor);
             async move {
-                let result =
-                    if call.request.path == "api/automation" || call.request.path == "api/jobs" {
-                        let _control = controls.lock().await;
-                        control::handle(call).await
+                let result = if call.request.path == "api/accounts"
+                    && call.request.method == "GET"
+                    && call.payload.is_empty()
+                    && call.request.query.is_empty()
+                {
+                    rows(&call.host).await
+                } else if call.request.path == "api/executor"
+                    && call.request.method == "GET"
+                    && call.payload.is_empty()
+                    && call.request.query.is_empty()
+                {
+                    executor.status(&call.host).await
+                } else if call.request.path == "api/automation" || call.request.path == "api/jobs" {
+                    let _control = controls.lock().await;
+                    control::handle(call).await
+                } else {
+                    let mut manager = manager.lock().await;
+                    if call.request.method == "GET" {
+                        handle(&mut manager, call).await
+                    } else if call.request.path == "api/standby"
+                        && call.payload == b"{}"
+                        && call.request.query.is_empty()
+                    {
+                        if manager.worker.is_some() || !manager.imports.is_empty() {
+                            Err(fault("本宿主仍有授权工作，不能交接执行权"))
+                        } else {
+                            executor.standby(&call.host).await
+                        }
                     } else {
-                        handle(&mut *manager.lock().await, call).await
-                    };
+                        let host = call.host.clone();
+                        let tick = call.request.path == "api/tick";
+                        let result = executor.run(&host, handle(&mut manager, call)).await;
+                        match result {
+                            Ok(Some(value)) => Ok(value),
+                            other => {
+                                // 无效管理参数不能终止本宿主已有的授权工作
+                                if matches!(&other, Ok(None))
+                                    || matches!(&other, Err(error) if tick || error.code == gateway_plugin_sdk::ErrorCode::Conflict)
+                                {
+                                    manager.worker.take();
+                                    manager.imports.clear();
+                                    manager.recovered = false;
+                                }
+                                match other {
+                                    Ok(None) if tick => Ok(json!({"ok":true,"standby":true})),
+                                    Ok(None) => Err(fault(
+                                        "授权由另一宿主处理，请从当前正式入口操作；状态仍可读取",
+                                    )),
+                                    Err(error) => Err(error),
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                    }
+                };
                 let (status, value) = match result {
                     Ok(value) => (200, value),
                     Err(error) => (400, json!({"error":{"message":error.message}})),
@@ -1137,9 +1191,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .on(methods::RECONCILE, move |call| {
             let manager = Arc::clone(&background);
+            let executor = Arc::clone(&background_executor);
             async move {
                 if let Ok(mut manager) = manager.try_lock() {
-                    manager.tick(&call.host).await?;
+                    let result = executor.run(&call.host, manager.tick(&call.host)).await;
+                    if !matches!(result, Ok(Some(()))) {
+                        manager.worker.take();
+                        manager.imports.clear();
+                        manager.recovered = false;
+                    }
+                    result?;
                 }
                 Ok(TypedReply::new(Empty {}))
             }

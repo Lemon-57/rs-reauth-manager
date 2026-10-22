@@ -30,3 +30,7 @@ body { margin: 0; min-width: 0; min-height: inherit; font-size: var(--cp-font-si
 .import-results { margin: 8px 0 16px; padding: 12px; border: 1px solid var(--cp-color-border); border-radius: var(--cp-border-radius-sm); } .import-results > p { margin: 0 0 8px; } .import-results ol { margin: 0; padding: 0; list-style: none; max-height: 280px; overflow: auto; } .import-results li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--cp-color-border-secondary); overflow-wrap: anywhere; } .import-results small { grid-column: 1 / -1; white-space: pre-wrap; }
 
 .import-history { grid-column: 1 / -1; font-size: 12px; } .import-history summary { cursor: pointer; } .import-history p { margin: 6px 0; white-space: pre-wrap; }
+
+.import-results > summary { cursor: pointer; }
+.import-results[open] > summary { margin-bottom: 8px; }
+.refresh-status { margin: 4px 0 8px; font-size: 12px; }
