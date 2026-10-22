@@ -9,6 +9,7 @@ race_reads = 0
 class Plugin:
     def __init__(self, executable):
         self.p = subprocess.Popen([executable], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.send_lock=threading.Lock();self.queue_delay=0;self.lease_writes=0
         self.id = 99
         self.send({'type':'hello','handshake':{'protocol_version':5,'artifact_sha256':'a'*64,'plugin_id':'personal.reauth-manager','instance_id':'shared-test','generation':1,'incarnation':str(self.p.pid),'configuration':{},'contributes':{'management':{'id':'personal.reauth-manager.management','version':2,'stages':['management']},'maintenance':{'id':'personal.reauth-manager.maintenance','version':1,'stages':['maintenance']}}}})
         assert self.frame()[0]['type'] == 'ready'
@@ -19,7 +20,8 @@ class Plugin:
         else: business=None
         if business is not None:
             raw=json.dumps(business).encode();meta['data_bytes']=len(raw);payload=raw+payload
-        raw=json.dumps(meta).encode();self.p.stdin.write(struct.pack('>IQ',len(raw),len(payload))+raw+payload);self.p.stdin.flush()
+        raw=json.dumps(meta).encode()
+        with self.send_lock:self.p.stdin.write(struct.pack('>IQ',len(raw),len(payload))+raw+payload);self.p.stdin.flush()
     def read(self, size):
         data=b''
         while len(data)<size:
@@ -50,7 +52,12 @@ class Plugin:
                     else:
                         version=(record or {}).get('version',0)+1
                         store[key]={'value':copy.deepcopy(params['value']),'version':version,'schema_version':1};value={'version':version}
+                        if key=='executor':self.lease_writes+=1
                 if wait:barrier.wait(timeout=10)
+                if operation=='host.state.get' and key=='queue' and self.queue_delay:
+                    delay=self.queue_delay;self.queue_delay=0
+                    threading.Timer(delay,lambda response=value,callback=meta['id']:self.send({'type':'result','id':callback,'result':response})).start()
+                    continue
                 if conflict:self.send({'type':'error','id':meta['id'],'error':{'code':'conflict','message':'state version conflicts','send_state':'not_sent'}})
                 else:self.send({'type':'result','id':meta['id'],'result':value})
             else:
@@ -85,6 +92,9 @@ def main(executable):
         assert owner.call('api/jobs','GET',b'')[1]['jobs'][0]['status']=='running'
         with lock:store.pop('queue')
         print('PASS an invalid administrative request cannot reset or interrupt existing work')
+        owner.queue_delay=12;writes=owner.lease_writes
+        assert owner.call('api/tick')[0]==200 and owner.lease_writes-writes>=2
+        print('PASS a blocked task renews ownership before completing instead of expiring mid-operation')
         assert owner.call('api/standby')[1]['standby'] is True
         assert passive.call('api/tick')[0]==200
         assert passive.call('api/executor','GET',b'')[1]['localOwner'] is True
@@ -105,6 +115,6 @@ def main(executable):
     finally:
         a.close() if a.p.poll() is None else None
         b.close() if b.p.poll() is None else None
-    print(json.dumps({'passed':True,'accountRequests':0,'processes':3,'cases':5}))
+    print(json.dumps({'passed':True,'accountRequests':0,'processes':3,'cases':6}))
 
 if __name__=='__main__':main(sys.argv[1])
