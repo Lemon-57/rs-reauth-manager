@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 
 const binary = process.argv[2] || fileURLToPath(new URL(`../backend/target/debug/reauth-manager${process.platform === 'win32' ? '.exe' : ''}`, import.meta.url))
+const releaseVersion = JSON.parse(readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version
 const python = process.env.RS_REAUTH_TEST_PYTHON || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
 const worker = fileURLToPath(new URL('./fake-worker.py', import.meta.url))
 const innerAuthorization = 'https://auth.openai.com/oauth/authorize?' + new URLSearchParams({ response_type: 'code', client_id: 'fixture', redirect_uri: 'http://127.0.0.1:1455/auth/callback', state: 'fixture', code_challenge: 'a'.repeat(43), code_challenge_method: 'S256' })
@@ -105,6 +107,8 @@ async function callback(meta,payload) {
    dataReply={accountId:a.id}
   }else if(url.pathname==='/api/admin/account-groups/options'){
    let items=groupMode==='missing'?[]:[{id:'gpt-pro',name:'GPT Pro',enabled:groupMode!=='disabled'}]
+   if(groupMode!=='wait_missing')items.push({id:'free-wait',name:'Free Wait',enabled:groupMode!=='wait_disabled'})
+   if(groupMode==='wait_duplicate')items.push({id:'duplicate-wait',name:'Free Wait',enabled:true})
    if(groupMode==='duplicate')items.push({id:'duplicate-pro',name:'GPT Pro',enabled:true})
    dataReply={items,page:{total:items.length}}
   }else if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
@@ -115,11 +119,11 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/api/admin/accounts/oauth/start') {
    assert.deepEqual(Object.keys(data).sort(),['accountId','name','provider']);starts.push(structuredClone(data));dataReply={flowId:`flow_${data.accountId}`,authorizationUrl:nativeAuthorization};status=201
   } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.groupIds) {
-   assert.deepEqual(Object.keys(data).sort(),['accountIds','groupIds']);assert.equal(data.accountIds.length,1);assert.deepEqual(data.groupIds,['gpt-pro'])
+   assert.deepEqual(Object.keys(data).sort(),['accountIds','groupIds']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
-   a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];groupMoves.push(a.id);dataReply={}
-   if(a.id==='group_lost'){status=503;code=50301}
-   if(a.id==='group_revision_race')revisions.set(a.id,revisions.get(a.id)+1)
+   a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':id==='free-wait'?'Free Wait':'Custom',enabled:true}));groupMoves.push(a.id);dataReply={}
+   if(a.id==='group_lost'||a.id==='fb_wait_lost'){status=503;code=50301}
+   if(a.id==='group_revision_race'||a.id==='fb_wait_revision_race')revisions.set(a.id,revisions.get(a.id)+1)
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    assert.deepEqual(Object.keys(data).sort(),['accountIds','enabled']);assert.equal(data.accountIds.length,1)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0);controls.push([a.id,data.enabled])
@@ -211,7 +215,7 @@ let passed=0
 const check=name=>{passed++;console.log('PASS '+name)}
 try {
  await start()
- const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,12)
+ const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
  for(const [id,hasRT] of [['new_import_ui',false],['new_import_free_ui',false],['rt_team_ui',true],['rt_business_ui',true],['up_import_ui',true]]) {
   const requestId=randomUUID(),n=starts.length,c=completes.length
@@ -270,7 +274,7 @@ try {
  {
   const requestId=randomUUID(),ids=['rt_restart_first','rt_restart_second'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt').join('\n')
   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
-  await stop();await start();await tick()
+  await stop();records.get('executor').value.expires=0;await start();await tick() // Simulate lease expiry after the previous host exits.
   const batch=records.get('queue').value.jobs.filter(j=>j.requestId.startsWith(requestId+':'))
   assert.ok(batch.every(j=>j.status==='interrupted'));assert.ok(ids.every(id=>!providedImports.includes(id)))
   await request('import-line',{requestId,line,groupIds:[]});await tick();assert.ok(ids.every(id=>!providedImports.includes(id)))
@@ -332,6 +336,38 @@ try {
   check(`${id}: RS native completion and native refresh exclusively issue and save RT, configuration preserved`)
  }
 
+ for(const id of ['fb_wait','fb_wait_custom','fb_wait_existing','fb_wait_outside','fb_wait_lost','fb_wait_revision_race','fb_wait_missing','fb_wait_disabled','fb_wait_duplicate']) {
+  const a=add(id)
+  if(id!=='fb_wait_outside')a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
+  if(id==='fb_wait_custom')a.groups.push({id:'custom',name:'Custom',enabled:true})
+  if(id==='fb_wait_existing')a.groups.push({id:'free-wait',name:'Free Wait',enabled:true})
+  groupMode=id==='fb_wait_missing'?'wait_missing':id==='fb_wait_disabled'?'wait_disabled':id==='fb_wait_duplicate'?'wait_duplicate':'normal'
+  const before=structuredClone(a),moves=groupMoves.length,n=starts.length
+  await submit([id]);const done=await finish(id)
+  const review=['fb_wait_lost','fb_wait_revision_race','fb_wait_missing','fb_wait_disabled','fb_wait_duplicate'].includes(id)
+  assert.equal(done.status,review?'review':'success',done.message);assert.equal(a.enabled,false);assert.equal(a.planType,'free')
+  for(const key of ['notes','name','userId','outboundProxyEndpoint','weight','concurrencyLimit','modelAccess'])assert.deepEqual(a[key],before[key])
+  if(['fb_wait_missing','fb_wait_disabled','fb_wait_duplicate','fb_wait_outside'].includes(id)){
+   assert.equal(groupMoves.length,moves);assert.deepEqual(a.groups,before.groups)
+  }else{
+   assert.equal(groupMoves.length,moves+1)
+   assert.deepEqual(a.groups.map(g=>g.id),id==='fb_wait_custom'?['custom','free-wait']:['free-wait'])
+  }
+  const counts=[groupMoves.length,starts.length,refreshes.length];await tick();await tick();assert.deepEqual([groupMoves.length,starts.length,refreshes.length],counts);assert.equal(starts.length,n+1)
+  groupMode='normal';accounts.splice(accounts.findIndex(x=>x.id===id),1)
+  check(id+': Free in GPT Pro moves to Free Wait, preserves unrelated controls, protects unknown results and does not replay authorization')
+ }
+ {
+  const ids=['fb_wait_batch_one','fb_wait_batch_two'];for(const id of ids)add(id).groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
+  await submit(ids);for(const id of ids){assert.equal((await finish(id)).status,'success');const a=accounts.find(a=>a.id===id);assert.equal(a.enabled,false);assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])}
+  check('Batch Free fallback uses the same guarded grouping flow for each account')
+ }
+ for(const enabled of [true,false]) {
+  const a=add(enabled?'free_in_pro_enabled':'free_in_pro_paused');a.planType='free';a.enabled=enabled;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];credentials.set(a.id,credential(a))
+  await submit([a.id]);const done=await finish(a.id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,enabled);assert.deepEqual(a.groups.map(g=>g.id),['free-wait']);assert.match(done.message,/Free Wait/)
+  accounts.splice(accounts.findIndex(x=>x.id===a.id),1)
+  check('An existing Free account in GPT Pro moves after native authorization while preserving its original enable state')
+ }
  for(const mode of ['missing','disabled','duplicate']) {
   const id='group_'+mode,a=add(id),moves=groupMoves.length;groupMode=mode
   await submit([id]);const done=await finish(id);assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(groupMoves.length,moves);assert.match(done.message,/GPT Pro/)
@@ -429,12 +465,14 @@ try {
 
  for(const [id,plan,enabled] of [['auto_up_enabled','free',true],['auto_up_paused','free',false],['auto_fb_team','team',true]]) {
   const a=add(id);Object.assign(a,{planType:plan,enabled,status:'error',errorReason:'credential_invalid',runtimeCredentialState:'invalid'});credentials.set(id,credential(a))
+  if(id==='auto_fb_team')a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
   const n=completes.length,r=refreshes.length
   await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
   assert.equal(job(id).automatic,true)
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.planType,id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id==='auto_up_enabled');if(a.planType==='team')assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
-  assert.equal(done.implementationVersion,'0.1.43');assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
+  if(id==='auto_fb_team')assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])
+  assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')
  }
@@ -462,7 +500,7 @@ try {
   directoryGate.resolve();directoryGate=null;await reconcile
   assert.equal(starts.length,n,'A scan finishing after disable must not send login credentials')
   assert.equal((await request('jobs')).value.automation.enabled,false,'Stale queue saves must not reenable automation')
-  await stop();await start();assert.equal((await request('jobs')).value.automation.enabled,false)
+  await stop();records.get('executor').value.expires=0;await start();assert.equal((await request('jobs')).value.automation.enabled,false)
   check('Disabling stays responsive during a blocked scan, fences late work, persists across restart and cannot be overwritten by queue saves')
  }
  {
@@ -473,3 +511,6 @@ try {
  assert.ok(!records.get('queue').value.automation.attempts[''],'Import failures without an account ID never create an empty automatic-attempt identity')
  await stop();console.log(`Verified ${passed} unified native protocol scenarios`)
 } finally {if(child?.exitCode===null)child.kill()}
+
+
+

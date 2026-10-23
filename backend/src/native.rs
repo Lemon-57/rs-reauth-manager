@@ -302,6 +302,14 @@ pub async fn complete(
     };
     let message = if crate::grouping::team(&expected) {
         format!("{message}；已移入 GPT Pro 分组")
+    } else if expected["planType"]
+        .as_str()
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"))
+        && original["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|g| g["name"] == "GPT Pro"))
+    {
+        format!("{message}；已移入 Free Wait 分组")
     } else {
         message.into()
     };
