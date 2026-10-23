@@ -258,9 +258,9 @@ pub async fn submit(
         .iter()
         .any(|j| j.request_id == prefix || j.request_id.starts_with(&(prefix.clone() + ":")))
     {
-        return Ok(json!({"jobs":queue.jobs}));
+        return Ok(json!({"jobs":queue.visible_jobs()}));
     }
-    if manager.worker.is_some() || queue.jobs.iter().any(Job::active) {
+    if manager.worker.is_some() || queue.has_active() {
         return Err(fault("已有授权任务进行中，请等待空闲后导入"));
     }
     let rows = directory(&call.host).await?;
@@ -300,7 +300,7 @@ pub async fn submit(
     crate::host::save(&call.host, &queue, version).await?;
     prune(manager, &queue);
     manager.imports.extend(pending);
-    Ok(json!({"jobs":queue.jobs}))
+    Ok(json!({"jobs":queue.visible_jobs()}))
 }
 
 pub async fn advance(manager: &mut Manager, host: &HostClient) -> Result<bool, PluginFault> {

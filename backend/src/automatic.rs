@@ -145,7 +145,7 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
     }
     queue.automation.observe(&accounts);
     // 手动队列优先，每次巡检最多加入一个账号
-    if queue.jobs.iter().any(Job::active) {
+    if queue.has_active() {
         return Ok(());
     }
     for summary in accounts.iter().filter(|a| prepared(a)) {

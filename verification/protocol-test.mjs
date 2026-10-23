@@ -54,6 +54,7 @@ async function callback(meta,payload) {
  if(meta.method==='host.state.put') {
   const old=records.get(data.key);assert.equal(data.expected_version,old?.version??null)
   const raw=JSON.stringify(data.value)
+  assert.ok(Buffer.byteLength(raw)<=256*1024,'Every stored record must fit the real SDK state budget')
   for(const secret of ['fixture-password','fixture:pass','secret-code','access_token','refresh_token','id_token','fixture-cookie','fixture-admin-key','fixture-provided-rt','fixture-current-session','59859b73-b63b-45f4-86f9-e728a9512905'])assert.ok(!raw.includes(secret),'Private material must not enter job state')
   const version=(old?.version||0)+1;records.set(data.key,{value:structuredClone(data.value),version,schema_version:1});return result(meta.id,{version})
  }
@@ -218,9 +219,40 @@ async function verifyExpiredExistingBindings() {
   check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
  }
 }
+async function verifyDurableBatches() {
+ const ids=Array.from({length:242},(_,i)=>`bulk${String(i).padStart(4,'0')}`);ids.forEach(add)
+ const requestId=randomUUID(), beforeStarts=starts.length
+ let result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(requestId+':')).length,242)
+ assert.equal(starts.length,beforeStarts);assert.equal(records.get('queue').value.pendingBatches[0].accountIds.length,242)
+ result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(records.get('queue').value.pendingBatches.length,1)
+ const saved=structuredClone(records.get('queue'))
+ assert.equal((await submit([ids[0],'independent'],randomUUID())).status,400);assert.deepEqual(records.get('queue'),saved)
+ check('All 242 selected accounts are durably queued in one atomic write; repeats and overlaps cannot duplicate any account')
+ await request('standby',{});await stop();await start();let all=(await request('jobs')).value.jobs
+ assert.equal(all.filter(j=>j.requestId.startsWith(requestId+':')).length,242);assert.ok(all.every(j=>j.status==='queued'));assert.equal(starts.length,beforeStarts)
+ check('Restarting or closing the client preserves all 242 pending accounts without replaying authorization')
+ await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');let running=(await request('jobs')).value.jobs.filter(j=>j.status==='running');assert.equal(running.length,1);assert.equal(starts.length,beforeStarts+1)
+ for(let i=0;i<60&&['queued','running'].includes(job(ids[0]).status);i++){await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');await sleep(60)}
+ const first=job(ids[0]);assert.equal(first.status,'success',first.message);assert.equal(starts.length,beforeStarts+1)
+ all=(await request('jobs')).value.jobs;assert.equal(all.filter(j=>j.status==='queued').length,241)
+ check('The worker promotes only one pending account and completes native OAuth and refresh before starting another')
+ await request('cancel',{requestId:requestId+':'+ids[1]});assert.equal((await request('jobs')).value.jobs.find(j=>j.accountId===ids[1]).status,'cancelled')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)));assert.equal(starts.length,beforeStarts+1)
+ check('Cancelling one pending account or the remaining backlog never starts login for cancelled accounts')
+ const large=Array.from({length:1001},(_,i)=>`later${String(i).padStart(4,'0')}`), largeRequest=randomUUID()
+ result=await submit(large,largeRequest);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ await request('standby',{});await stop();await start();assert.equal((await request('jobs')).value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ assert.equal(starts.length,beforeStarts+1);assert.ok(Buffer.byteLength(JSON.stringify(records.get('queue').value))<=256*1024)
+ check('A 1001-account backlog has no 100/1000-count rejection and stays within the unchanged SDK storage budget')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)))
+ assert.equal(starts.length,beforeStarts+1)
+ check('Large cancellation also respects storage bounds, retains recent outcomes and leaves no pending logins')
+}
 try {
  await start()
- if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
+ if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
+  await verifyDurableBatches();await stop();console.log(`Verified ${passed} durable batch scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
   await verifyExpiredExistingBindings();await stop();console.log(`Verified ${passed} expired existing-account native OAuth scenarios`)
  } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
@@ -440,7 +472,7 @@ try {
   assert.equal(job(id).automatic,true)
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.planType,id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id==='auto_up_enabled');if(a.planType==='team')assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
-  assert.equal(done.implementationVersion,'0.1.49');assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
+  assert.equal(done.implementationVersion,'0.1.50');assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')
  }
