@@ -56,6 +56,7 @@ async function callback(meta,payload) {
  if(meta.method==='host.state.put') {
   const old=records.get(data.key);assert.equal(data.expected_version,old?.version??null)
   const raw=JSON.stringify(data.value)
+  assert.ok(Buffer.byteLength(raw)<=256*1024,'Every stored record must fit the real SDK state budget')
   for(const secret of ['fixture-password','fixture:pass','secret-code','access_token','refresh_token','id_token','fixture-cookie','fixture-admin-key','fixture-provided-rt','fixture-current-session','59859b73-b63b-45f4-86f9-e728a9512905'])assert.ok(!raw.includes(secret),'Private material must not enter job state')
   const version=(old?.version||0)+1;records.set(data.key,{value:structuredClone(data.value),version,schema_version:1});return result(meta.id,{version})
  }
@@ -206,15 +207,59 @@ async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'man
   return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), 10000).unref())])
 }
 async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [{name:'x-api-key',value:Array.from(Buffer.from('fixture-admin-key'))}] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
-const submit = (ids, requestId = randomUUID()) => request('submit', { accountIds: ids, requestId })
+const submit = async (ids, requestId = randomUUID()) => { const result = await request('submit', { accountIds: ids, requestId }); if (process.env.RS_REAUTH_TEST_CASE !== 'durable-batches') await tick(); return result }
 const tick = () => request('tick', {})
-const job = id => records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1)
+// Compact persisted jobs omit false defaults; expose the same decoded fields as api/jobs.
+const job = id => { const row = records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1); return row && new Proxy(row, { get: (value, key) => value[key] ?? (['automatic','logoutOthers','cleanupStarted','freeFallback','newAccount'].includes(key) ? false : undefined) }) }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function finish(id) { for (let i = 0; i < 60; i++) { await tick(); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish: ' + JSON.stringify(job(id))) }
 let passed=0
 const check=name=>{passed++;console.log('PASS '+name)}
+async function verifyExpiredExistingBindings() {
+ for(const id of ['unbound_existing_team','unbound_existing_personal']) {
+  const a=add(id);a.enabled=false;a.planType='free';a.accountId=null;const c=credential(a)
+  for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
+  credentials.set(id,c);const im=providedImports.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,!id.includes('personal'));assert.equal(providedImports.length,im)
+  check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
+ }
+}
+async function verifyDurableBatches() {
+ const ids=Array.from({length:242},(_,i)=>`bulk${String(i).padStart(4,'0')}`);ids.forEach(add)
+ const requestId=randomUUID(), beforeStarts=starts.length
+ let result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(requestId+':')).length,242)
+ assert.equal(starts.length,beforeStarts);assert.equal(records.get('queue').value.pendingBatches[0].accountIds.length,242)
+ result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(records.get('queue').value.pendingBatches.length,1)
+ const saved=structuredClone(records.get('queue'))
+ assert.equal((await submit([ids[0],'independent'],randomUUID())).status,400);assert.deepEqual(records.get('queue'),saved)
+ check('All 242 selected accounts are durably queued in one atomic write; repeats and overlaps cannot duplicate any account')
+ await request('standby',{});await stop();await start();let all=(await request('jobs')).value.jobs
+ assert.equal(all.filter(j=>j.requestId.startsWith(requestId+':')).length,242);assert.ok(all.every(j=>j.status==='queued'));assert.equal(starts.length,beforeStarts)
+ check('Restarting or closing the client preserves all 242 pending accounts without replaying authorization')
+ await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');let running=(await request('jobs')).value.jobs.filter(j=>j.status==='running');assert.equal(running.length,1);assert.equal(starts.length,beforeStarts+1)
+ for(let i=0;i<60&&['queued','running'].includes(job(ids[0]).status);i++){await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');await sleep(60)}
+ const first=job(ids[0]);assert.equal(first.status,'success',first.message);assert.equal(starts.length,beforeStarts+1)
+ all=(await request('jobs')).value.jobs;assert.equal(all.filter(j=>j.status==='queued').length,241)
+ check('The worker promotes only one pending account and completes native OAuth and refresh before starting another')
+ await request('cancel',{requestId:requestId+':'+ids[1]});assert.equal((await request('jobs')).value.jobs.find(j=>j.accountId===ids[1]).status,'cancelled')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)));assert.equal(starts.length,beforeStarts+1)
+ check('Cancelling one pending account or the remaining backlog never starts login for cancelled accounts')
+ const large=Array.from({length:1001},(_,i)=>`later${String(i).padStart(4,'0')}`), largeRequest=randomUUID()
+ result=await submit(large,largeRequest);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ await request('standby',{});await stop();await start();assert.equal((await request('jobs')).value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ assert.equal(starts.length,beforeStarts+1);assert.ok(Buffer.byteLength(JSON.stringify(records.get('queue').value))<=256*1024)
+ check('A 1001-account backlog has no 100/1000-count rejection and stays within the unchanged SDK storage budget')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)))
+ assert.equal(starts.length,beforeStarts+1)
+ check('Large cancellation also respects storage bounds, retains recent outcomes and leaves no pending logins')
+}
 try {
  await start()
+ if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
+  await verifyDurableBatches();await stop();console.log(`Verified ${passed} durable batch scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
+  await verifyExpiredExistingBindings();await stop();console.log(`Verified ${passed} expired existing-account native OAuth scenarios`)
+ } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
  for(const [id,hasRT] of [['new_import_ui',false],['new_import_free_ui',false],['rt_team_ui',true],['rt_business_ui',true],['up_import_ui',true]]) {
@@ -225,8 +270,8 @@ try {
   for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
   assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id)
   assert.equal(accounts.find(a=>a.id===id).enabled,id!=='new_import_free_ui');if(id!=='new_import_free_ui')assert.deepEqual(accounts.find(a=>a.id===id).groups.map(g=>g.id),['gpt-pro'])
-  if(id.startsWith('rt_')){assert.equal(starts.length,n);assert.equal(completes.length,c);assert.equal(done.cleanupStarted,false)}
-  else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(done.cleanupStarted,false)}
+  if(id.startsWith('rt_')){assert.equal(starts.length,n);assert.equal(completes.length,c);assert.equal(done.cleanupStarted??false,false)}
+  else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(done.cleanupStarted??false,false)}
   if(id==='up_import_ui'){assert.equal(accounts.find(a=>a.id===id).planType,'team');assert.equal(accounts.filter(a=>a.email===id+'@example.com').length,1)}
   const before=[starts.length,completes.length,accounts.length]
   assert.equal((await request('import-line',body)).status,200);assert.deepEqual([starts.length,completes.length,accounts.length],before)
@@ -288,7 +333,7 @@ try {
   let done
   for(let i=0;i<60;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
   assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,id==='new_team')
-  if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted,false);assert.ok(refreshes.includes(id))}
+  if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted??false,false);assert.ok(refreshes.includes(id))}
   else{assert.equal(done.status,'review',done.message);const before=[starts.length,completes.length];await tick();assert.deepEqual([starts.length,completes.length],before)}
   const count=starts.length;assert.equal((await request('import',{...req,requestId:randomUUID(),email:'other@example.com',notes:'other@example.com----fixture-password----GEZDGNBVGY3TQOJQ'})).status,400);assert.equal(starts.length,count)
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
@@ -311,20 +356,14 @@ try {
   const a=accounts.find(a=>a.id===id);assert.equal(accounts.filter(a=>a.id===id).length,1)
   if(['unbound_team','unbound_personal'].includes(id)) {
    assert.equal(done.status,'success',done.message);assert.equal(a.enabled,id==='unbound_team');assert.equal(a.planType,id==='unbound_team'?'team':'free')
-   assert.equal(a.accountId,id==='unbound_team'?'team-workspace':'personal-workspace');assert.equal(done.cleanupStarted,false)
+   assert.equal(a.accountId,id==='unbound_team'?'team-workspace':'personal-workspace');assert.equal(done.cleanupStarted??false,false)
    assert.deepEqual(a.groups.map(g=>g.id),id==='unbound_team'?['gpt-pro']:[])
   } else {assert.equal(done.status,'review',done.message);assert.equal(a.enabled,false)}
   const counts=[starts.length,completes.length,providedImports.length];await tick();assert.deepEqual([starts.length,completes.length,providedImports.length],counts)
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(id+': missing old workspace continues through the same bound native OAuth and validates new identity before grouping or enabling')
  }
- for(const id of ['unbound_existing_team','unbound_existing_personal']) {
-  const a=add(id);a.enabled=false;a.planType='free';a.accountId=null;const c=credential(a)
-  for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
-  credentials.set(id,c);const im=providedImports.length
-  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,!id.includes('personal'));assert.equal(providedImports.length,im)
-  check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
- }
+ await verifyExpiredExistingBindings()
  for(const id of ['good','disabled','free','legacy_principal','business']) {
   const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'||id==='business'){a.planType=id;credentials.set(id,credential(a))}
   const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length
@@ -472,7 +511,7 @@ try {
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.planType,id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id==='auto_up_enabled');if(a.planType==='team')assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
   if(id==='auto_fb_team')assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])
-  assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
+  assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted??false,false);assert.equal(done.logoutOthers??false,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')
  }
@@ -510,7 +549,9 @@ try {
  }
  assert.ok(!records.get('queue').value.automation.attempts[''],'Import failures without an account ID never create an empty automatic-attempt identity')
  await stop();console.log(`Verified ${passed} unified native protocol scenarios`)
+ }
 } finally {if(child?.exitCode===null)child.kill()}
+
 
 
 

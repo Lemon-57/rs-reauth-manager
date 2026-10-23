@@ -365,6 +365,23 @@ try {
   assert.deepEqual(jobs,[originalSnapshot,laterReview])
   check('Reopening reconciles the import panel through read-only account and task requests while keeping session batch totals and stored history intact')
 
+  {
+  state.search.value='';state.plan.value='all';state.filter.value='all';state.selected.value=[]
+  accounts=Array.from({length:242},(_,i)=>account('selected-'+i));jobs=[];await state.load();state.selectAll(true)
+  assert.equal(state.selected.value.length,242);assert.equal(state.visible.value.length,20)
+  let count=calls.filter(c=>c.path==='api/submit').length
+  await state.submit(state.reauthChosen.value)
+  assert.equal(calls.filter(c=>c.path==='api/submit').length,count+1)
+  assert.equal(JSON.parse(calls.filter(c=>c.path==='api/submit').at(-1).body).accountIds.length,242)
+  assert.equal(state.selected.value.length,0);assert.equal(state.success.value,242)
+  check('Select all submits all 242 accounts once across pagination and keeps the full batch results')
+  accounts=Array.from({length:242},(_,i)=>account('uncertain-'+i));jobs=[];await state.load();state.selectAll(true);throwAfterSubmit=true
+  count=calls.filter(c=>c.path==='api/submit').length;await state.submit(state.reauthChosen.value);throwAfterSubmit=false
+  assert.equal(calls.filter(c=>c.path==='api/submit').length,count+1);assert.equal(state.active.value,242)
+  assert.equal(state.selected.value.length,242);assert.equal(state.reauthChosen.value.length,0)
+  check('A lost 242-account submission response is read back once without re-submitting or double-queuing accounts')
+
+  }
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }
 

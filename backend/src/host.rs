@@ -50,11 +50,94 @@ pub async fn save(
     queue: &crate::Queue,
     version: Option<u64>,
 ) -> Result<(), PluginFault> {
+    save_with_limit(host, queue, version, 256 * 1024).await
+}
+pub(crate) async fn save_with_limit(
+    host: &HostClient,
+    queue: &crate::Queue,
+    version: Option<u64>,
+    limit: usize,
+) -> Result<(), PluginFault> {
     crate::executor::check(host).await?;
-    let reply = host.call("host.state.put", json!({"namespace":"reauth-manager","key":"queue","value":queue,"expected_version":version}), vec![]).await.map_err(|e| e.into_plugin_fault())?;
+    let value = queue_value(queue, limit)?;
+    let reply = host.call("host.state.put", json!({"namespace":"reauth-manager","key":"queue","value":value,"expected_version":version}), vec![]).await.map_err(|e| e.into_plugin_fault())?;
     let _: StatePutResult =
         serde_json::from_value(reply.result).map_err(|_| fault("任务保存失败"))?;
     Ok(())
+}
+
+/// Omit only fields that both current and older readers already default. Keep
+/// every active job; discard oldest completed history only when the SDK's
+/// 256 KiB record budget requires it. HTTP responses still expose full jobs.
+pub(crate) fn queue_value(queue: &crate::Queue, limit: usize) -> Result<Value, PluginFault> {
+    let mut value = json!({"jobs": &queue.jobs, "automation": &queue.automation, "pendingBatches": &queue.pending_batches});
+    for job in value["jobs"]
+        .as_array_mut()
+        .ok_or_else(|| fault("任务状态格式无效"))?
+    {
+        let object = job
+            .as_object_mut()
+            .ok_or_else(|| fault("任务状态格式无效"))?;
+        for key in [
+            "startedAt",
+            "finishedAt",
+            "forceWorkspaceId",
+            "expectedRevision",
+        ] {
+            if object.get(key).is_some_and(Value::is_null) {
+                object.remove(key);
+            }
+        }
+        for key in [
+            "freeFallback",
+            "automatic",
+            "logoutOthers",
+            "cleanupStarted",
+            "newAccount",
+        ] {
+            if object.get(key) == Some(&json!(false)) {
+                object.remove(key);
+            }
+        }
+        if object
+            .get("workspaceChoices")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            object.remove("workspaceChoices");
+        }
+    }
+    let mut size = serde_json::to_vec(&value)
+        .map_err(|_| fault("任务编码失败"))?
+        .len();
+    let jobs = value["jobs"]
+        .as_array_mut()
+        .ok_or_else(|| fault("任务状态格式无效"))?;
+    while size > limit {
+        let terminal: Vec<_> = jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| !matches!(j["status"].as_str(), Some("queued" | "running")))
+            .collect();
+        if terminal.len() <= 1 {
+            return Err(fault(
+                "后台队列状态暂时无法保存，本次任务未提交，请稍后重试",
+            ));
+        }
+        let index = terminal
+            .into_iter()
+            .min_by_key(|(index, j)| (j["finishedAt"].as_u64().unwrap_or(0), *index))
+            .unwrap()
+            .0;
+        let removed = jobs.remove(index);
+        size = size.saturating_sub(
+            serde_json::to_vec(&removed)
+                .map_err(|_| fault("任务编码失败"))?
+                .len()
+                + 1,
+        );
+    }
+    Ok(value)
 }
 pub async fn admin(
     host: &HostClient,

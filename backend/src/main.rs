@@ -80,11 +80,127 @@ impl Job {
         self.finished_at = Some(now());
     }
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct Queue {
     jobs: Vec<Job>,
     #[serde(default)]
     automation: automatic::Automation,
+    #[serde(default, rename = "pendingBatches")]
+    pending_batches: Vec<PendingBatch>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingBatch {
+    request_id: String,
+    account_ids: std::collections::VecDeque<String>,
+}
+impl Job {
+    fn queued(batch: &str, account_id: String) -> Self {
+        Self {
+            request_id: format!("{batch}:{account_id}"),
+            account_id,
+            status: "queued".into(),
+            step: "queued".into(),
+            message: String::new(),
+            started_at: None,
+            finished_at: None,
+            workspace_choices: vec![],
+            force_workspace_id: None,
+            free_fallback: false,
+            automatic: false,
+            expected_revision: None,
+            logout_others: false,
+            cleanup_started: false,
+            new_account: false,
+            import_info: None,
+            implementation_version: None,
+        }
+    }
+}
+impl Queue {
+    fn visible_jobs(&self) -> Vec<Job> {
+        self.jobs
+            .iter()
+            .cloned()
+            .chain(self.pending_batches.iter().flat_map(|batch| {
+                batch
+                    .account_ids
+                    .iter()
+                    .cloned()
+                    .map(|id| Job::queued(&batch.request_id, id))
+            }))
+            .collect()
+    }
+    fn has_active(&self) -> bool {
+        self.jobs.iter().any(Job::active)
+            || self
+                .pending_batches
+                .iter()
+                .any(|b| !b.account_ids.is_empty())
+    }
+    fn account_active(&self, id: &str) -> bool {
+        self.jobs.iter().any(|j| j.account_id == id && j.active())
+            || self
+                .pending_batches
+                .iter()
+                .any(|b| b.account_ids.iter().any(|a| a == id))
+    }
+    fn contains_batch(&self, id: &str) -> bool {
+        self.pending_batches.iter().any(|b| b.request_id == id)
+            || self
+                .jobs
+                .iter()
+                .any(|j| j.request_id.starts_with(&format!("{id}:")))
+    }
+    fn take_next_pending(&mut self) {
+        if self.jobs.iter().any(Job::active) {
+            return;
+        }
+        while let Some(batch) = self.pending_batches.first_mut() {
+            if let Some(id) = batch.account_ids.pop_front() {
+                let job = Job::queued(&batch.request_id, id);
+                if batch.account_ids.is_empty() {
+                    self.pending_batches.remove(0);
+                }
+                self.jobs.push(job);
+                return;
+            }
+            self.pending_batches.remove(0);
+        }
+    }
+    fn remove_pending(&mut self, ids: &[String]) {
+        for batch in &mut self.pending_batches {
+            batch.account_ids.retain(|id| !ids.contains(id));
+        }
+        self.pending_batches.retain(|b| !b.account_ids.is_empty());
+    }
+    fn cancel_pending(&mut self, request: Option<&str>) {
+        let mut cancelled = Vec::new();
+        for batch in &mut self.pending_batches {
+            batch.account_ids.retain(|id| {
+                let key = format!("{}:{id}", batch.request_id);
+                if request.is_none_or(|r| r == key) {
+                    let mut job = Job::queued(&batch.request_id, id.clone());
+                    job.finish("cancelled", "已取消，尚未开始登录");
+                    cancelled.push(job);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.pending_batches.retain(|b| !b.account_ids.is_empty());
+        self.jobs.extend(cancelled);
+    }
+}
+impl Serialize for Queue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Queue", 2)?;
+        state.serialize_field("jobs", &self.visible_jobs())?;
+        state.serialize_field("automation", &self.automation)?;
+        state.end()
+    }
 }
 struct Manager {
     imports: std::collections::VecDeque<onboarding::Pending>,
@@ -514,18 +630,33 @@ impl Manager {
                         Ok(()) => {
                             let message =
                                 format!("{success_message}；本次原生 RT 刷新及保存已确认");
-                            latest.jobs[position].finish("success", &message);
+                            latest
+                                .jobs
+                                .iter_mut()
+                                .find(|j| j.request_id == current.request_id)
+                                .ok_or_else(|| fault("授权任务记录未确认"))?
+                                .finish("success", &message);
                             if success_step == "free" {
-                                latest.jobs[position].step = "free".into();
+                                latest
+                                    .jobs
+                                    .iter_mut()
+                                    .find(|j| j.request_id == current.request_id)
+                                    .ok_or_else(|| fault("授权任务记录未确认"))?
+                                    .step = "free".into();
                             }
                         }
-                        Err(error) => latest.jobs[position].finish(
-                            "review",
-                            &format!(
-                                "{}；请核对已保存 RT 与账号启停，不会自动重放",
-                                error.message
+                        Err(error) => latest
+                            .jobs
+                            .iter_mut()
+                            .find(|j| j.request_id == current.request_id)
+                            .ok_or_else(|| fault("授权任务记录未确认"))?
+                            .finish(
+                                "review",
+                                &format!(
+                                    "{}；请核对已保存 RT 与账号启停，不会自动重放",
+                                    error.message
+                                ),
                             ),
-                        ),
                     }
                     host::save(host, &latest, version).await?;
                     return Ok(());
@@ -590,15 +721,17 @@ impl Manager {
         if onboarding::advance(self, host).await? {
             return Ok(());
         }
-        if queue.automation.enabled && !queue.jobs.iter().any(Job::active) {
+        if queue.automation.enabled && !queue.has_active() {
             let result = automatic::scan(host, &mut queue).await;
             host::save(host, &queue, version).await?;
             result?;
             // 入队后读取新的状态版本，在本次通知内开始，不等待补偿计时器
             (queue, version) = host::load(host).await?;
         }
+        queue.take_next_pending();
         if let Some(position) = queue.jobs.iter().position(|j| j.status == "queued") {
             let job = &mut queue.jobs[position];
+            let starting_request_id = job.request_id.clone();
             job.status = "running".into();
             job.step = "preparing".into();
             job.started_at = Some(now());
@@ -616,7 +749,7 @@ impl Manager {
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
                 let proxy=proxy(host,&a).await?;
                 let recover_workspace = recovery::missing_workspace(&settings(&a)) && job.force_workspace_id.is_none() && !job.free_fallback;
-                if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_binding(&recovery::tokens(&old), &settings(&a))?; }
+                if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_existing_binding(&recovery::tokens(&old), &settings(&a))?; }
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
                 let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback,"automatic":job.automatic,"recoverWorkspace":recover_workspace});
@@ -626,7 +759,12 @@ impl Manager {
                 Ok(worker) => self.worker = Some(worker),
                 Err(error) => {
                     let (mut latest, version) = host::load(host).await?;
-                    latest.jobs[position].finish("failed", &error.message);
+                    latest
+                        .jobs
+                        .iter_mut()
+                        .find(|j| j.request_id == starting_request_id)
+                        .ok_or_else(|| fault("授权任务记录未确认"))?
+                        .finish("failed", &error.message);
                     host::save(host, &latest, version).await?;
                 }
             }
@@ -640,7 +778,9 @@ async fn handle(
 ) -> Result<Value, PluginFault> {
     if !call.request.query.is_empty()
         || call.payload.len()
-            > if call.request.path == "api/import-line" {
+            > if call.request.path == "api/submit" {
+                2097152
+            } else if call.request.path == "api/import-line" {
                 524288
             } else {
                 16384
@@ -717,9 +857,9 @@ async fn handle(
             .iter()
             .any(|job| job.request_id == request.request_id)
         {
-            return Ok(json!({"jobs":queue.jobs}));
+            return Ok(json!({"jobs":queue.visible_jobs()}));
         }
-        if manager.worker.is_some() || queue.jobs.iter().any(Job::active) {
+        if manager.worker.is_some() || queue.has_active() {
             return Err(fault("已有授权任务进行中，请等待空闲后再新增账号"));
         }
         let accounts = directory(&call.host).await?;
@@ -828,7 +968,7 @@ async fn handle(
             }
         }
         let (queue, _) = host::load(&call.host).await?;
-        return Ok(json!({"jobs":queue.jobs}));
+        return Ok(json!({"jobs":queue.visible_jobs()}));
     }
     let (mut queue, version) = host::load(&call.host).await?;
     match call.request.path.as_str() {
@@ -848,17 +988,19 @@ async fn handle(
                 manager.worker.take();
             }
             queue.jobs.retain(|j| !ids.contains(&j.account_id));
+            queue.remove_pending(&ids);
             host::save(&call.host, &queue, version).await.map_err(|_| {
                 fault("账号已从 RS 网关删除，但插件任务列表同步失败，请刷新核对；不会自动重复删除")
             })?;
-            return Ok(json!({"deletedAccountIds":ids,"jobs":queue.jobs}));
+            return Ok(json!({"deletedAccountIds":ids,"jobs":queue.visible_jobs()}));
         }
         "api/submit" => {
             let request: Submit =
                 serde_json::from_slice(&call.payload).map_err(|_| fault("提交格式无效"))?;
+            if request.account_ids.is_empty() {
+                return Err(fault("请选择要重新授权的账号"));
+            }
             if uuid::Uuid::parse_str(&request.request_id).is_err()
-                || request.account_ids.is_empty()
-                || request.account_ids.len() > 100
                 || request
                     .account_ids
                     .iter()
@@ -875,24 +1017,15 @@ async fn handle(
             {
                 return Err(fault("账号或请求标识无效"));
             }
-            let prefix = format!("{}:", request.request_id);
-            if queue
-                .jobs
-                .iter()
-                .any(|job| job.request_id.starts_with(&prefix))
-            {
-                return Ok(json!({"jobs":queue.jobs}));
+            if queue.contains_batch(&request.request_id) {
+                return Ok(json!({"jobs":queue.visible_jobs()}));
             }
             if request
                 .account_ids
                 .iter()
-                .any(|id| queue.jobs.iter().any(|j| j.account_id == *id && j.active()))
+                .any(|id| queue.account_active(id))
             {
                 return Err(fault("选择的账号已有进行中的任务"));
-            }
-            let active = queue.jobs.iter().filter(|j| j.active()).count();
-            if active + request.account_ids.len() > 100 {
-                return Err(fault("队列最多保留 100 个待处理账号"));
             }
             let mut completed = queue.jobs.iter().filter(|job| !job.active()).count();
             queue.jobs.retain(|job| {
@@ -903,27 +1036,10 @@ async fn handle(
                     true
                 }
             });
-            for id in request.account_ids {
-                queue.jobs.push(Job {
-                    request_id: format!("{}:{id}", request.request_id),
-                    account_id: id,
-                    status: "queued".into(),
-                    step: "queued".into(),
-                    message: String::new(),
-                    started_at: None,
-                    finished_at: None,
-                    workspace_choices: vec![],
-                    force_workspace_id: None,
-                    free_fallback: false,
-                    automatic: false,
-                    expected_revision: None,
-                    logout_others: false,
-                    cleanup_started: false,
-                    new_account: false,
-                    import_info: None,
-                    implementation_version: None,
-                });
-            }
+            queue.pending_batches.push(PendingBatch {
+                request_id: request.request_id,
+                account_ids: request.account_ids.into(),
+            });
         }
         "api/force-submit" => {
             let request: ForceSubmit =
@@ -941,7 +1057,7 @@ async fn handle(
                 .ok_or_else(|| fault("原失败任务已失效，请重新检测"))?;
             let key = format!("{}:{}", request.request_id, source.account_id);
             if queue.jobs.iter().any(|j| j.request_id == key) {
-                return Ok(json!({"jobs":queue.jobs}));
+                return Ok(json!({"jobs":queue.visible_jobs()}));
             }
             if source.status != "failed"
                 || source.step != "workspace"
@@ -1011,7 +1127,7 @@ async fn handle(
                 .ok_or_else(|| fault("原失败任务已失效，请重新检测"))?;
             let key = format!("{}:{}", request.request_id, source.account_id);
             if queue.jobs.iter().any(|j| j.request_id == key) {
-                return Ok(json!({"jobs":queue.jobs}));
+                return Ok(json!({"jobs":queue.visible_jobs()}));
             }
             if source.status != "failed"
                 || source.step != "workspace"
@@ -1058,6 +1174,7 @@ async fn handle(
                 control::set(&call.host, false).await?;
                 queue.automation.enabled = false;
             }
+            queue.cancel_pending(request.request_id.as_deref());
             for job in &mut queue.jobs {
                 if job.active()
                     && request
@@ -1084,8 +1201,12 @@ async fn handle(
         _ => return Err(fault("路由不存在")),
     }
     onboarding::prune(manager, &queue);
-    host::save(&call.host, &queue, version).await?;
-    Ok(json!({"jobs":queue.jobs}))
+    if call.request.path == "api/submit" {
+        host::save_with_limit(&call.host, &queue, version, 240 * 1024).await?;
+    } else {
+        host::save(&call.host, &queue, version).await?;
+    }
+    Ok(json!({"jobs":queue.visible_jobs()}))
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
