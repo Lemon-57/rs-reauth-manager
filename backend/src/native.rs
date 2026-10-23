@@ -131,7 +131,7 @@ pub async fn complete(
         return Err(fault("原账号身份或凭据版本未确认，未提交原生完成接口"));
     }
     let old_subject = if recovered {
-        recovery::validate_binding(&recovery::tokens(&old), &original)?
+        recovery::validate_existing_binding(&recovery::tokens(&old), &original)?
     } else if team {
         recovery::subject_for_team_upgrade(&old)?
     } else {

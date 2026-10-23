@@ -616,7 +616,7 @@ impl Manager {
                 if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
                 let proxy=proxy(host,&a).await?;
                 let recover_workspace = recovery::missing_workspace(&settings(&a)) && job.force_workspace_id.is_none() && !job.free_fallback;
-                if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_binding(&recovery::tokens(&old), &settings(&a))?; }
+                if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_existing_binding(&recovery::tokens(&old), &settings(&a))?; }
                 let start=admin(host,"POST","/api/admin/accounts/oauth/start",Some(json!({"provider":"openai","name":a["name"],"accountId":a["id"]}))).await?;
                 let flow=start["flowId"].as_str().ok_or_else(||fault("RS 授权流程无效"))?.to_owned();
                 let input=json!({"notes":a["notes"],"email":a["email"],"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"forceWorkspaceId":job.force_workspace_id,"forceFree":job.free_fallback,"automatic":job.automatic,"recoverWorkspace":recover_workspace});

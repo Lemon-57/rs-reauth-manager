@@ -209,9 +209,21 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function finish(id) { for (let i = 0; i < 60; i++) { await tick(); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish: ' + JSON.stringify(job(id))) }
 let passed=0
 const check=name=>{passed++;console.log('PASS '+name)}
+async function verifyExpiredExistingBindings() {
+ for(const id of ['unbound_existing_team','unbound_existing_personal']) {
+  const a=add(id);a.enabled=false;a.planType='free';a.accountId=null;const c=credential(a)
+  for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
+  credentials.set(id,c);const im=providedImports.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,!id.includes('personal'));assert.equal(providedImports.length,im)
+  check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
+ }
+}
 try {
  await start()
- const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,12)
+ if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
+  await verifyExpiredExistingBindings();await stop();console.log(`Verified ${passed} expired existing-account native OAuth scenarios`)
+ } else {
+ const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
  for(const [id,hasRT] of [['new_import_ui',false],['new_import_free_ui',false],['rt_team_ui',true],['rt_business_ui',true],['up_import_ui',true]]) {
   const requestId=randomUUID(),n=starts.length,c=completes.length
@@ -314,13 +326,7 @@ try {
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(id+': missing old workspace continues through the same bound native OAuth and validates new identity before grouping or enabling')
  }
- for(const id of ['unbound_existing_team','unbound_existing_personal']) {
-  const a=add(id);a.enabled=false;a.planType='free';a.accountId=null;const c=credential(a)
-  for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
-  credentials.set(id,c);const im=providedImports.length
-  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,!id.includes('personal'));assert.equal(providedImports.length,im)
-  check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
- }
+ await verifyExpiredExistingBindings()
  for(const id of ['good','disabled','free','legacy_principal','business']) {
   const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'||id==='business'){a.planType=id;credentials.set(id,credential(a))}
   const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length
@@ -434,7 +440,7 @@ try {
   assert.equal(job(id).automatic,true)
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.planType,id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id==='auto_up_enabled');if(a.planType==='team')assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
-  assert.equal(done.implementationVersion,'0.1.43');assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
+  assert.equal(done.implementationVersion,'0.1.49');assert.equal(done.cleanupStarted,false);assert.equal(done.logoutOthers,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')
  }
@@ -472,4 +478,5 @@ try {
  }
  assert.ok(!records.get('queue').value.automation.attempts[''],'Import failures without an account ID never create an empty automatic-attempt identity')
  await stop();console.log(`Verified ${passed} unified native protocol scenarios`)
+ }
 } finally {if(child?.exitCode===null)child.kill()}

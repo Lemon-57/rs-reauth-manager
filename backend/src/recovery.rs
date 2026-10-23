@@ -18,9 +18,19 @@ pub(crate) fn missing_workspace(original: &Value) -> bool {
 
 // 旧 RT 可以没有 ChatGPT 工作区声明；仅用于绑定已有用户，不能据此启用或归组
 pub(crate) fn validate_binding(tokens: &Value, original: &Value) -> Result<String, PluginFault> {
+    validate_binding_with_expiry(tokens, original, true)
+}
+
+// Existing saved credentials establish historical identity only. Fresh OAuth results
+// and supplied RT imports still require live tokens through validate_binding/validate.
+pub(crate) fn validate_existing_binding(tokens: &Value, original: &Value) -> Result<String, PluginFault> {
+    validate_binding_with_expiry(tokens, original, false)
+}
+
+fn validate_binding_with_expiry(tokens: &Value, original: &Value, require_fresh: bool) -> Result<String, PluginFault> {
     text(tokens, "refresh_token")?;
-    let identity = claims(text(tokens, "id_token")?)?;
-    let access = claims(text(tokens, "access_token")?)?;
+    let identity = decode_claims(text(tokens, "id_token")?, require_fresh)?;
+    let access = decode_claims(text(tokens, "access_token")?, require_fresh)?;
     let email = identity["email"]
         .as_str()
         .or_else(|| identity["https://api.openai.com/profile"]["email"].as_str());
@@ -58,6 +68,10 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
 }
 
 pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
+    decode_claims(token, true)
+}
+
+fn decode_claims(token: &str, require_fresh: bool) -> Result<Value, PluginFault> {
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
         return Err(fault(IDENTITY_ERROR));
@@ -69,7 +83,7 @@ pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
     // 私有 TLS 交换结果的字段投影，不宣称为 JWT 签名校验
     let expires = claims["exp"]
         .as_u64()
-        .filter(|exp| *exp > now() / 1000 + 30 && *exp < 253402300799)
+        .filter(|exp| *exp > 0 && *exp < 253402300799 && (!require_fresh || *exp > now() / 1000 + 30))
         .ok_or_else(|| fault(IDENTITY_ERROR))?;
     if !claims.is_object() || expires.checked_mul(1000).is_none() {
         return Err(fault(IDENTITY_ERROR));
@@ -264,6 +278,31 @@ fn subject_with_workspace_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn expired_token(user: &str, subject: &str, email: &str) -> String {
+        let value = json!({"email":email,"sub":subject,"exp":1,AUTH:{"user_id":user}});
+        format!("fixture.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap()))
+    }
+    #[test]
+    fn expired_saved_credentials_bind_identity_but_cannot_authorize_or_import() {
+        let original = json!({"email":"fixture@example.com","userId":"user","planType":"free","accountId":null});
+        let old = expired_token("user", "subject", "fixture@example.com");
+        let tokens = json!({"id_token":old,"access_token":old,"refresh_token":"fixture-rt"});
+        assert_eq!(validate_existing_binding(&tokens, &original).unwrap(), "subject");
+        assert!(validate_binding(&tokens, &original).is_err());
+        assert!(claims(&old).is_err());
+        assert!(validate(&json!({"event":"workspace_recovered","workspaceId":"workspace","originalWorkspaceId":null,"uniqueWorkspaceConfirmed":true,"selectedPlan":"free","tokens":tokens}), &original).is_err());
+        for (user, subject, email) in [("other", "subject", "fixture@example.com"), ("user", "other", "fixture@example.com"), ("user", "subject", "other@example.com")] {
+            let mut wrong = tokens.clone();
+            let key = if email == "other@example.com" { "id_token" } else { "access_token" };
+            wrong[key] = json!(expired_token(user, subject, email));
+            assert!(validate_existing_binding(&wrong, &original).is_err());
+        }
+        for invalid in ["not-a-token", "fixture.e30.signature"] {
+            let mut wrong = tokens.clone();
+            wrong["access_token"] = json!(invalid);
+            assert!(validate_existing_binding(&wrong, &original).is_err());
+        }
+    }
     fn token(user: &str, subject: &str) -> String {
         let value = json!({"email":"fixture@example.com","sub":subject,"exp":now()/1000+3600,AUTH:{"user_id":user}});
         format!(
