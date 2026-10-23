@@ -130,12 +130,18 @@ export function useReauthManager() {
   const pageCandidates = computed(() => visible.value)
   const pageSelected = computed(() => !!pageCandidates.value.length && pageCandidates.value.every(a => selected.value.includes(a.id)))
   const pageIndeterminate = computed(() => !pageSelected.value && pageCandidates.value.some(a => selected.value.includes(a.id)))
+  const allSelected = computed(() => !!filtered.value.length && filtered.value.every(a => selected.value.includes(a.id)))
+  const allIndeterminate = computed(() => !allSelected.value && filtered.value.some(a => selected.value.includes(a.id)))
   const chosen = computed(() => accounts.value.filter(a => selected.value.includes(a.id)))
   const reauthChosen = computed(() => chosen.value.filter(ready))
   watch([search, plan, filter, pageSize], () => page.value = 1)
   watch(() => filtered.value.length, n => { page.value = Math.min(page.value, Math.max(1, Math.ceil(n / pageSize.value))) })
   function selectOne(id: string, checked: boolean) { selected.value = checked ? [...new Set([...selected.value, id])] : selected.value.filter(v => v !== id) }
   function selectPage(checked: boolean) { for (const a of pageCandidates.value) selectOne(a.id, checked) }
+  function selectAll(checked: boolean) {
+    const ids = new Set(filtered.value.map(a => a.id))
+    selected.value = checked ? [...new Set([...selected.value, ...ids])] : selected.value.filter(id => !ids.has(id))
+  }
   function receiveJobs(next: Job[]) {
     const changed = next.some(j => !isActive(j) && jobs.value.some(old => old.requestId === j.requestId && isActive(old)))
     jobs.value = next
@@ -232,5 +238,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
-  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, chosen, reauthChosen, selectOne, selectPage, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }
