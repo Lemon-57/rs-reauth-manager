@@ -113,7 +113,14 @@ async function callback(meta,payload) {
    if(groupMode==='duplicate')items.push({id:'duplicate-pro',name:'GPT Pro',enabled:true})
    dataReply={items,page:{total:items.length}}
   }else if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
-  else if(url.pathname==='/api/admin/accounts/detail')dataReply={account:accounts.find(a=>a.id===url.searchParams.get('accountId')),credentialConfiguration:{transport:'http'}}
+  else if(url.pathname==='/api/admin/accounts/detail') {
+   const a=accounts.find(a=>a.id===url.searchParams.get('accountId'))
+   if(a.id.startsWith('up_projection_')&&nativeMaterials.has(a.id)) {
+    a.planType='team'
+    if(a.id==='up_projection_control')a.weight=99
+   }
+   dataReply={account:a,credentialConfiguration:{transport:'http'}}
+  }
   else if(url.pathname==='/api/admin/accounts/export') {
    assert.equal(url.searchParams.get('confirm'),'export_sensitive_accounts');const id=url.searchParams.get('accountIds');assert.ok(!id.includes(','))
    dataReply={documents:[{provider:'openai',document:{accounts:[{id,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'+(id.startsWith('new_')?'/':'')}]}}]}
@@ -255,7 +262,35 @@ async function verifyDurableBatches() {
 }
 try {
  await start()
- if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
+ if(process.env.RS_REAUTH_TEST_CASE==='team-consistency') {
+  for(const id of ['up_projection_ok','up_projection_control','saved_team_ok','saved_team_wrong_user','saved_team_wrong_email','saved_team_wrong_subject','saved_team_wrong_workspace']) {
+   const a=add(id);a.enabled=false;a.status='disabled';a.planType=id.startsWith('up_')?'free':'team';credentials.set(id,credential(a))
+   if(id.startsWith('saved_')) {
+    const c=credential(a,'team-workspace','team');c.facts.material.principal=null
+    if(id!=='saved_team_ok') {
+     const p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'))
+     if(id.endsWith('user'))p[AUTH].chatgpt_user_id='other-user'
+     if(id.endsWith('email')) { const ip=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'));ip.email='other@example.com';c.facts.material.id_token=jwt(ip) }
+     if(id.endsWith('subject'))p.sub='other-subject'
+     if(id.endsWith('workspace'))p[AUTH].chatgpt_account_id='other-team'
+     c.facts.material.access_token=jwt(p)
+    }
+    credentials.set(id,c);nativeMaterials.set(id,structuredClone(c.facts.material))
+   }
+   const n=completes.length;await submit([id]);const done=await finish(id)
+   if(id==='up_projection_ok'||id==='saved_team_ok') {
+    assert.equal(done.status,'success',done.message);assert.equal(a.accountId,'team-workspace');assert.equal(a.planType,'team');assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro']);assert.equal(completes.length,n+1)
+    assert.equal(a.enabled,id==='up_projection_ok');assert.ok(refreshes.includes(id))
+   } else {
+    assert.ok(['failed','review'].includes(done.status),done.message);assert.equal(a.enabled,false)
+    assert.equal(completes.length,n+(id==='up_projection_control'?1:0))
+    if(id==='up_projection_control')assert.equal(a.weight,99)
+   }
+   const counts=[starts.length,completes.length,metadataSaves.length];await tick();assert.deepEqual([starts.length,completes.length,metadataSaves.length],counts)
+   check(id+': verified Team metadata reconciles without replacing token material or replaying OAuth')
+  }
+  await stop();console.log(`Verified ${passed} Team consistency scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
   await verifyDurableBatches();await stop();console.log(`Verified ${passed} durable batch scenarios`)
  } else if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
   await verifyExpiredExistingBindings();await stop();console.log(`Verified ${passed} expired existing-account native OAuth scenarios`)

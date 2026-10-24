@@ -740,7 +740,9 @@ impl Manager {
             host::save(host, &queue, version).await?;
             let result=async {
                 self.runtime.prepare().await?;
-                let job=&queue.jobs[position];let a=detail(host,&job.account_id).await?;
+                let job=&queue.jobs[position];
+                native::reconcile_saved_team(host, job).await?;
+                let a=detail(host,&job.account_id).await?;
                 require_idle(&a)?;
                 if job.expected_revision.is_some_and(|revision| a["_credentialRevision"].as_u64() != Some(revision)) { return Err(fault("导入后凭据版本已变化，未重新登录")); }
                 if job.automatic && (!control::enabled(host, queue.automation.enabled).await? || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {

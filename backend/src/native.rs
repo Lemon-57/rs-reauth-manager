@@ -25,6 +25,106 @@ fn final_status_confirmed(status: &Value) -> bool {
     )
 }
 
+// 接受原生保存所投影的已验证套餐/工作区，其他控制字段仍逐项一致
+fn native_settings_match(actual: &Value, expected: &Value, workspace: &str, plan: &str) -> bool {
+    let mut actual = settings(actual);
+    for (key, verified) in [("accountId", workspace), ("planType", plan)] {
+        if actual[key] != expected[key] && actual[key].as_str() != Some(verified) {
+            return false;
+        }
+        actual[key] = expected[key].clone();
+    }
+    actual == *expected
+}
+
+// 仅在显式手动任务中补齐已保存 Team 凭据的元数据，不登录、不交换或恢复旧 RT
+pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), PluginFault> {
+    if job.automatic {
+        return Ok(());
+    }
+    let before = detail(host, &job.account_id).await?;
+    require_idle(&before)?;
+    let original = settings(&before);
+    let mut saved = recovery::credential(host, &job.account_id).await?;
+    let Ok(identity) = recovery::claims(
+        recovery::tokens(&saved)["id_token"]
+            .as_str()
+            .unwrap_or_default(),
+    ) else {
+        return Ok(());
+    };
+    let auth = &identity["https://api.openai.com/auth"];
+    let workspace = auth["chatgpt_account_id"].as_str().unwrap_or_default();
+    let plan = auth["chatgpt_plan_type"].as_str().unwrap_or_default();
+    if !matches!(plan, "team" | "business")
+        || workspace.is_empty()
+        || (original["accountId"] == workspace && original["planType"] == plan)
+    {
+        return Ok(());
+    }
+    if before["enabled"] != false {
+        return Err(fault("已保存 Team 工作区待核对，请先暂停账号"));
+    }
+    let subject = recovery::validate_binding(&recovery::tokens(&saved), &original)?;
+    if saved
+        .facts
+        .material
+        .get("principal")
+        .and_then(|v| v["oauth_subject"].as_str())
+        .is_some_and(|v| v != subject)
+    {
+        return Err(fault("已保存 Team 凭据主体不一致，未修正元数据"));
+    }
+    let mut target = original.clone();
+    target["accountId"] = json!(workspace);
+    target["planType"] = json!(plan);
+    recovery::validate(
+        &json!({"event":"same_workspace","workspaceId":workspace,"originalWorkspaceId":workspace,"tokens":recovery::tokens(&saved)}),
+        &target,
+    )?;
+    let guard = detail(host, &job.account_id).await?;
+    require_idle(&guard)?;
+    if settings(&guard) != original
+        || guard["_credentialRevision"].as_u64() != Some(saved.credential_revision)
+    {
+        return Err(fault("补齐 Team 元数据前配置或凭据变化，未写入"));
+    }
+    saved.facts.upstream_account_id = Some(workspace.to_owned());
+    saved.facts.plan_type = Some(plan.to_owned());
+    saved.facts.material.insert(
+        "principal".into(),
+        json!({"oauth_subject":subject,"poid":null}),
+    );
+    let request = AuthSaveRequest::Replace {
+        account_id: job.account_id.clone(),
+        credential_revision: saved.credential_revision,
+        facts: saved.facts.clone(),
+    };
+    crate::executor::check(host).await?;
+    let reply = host
+        .call(
+            "host.auth.save",
+            json!({}),
+            serde_json::to_vec(&request).map_err(|_| fault("Team 元数据请求无效"))?,
+        )
+        .await
+        .map_err(|_| fault("Team 元数据保存未确认，请回读，未重放"))?;
+    let result: AuthSaveResult =
+        serde_json::from_slice(&reply.payload).map_err(|_| fault("Team 元数据回执未确认"))?;
+    let read = recovery::credential(host, &job.account_id).await?;
+    let after = detail(host, &job.account_id).await?;
+    if result.account_id != job.account_id
+        || result.credential_revision != saved.credential_revision + 1
+        || read.credential_revision != result.credential_revision
+        || settings(&after) != target
+        || serde_json::to_value(read.facts).map_err(|_| fault("Team 元数据读回失败"))?
+            != serde_json::to_value(saved.facts).map_err(|_| fault("Team 元数据读回失败"))?
+    {
+        return Err(fault("Team 元数据读回未确认，账号保持暂停"));
+    }
+    Ok(())
+}
+
 pub async fn restore(
     host: &HostClient,
     id: &str,
@@ -180,8 +280,7 @@ pub async fn complete(
     let after = detail(host, &job.account_id).await?;
     require_idle(&after)?;
     let mut saved = recovery::credential(host, &job.account_id).await?;
-    if settings(&after) != expected
-        || after["_credentialRevision"].as_u64() != Some(old.credential_revision + 1)
+    if after["_credentialRevision"].as_u64() != Some(old.credential_revision + 1)
         || saved.credential_revision != old.credential_revision + 1
     {
         return Err(fault(
@@ -219,10 +318,13 @@ pub async fn complete(
         .ok_or_else(|| fault("原生授权套餐缺失"))?
         .trim()
         .to_ascii_lowercase();
+    if !native_settings_match(&after, &expected, actual, &plan) {
+        return Err(fault("原生保存后账号控制配置变化，账号保持暂停"));
+    }
     if event != "complete" {
         let guard = detail(host, &job.account_id).await?;
         require_idle(&guard)?;
-        if settings(&guard) != expected
+        if !native_settings_match(&guard, &expected, actual, &plan)
             || guard["_credentialRevision"].as_u64() != Some(saved.credential_revision)
         {
             return Err(fault("工作区元数据写回前配置或凭据变化，账号保持暂停"));
@@ -274,6 +376,10 @@ pub async fn complete(
     }
     let verified = detail(host, &job.account_id).await?;
     require_idle(&verified)?;
+    if event == "complete" {
+        expected["accountId"] = json!(actual);
+        expected["planType"] = json!(plan);
+    }
     if settings(&verified) != expected
         || verified["_credentialRevision"].as_u64() != Some(saved.credential_revision)
     {
