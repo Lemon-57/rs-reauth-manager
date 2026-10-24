@@ -100,7 +100,26 @@ fn decode_claims(token: &str, require_fresh: bool) -> Result<Value, PluginFault>
     Ok(claims)
 }
 
+pub(crate) fn existing_claims(token: &str) -> Result<Value, PluginFault> {
+    decode_claims(token, false)
+}
+
+pub(crate) fn validate_existing(
+    output: &Value,
+    original: &Value,
+) -> Result<(Value, Value), PluginFault> {
+    validate_with_expiry(output, original, false)
+}
+
 pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFault> {
+    validate_with_expiry(output, original, true)
+}
+
+fn validate_with_expiry(
+    output: &Value,
+    original: &Value,
+    fresh: bool,
+) -> Result<(Value, Value), PluginFault> {
     let workspace = text(output, "workspaceId")?;
     let user = text(original, "userId")?;
     let email = text(original, "email")?;
@@ -136,8 +155,8 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
         return Err(fault(IDENTITY_ERROR));
     }
     text(&output["tokens"], "refresh_token")?;
-    let identity = claims(text(&output["tokens"], "id_token")?)?;
-    let access = claims(text(&output["tokens"], "access_token")?)?;
+    let identity = decode_claims(text(&output["tokens"], "id_token")?, fresh)?;
+    let access = decode_claims(text(&output["tokens"], "access_token")?, fresh)?;
     text(&identity, "sub")?;
     let token_email = identity["email"]
         .as_str()

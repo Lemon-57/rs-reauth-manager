@@ -46,7 +46,7 @@ pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), Pl
     require_idle(&before)?;
     let original = settings(&before);
     let mut saved = recovery::credential(host, &job.account_id).await?;
-    let Ok(identity) = recovery::claims(
+    let Ok(identity) = recovery::existing_claims(
         recovery::tokens(&saved)["id_token"]
             .as_str()
             .unwrap_or_default(),
@@ -68,7 +68,7 @@ pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), Pl
     if before["enabled"] != false {
         return Err(fault("已保存 Team 工作区待核对，请先暂停账号"));
     }
-    let subject = recovery::validate_binding(&recovery::tokens(&saved), &original)?;
+    let subject = recovery::validate_existing_binding(&recovery::tokens(&saved), &original)?;
     if saved
         .facts
         .material
@@ -81,7 +81,7 @@ pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), Pl
     let mut target = original.clone();
     target["accountId"] = json!(workspace);
     target["planType"] = json!(plan);
-    recovery::validate(
+    recovery::validate_existing(
         &json!({"event":"same_workspace","workspaceId":workspace,"originalWorkspaceId":workspace,"tokens":recovery::tokens(&saved)}),
         &target,
     )?;
