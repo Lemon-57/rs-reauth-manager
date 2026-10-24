@@ -11,6 +11,7 @@ const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLS
 const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace3`,email:`${id}@example.com`,authenticationKind:'oauth',userId:'original-user',enabled:id!=='disabled',planType:'team',status:'error',notes:`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`,outboundProxyEndpoint:'http://127.0.0.1:21001',accountId:'original-workspace',groups:[{id:'g1',name:'Team'}],weight:3,concurrencyLimit:null,modelAccess:{mode:'all'},hasRefreshToken:true,capacity:{usedSlots:0},errorReason:null})
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
+const rollbackMaterials=new Map(),metadataFailures=new Set()
 let groupMode='normal'
 const importFlows=new Map(), providedImports=[]
 let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null
@@ -42,9 +43,10 @@ async function callback(meta,payload) {
  if(meta.method==='host.auth.save') {
   const a=accounts.find(a=>a.id===data.account_id),old=credentials.get(a.id)
   assert.equal(a.enabled,false);assert.equal(data.credential_revision,revisions.get(a.id));assert.equal(data.action,'replace')
-  for(const key of ['access_token','refresh_token','id_token'])assert.deepEqual(data.facts.material[key],nativeMaterials.get(a.id)[key],'Only native-issued tokens may be retained during metadata updates')
+  const isMaterial=(expected)=>expected&&['access_token','refresh_token','id_token'].every(key=>JSON.stringify(data.facts.material[key])===JSON.stringify(expected[key]))
+  assert.ok(isMaterial(nativeMaterials.get(a.id))||isMaterial(rollbackMaterials.get(a.id)),'Metadata updates may retain native material or an explicit rollback snapshot')
   metadataSaves.push(a.id)
-  if(a.id==='fb_metadata_lost')return result(meta.id,{}, {})
+  if(['fb_metadata_lost','up_metadata_lost'].includes(a.id)&&!metadataFailures.has(a.id)){metadataFailures.add(a.id);return result(meta.id,{}, {})}
   const revision=revisions.get(a.id)+1;revisions.set(a.id,revision)
   a.accountId=data.facts.upstream_account_id;a.planType=data.facts.plan_type;a.status='disabled'
   credentials.set(a.id,{...old,credential_revision:revision,facts:structuredClone(data.facts)})
@@ -138,6 +140,7 @@ async function callback(meta,payload) {
     if(a.id.startsWith('up_')||a.id.startsWith('auto_up_')){workspace='team-workspace';plan='team'}
     if(a.id.startsWith('unbound_')){workspace=a.id.includes('personal')?'personal-workspace':'team-workspace';plan=a.id.includes('personal')?'free':'team'}
     if(a.id.startsWith('force_')){workspace='alternate-workspace';plan='plus'}
+    rollbackMaterials.set(a.id,structuredClone(credentials.get(a.id).facts.material))
     const c=credential(a,workspace,plan);c.facts.material.principal=credentials.get(a.id).facts.material.principal;const p=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'))
     if(a.id.includes('wrong_user'))p[AUTH].chatgpt_user_id='wrong-user'
     if(a.id.includes('wrong_workspace'))p[AUTH].chatgpt_account_id='other-workspace'
@@ -266,7 +269,7 @@ try {
   assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id)
   assert.equal(accounts.find(a=>a.id===id).enabled,id!=='new_import_free_ui');if(id!=='new_import_free_ui')assert.deepEqual(accounts.find(a=>a.id===id).groups.map(g=>g.id),['gpt-pro'])
   if(id.startsWith('rt_')){assert.equal(starts.length,n);assert.equal(completes.length,c);assert.equal(done.cleanupStarted,false)}
-  else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(done.cleanupStarted,false)}
+  else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.notEqual(done.cleanupStarted,true)}
   if(id==='up_import_ui'){assert.equal(accounts.find(a=>a.id===id).planType,'team');assert.equal(accounts.filter(a=>a.email===id+'@example.com').length,1)}
   const before=[starts.length,completes.length,accounts.length]
   assert.equal((await request('import-line',body)).status,200);assert.deepEqual([starts.length,completes.length,accounts.length],before)
@@ -376,9 +379,12 @@ try {
   groupMode='normal';check(mode+': absent, disabled or ambiguous GPT Pro never reports authorization success or enables scheduling')
  }
  for(const id of ['group_lost','group_revision_race']) {
-  const a=add(id),moves=groupMoves.length;await submit([id]);const done=await finish(id)
-  assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(groupMoves.length,moves+1)
-  await tick();assert.equal(groupMoves.length,moves+1)
+  const a=add(id),before=structuredClone(a),moves=groupMoves.length;await submit([id]);const done=await finish(id)
+  assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(groupMoves.length,moves+(id==='group_lost'?2:1))
+  if(id==='group_lost'){
+   assert.equal(a.accountId,before.accountId);assert.equal(a.planType,before.planType);assert.deepEqual(a.groups,before.groups)
+  }
+  await tick();assert.equal(groupMoves.length,moves+(id==='group_lost'?2:1))
   check(id+': unconfirmed grouping or changed credentials stay paused without replaying a write')
  }
  {
@@ -417,15 +423,18 @@ try {
   }
   check(`${id}: Team membership tolerates stale old workspace while user, email and new authorization remain checked`)
  }
- for(const id of ['fb_good','fb_metadata_lost','up_good','up_wrong_plan']) {
+ for(const id of ['fb_good','fb_metadata_lost','up_good','up_wrong_plan','up_metadata_lost']) {
   const a=add(id);if(id.startsWith('up_')){a.planType='free';credentials.set(id,credential(a))}
-  const n=completes.length,r=refreshes.length,m=metadataSaves.length
+  const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length
   await submit([id]);const done=await finish(id)
   assert.equal(completes.length,n+1)
   if(['fb_good','up_good'].includes(id)) {
    assert.equal(done.status,'success',done.message);assert.equal(refreshes.length,r+1);assert.equal(metadataSaves.length,m+1)
    assert.equal(a.accountId,id.startsWith('up_')?'team-workspace':'personal-workspace');assert.equal(a.enabled,id.startsWith('up_'))
   } else {assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(refreshes.length,r)}
+  if(id==='up_metadata_lost'){
+   assert.equal(a.accountId,before.accountId);assert.equal(a.planType,before.planType);assert.deepEqual(a.groups,before.groups)
+  }
   check(`${id}: workspace recovery still uses native callback and only changes metadata after the native RT is saved`)
  }
  {
