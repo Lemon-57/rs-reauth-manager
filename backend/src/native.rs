@@ -25,42 +25,6 @@ fn final_status_confirmed(status: &Value) -> bool {
     )
 }
 
-fn group_ids(value: &Value) -> Result<Vec<String>, PluginFault> {
-    let groups = value.as_array().ok_or_else(|| fault("账号分组格式无效，回滚未确认"))?;
-    let mut ids = groups.iter().map(|group| {
-        group["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned)
-            .ok_or_else(|| fault("账号分组身份无效，回滚未确认"))
-    }).collect::<Result<Vec<_>, _>>()?;
-    ids.sort();
-    ids.dedup();
-    if ids.len() != groups.len() { return Err(fault("账号分组重复，回滚未确认")); }
-    Ok(ids)
-}
-
-async fn rollback_after_native_save(
-    host: &HostClient,
-    id: &str,
-    original: &Value,
-    old: &gateway_plugin_sdk::call::host::AuthCredential,
-) -> Result<(), PluginFault> {
-    let current=detail(host,id).await?;require_idle(&current)?;
-    let current_credential=recovery::credential(host,id).await?;
-    let request=AuthSaveRequest::Replace{account_id:id.to_owned(),credential_revision:current_credential.credential_revision,facts:old.facts.clone()};
-    crate::executor::check(host).await?;
-    let reply=host.call("host.auth.save",json!({}),serde_json::to_vec(&request).map_err(|_|fault("凭据回滚请求无效"))?).await.map_err(|_|fault("凭据回滚结果不确定"))?;
-    let result:AuthSaveResult=serde_json::from_slice(&reply.payload).map_err(|_|fault("凭据回滚结果未确认"))?;
-    if result.account_id!=id||result.credential_revision!=current_credential.credential_revision+1{return Err(fault("凭据回滚版本未确认"));}
-    let groups=group_ids(&original["groups"])?;
-    admin(host,"POST","/api/admin/accounts/batch-update",Some(json!({"accountIds":[id],"groupIds":groups}))).await.map_err(|_|fault("原账号分组回滚结果不确定"))?;
-    let after=detail(host,id).await?;require_idle(&after)?;
-    let mut expected=original.clone();expected["enabled"]=json!(false);
-    let actual_groups=group_ids(&after["groups"])?;let expected_groups=group_ids(&expected["groups"])?;
-    let mut actual_without_groups=settings(&after);let mut expected_without_groups=expected.clone();
-    actual_without_groups["groups"]=json!([]);expected_without_groups["groups"]=json!([]);
-    if actual_groups!=expected_groups||actual_without_groups!=settings(&expected_without_groups)||after["_credentialRevision"].as_u64()!=Some(result.credential_revision){return Err(fault("原账号回滚完整读回失败"));}
-    Ok(())
-}
-
 pub async fn restore(
     host: &HostClient,
     id: &str,
@@ -210,11 +174,20 @@ pub async fn complete(
             error.message
         ))
     })?;
-    let post_native = Box::pin(async {
-        if done["accountId"] != job.account_id { return Err(fault("原生 OAuth 返回账号不一致，账号保持暂停")); }
-        let after=detail(host,&job.account_id).await?;require_idle(&after)?;
-        let mut saved=recovery::credential(host,&job.account_id).await?;
-        if settings(&after)!=expected||after["_credentialRevision"].as_u64()!=Some(old.credential_revision+1)||saved.credential_revision!=old.credential_revision+1{return Err(fault("原生 OAuth 保存后的配置或精确凭据版本未确认，账号保持暂停"));}
+    if done["accountId"] != job.account_id {
+        return Err(fault("原生 OAuth 返回账号不一致，账号保持暂停"));
+    }
+    let after = detail(host, &job.account_id).await?;
+    require_idle(&after)?;
+    let mut saved = recovery::credential(host, &job.account_id).await?;
+    if settings(&after) != expected
+        || after["_credentialRevision"].as_u64() != Some(old.credential_revision + 1)
+        || saved.credential_revision != old.credential_revision + 1
+    {
+        return Err(fault(
+            "原生 OAuth 保存后的配置或精确凭据版本未确认，账号保持暂停",
+        ));
+    }
     let tokens = recovery::tokens(&saved);
     let identity = recovery::claims(
         tokens["id_token"]
@@ -332,16 +305,7 @@ pub async fn complete(
     } else {
         message.into()
     };
-        Ok::<(String,bool),PluginFault>((message,free))
-    }).await;
-    match post_native {
-        Ok(result)=>Ok(result),
-        Err(error)=>{
-            if rollback_after_native_save(host,&job.account_id,&original,&old).await.is_ok(){
-                Err(fault(&format!("{}；已回滚本次原生凭据及工作区元数据，账号保持暂停",error.message)))
-            }else{Err(fault("原生授权后处理失败且回滚未确认，账号保持暂停，请人工核对"))}
-        }
-    }
+    Ok((message, free))
 }
 
 async fn complete_new_account(
