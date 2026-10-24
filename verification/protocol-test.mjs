@@ -263,11 +263,12 @@ async function verifyDurableBatches() {
 try {
  await start()
  if(process.env.RS_REAUTH_TEST_CASE==='team-consistency') {
-  for(const id of ['up_projection_ok','up_projection_control','saved_team_ok','saved_team_wrong_user','saved_team_wrong_email','saved_team_wrong_subject','saved_team_wrong_workspace']) {
+  for(const id of ['up_projection_ok','up_projection_control','saved_team_ok','saved_team_projected','saved_team_wrong_user','saved_team_wrong_email','saved_team_wrong_subject','saved_team_wrong_workspace']) {
    const a=add(id);a.enabled=false;a.status='disabled';a.planType=id.startsWith('up_')?'free':'team';credentials.set(id,credential(a))
    if(id.startsWith('saved_')) {
     const c=credential(a,'team-workspace','team');c.facts.material.principal=null
-    if(id!=='saved_team_ok') {
+    if(id==='saved_team_projected') { a.accountId='team-workspace'; c.facts.upstream_account_id='old-workspace'; }
+    if(!['saved_team_ok','saved_team_projected'].includes(id)) {
      const p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'))
      if(id.endsWith('user'))p[AUTH].chatgpt_user_id='other-user'
      if(id.endsWith('email')) { const ip=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'));ip.email='other@example.com';c.facts.material.id_token=jwt(ip) }
@@ -278,7 +279,7 @@ try {
     credentials.set(id,c);nativeMaterials.set(id,structuredClone(c.facts.material))
    }
    const n=completes.length;await submit([id]);const done=await finish(id)
-   if(id==='up_projection_ok'||id==='saved_team_ok') {
+   if(id==='up_projection_ok'||['saved_team_ok','saved_team_projected'].includes(id)) {
     assert.equal(done.status,'success',done.message);assert.equal(a.accountId,'team-workspace');assert.equal(a.planType,'team');assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro']);assert.equal(completes.length,n+1)
     assert.equal(a.enabled,id==='up_projection_ok');assert.ok(refreshes.includes(id))
    } else {

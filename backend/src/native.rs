@@ -58,7 +58,10 @@ pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), Pl
     let plan = auth["chatgpt_plan_type"].as_str().unwrap_or_default();
     if !matches!(plan, "team" | "business")
         || workspace.is_empty()
-        || (original["accountId"] == workspace && original["planType"] == plan)
+        || (original["accountId"] == workspace
+            && original["planType"] == plan
+            && saved.facts.upstream_account_id.as_deref() == Some(workspace)
+            && saved.facts.plan_type.as_deref() == Some(plan))
     {
         return Ok(());
     }
