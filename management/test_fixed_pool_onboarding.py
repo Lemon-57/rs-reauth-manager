@@ -236,6 +236,51 @@ class OnboardingTests(unittest.TestCase):
         started = self.start()
         self.adapter.call('/api/admin/accounts/oauth/complete', {}, self.body(started))
 
+    def test_busy_allocator_waits_before_reserving_and_starts_native_once(self):
+        attempts = []
+        @contextlib.contextmanager
+        def lock(_):
+            attempts.append(True)
+            if len(attempts) < 3:
+                raise BlockingIOError()
+            yield
+        self.module.allocation_lock = lock
+        with patch('fixed_pool_onboarding.time.sleep'):
+            self.start()
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(self.manager.rows()), 1)
+        self.assertEqual(sum(path.endswith('/oauth/start') for path, _ in self.calls), 1)
+
+    def test_busy_complete_does_not_mark_native_pending_before_lock(self):
+        started = self.start()
+        @contextlib.contextmanager
+        def busy(_):
+            raise BlockingIOError()
+            yield
+        self.module.allocation_lock = busy
+        with patch('fixed_pool_onboarding.time.monotonic', side_effect=[0, 21]):
+            with self.assertRaises(Rejected) as failure:
+                self.adapter.call('/api/admin/accounts/oauth/complete', {}, self.body(started))
+        self.assertEqual(failure.exception.status, 409)
+        receipt = json.loads(self.adapter.receipt_path('fixture@example.com').read_text())
+        self.assertEqual(receipt['phase'], 'native_started')
+        self.assertFalse(any(path.endswith('/oauth/complete') for path, _ in self.calls))
+
+    def test_exception_inside_held_lock_is_not_retried(self):
+        started = self.start()
+        real = self.backend
+        def backend(path, *args):
+            if path.endswith('/oauth/complete'):
+                self.calls.append((path, None))
+                raise BlockingIOError()
+            return real(path, *args)
+        self.adapter.backend = backend
+        with self.assertRaises(BlockingIOError):
+            self.adapter.call('/api/admin/accounts/oauth/complete', {}, self.body(started))
+        self.assertEqual(sum(path.endswith('/oauth/complete') for path, _ in self.calls), 1)
+        receipt = json.loads(self.adapter.receipt_path('fixture@example.com').read_text())
+        self.assertEqual(receipt['phase'], 'native_complete_pending')
+
 
 if __name__ == '__main__':
     unittest.main()

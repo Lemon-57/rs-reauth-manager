@@ -56,6 +56,29 @@ class Adapter:
         self.identity_mapping = Path(identity_mapping) if identity_mapping else None
         self.lock = threading.RLock()
 
+    @contextlib.contextmanager
+    def allocation_lock(self):
+        # The live allocator deliberately uses LOCK_NB. Contention is normal;
+        # wait before any reservation or native request, never replay a request.
+        deadline = time.monotonic() + 20
+        while True:
+            lock = self.module.allocation_lock(self.manager.root / 'private/allocation.lock')
+            try:
+                lock.__enter__()
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Rejected(409) from None
+                time.sleep(0.1)
+                continue
+            break
+        try:
+            yield
+        except BaseException as error:
+            if not lock.__exit__(type(error), error, error.__traceback__):
+                raise
+        else:
+            lock.__exit__(None, None, None)
+
     def backend(self, path, headers, body=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.gateway_port, timeout=120)
         allowed = {'cookie', 'authorization', 'x-api-key', 'origin', 'x-csrf-token'}
@@ -114,7 +137,7 @@ class Adapter:
         if path.exists():
             # Including after process restart or an uncertain native start/complete.
             raise Rejected()
-        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
+        with self.allocation_lock():
             if (self.manager.root / 'private/pending.json').exists():
                 raise Rejected()
             rows = self.manager.rows()
@@ -192,11 +215,11 @@ class Adapter:
             raise Rejected()
         entry = entries[0]
         self.verify_exit(entry)
-        receipt['phase'] = 'native_complete_pending'
-        atomic(path, receipt)
         # Keep the existing background allocator from racing native persistence
         # and assigning the new account a second identity before binding finishes.
-        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
+        with self.allocation_lock():
+            receipt['phase'] = 'native_complete_pending'
+            atomic(path, receipt)
             result = self.backend('/api/admin/accounts/oauth/complete', headers, body)
             receipt.update({'phase': 'native_saved', 'accountId': result['accountId']})
             atomic(path, receipt)
@@ -251,9 +274,9 @@ class Adapter:
             raise Rejected()
         path, receipt, entry = self.reserve(email, str(uuid.uuid4()), {row['id'] for row in rows})
         self.verify_exit(entry)
-        receipt['phase'] = 'native_import_pending'
-        atomic(path, receipt)
-        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
+        with self.allocation_lock():
+            receipt['phase'] = 'native_import_pending'
+            atomic(path, receipt)
             result = self.backend('/api/admin/accounts/import', headers, {**body,
                 'data': {**data, 'outboundProxyUrl': self.url(entry)}, 'settings': {**settings, 'concurrencyLimit': 3}})
             ids = result.get('accountIds')
