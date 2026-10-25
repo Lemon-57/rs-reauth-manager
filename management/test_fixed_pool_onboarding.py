@@ -35,14 +35,15 @@ class OnboardingTests(unittest.TestCase):
         if path.endswith('/oauth/start'):
             self.flow += 1
             return {'flowId': str(self.flow), 'authorizationUrl': 'https://fixture.invalid/authorize'}
-        if path.endswith('/oauth/complete'):
+        if path.endswith('/oauth/complete') or path.endswith('/accounts/import'):
             entry = self.manager.rows()[-1]
             self.account = {'id': 'fixture-account', 'email': entry['email'], 'enabled': False,
                 'provider': 'openai', 'authenticationKind': 'oauth', 'notes': body['settings']['notes'],
                 'outboundProxyEndpoint': f"http://{entry['host']}:{entry['port']}",
-                'hasRefreshToken': True, 'capacity': {'usedSlots': 0}, 'userId': 'fixture-user', 'accountId': 'fixture-workspace'}
+                'hasRefreshToken': True, 'concurrencyLimit': body['settings'].get('concurrencyLimit'),
+                'capacity': {'usedSlots': 0}, 'userId': 'fixture-user', 'accountId': 'fixture-workspace'}
             self.accounts.append(self.account)
-            return {'accountId': self.account['id']}
+            return {'accountIds': [self.account['id']]} if path.endswith('/accounts/import') else {'accountId': self.account['id']}
         if path.startswith('/api/admin/accounts/detail?'):
             return {'account': self.account}
         raise AssertionError('unexpected backend path')
@@ -158,6 +159,82 @@ class OnboardingTests(unittest.TestCase):
                 else:
                     with self.assertRaises(Rejected):
                         adapter.backend('/fixture', {})
+
+    def test_new_native_account_explicitly_sets_and_reads_back_three_concurrency(self):
+        started = self.start()
+        body = self.body(started)
+        body['settings']['concurrencyLimit'] = None
+        self.adapter.call('/api/admin/accounts/oauth/complete', {}, body)
+        self.assertEqual(self.account['concurrencyLimit'], 3)
+        self.assertIsNone(body['settings']['concurrencyLimit'])
+
+    def test_deleted_registrations_do_not_skew_current_account_balance(self):
+        atomic(self.manager.reg, [{'family': 4, 'email': 'old@example.com', 'rs_account_id': 'deleted'}] * 10)
+        self.start()
+        self.assertEqual(self.manager.rows()[-1]['family'], 4)
+
+    def test_pending_reservations_count_toward_balance(self):
+        atomic(self.manager.reg, [{'family': 4, 'email': 'pending@example.com', 'rs_account_id': None}])
+        self.start()
+        self.assertEqual(self.manager.rows()[-1]['family'], 6)
+
+    def import_body(self):
+        return {'provider': 'openai', 'data': {'email': 'fixture@example.com', 'refreshToken': 'fixture-rt'},
+            'settings': {'enabled': False, 'concurrencyLimit': None,
+                         'notes': 'fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP'}}
+
+    def test_provided_rt_uses_reserved_proxy_native_import_and_three_concurrency(self):
+        result = self.adapter.call('/api/admin/accounts/import', {}, self.import_body())
+        entry = self.manager.rows()[0]
+        self.assertEqual(result['accountIds'], [entry['rs_account_id']])
+        native = next(body for path, body in self.calls if path.endswith('/accounts/import'))
+        self.assertEqual(native['data']['outboundProxyUrl'], self.adapter.url(entry))
+        self.assertEqual(native['settings']['concurrencyLimit'], 3)
+        self.assertFalse(any(path.endswith('/oauth/start') for path, _ in self.calls))
+        receipt = self.adapter.receipt_path(entry['email']).read_text()
+        self.assertNotIn('fixture-rt', receipt)
+        self.assertNotIn('fixture-password', receipt)
+
+    def test_uncertain_rt_import_cannot_allocate_or_import_again(self):
+        real = self.backend
+        self.adapter.backend = lambda path, *args: (_ for _ in ()).throw(TimeoutError()) if path.endswith('/accounts/import') else real(path, *args)
+        with self.assertRaises(TimeoutError):
+            self.adapter.call('/api/admin/accounts/import', {}, self.import_body())
+        self.adapter.backend = self.backend
+        with self.assertRaises(Rejected):
+            self.adapter.call('/api/admin/accounts/import', {}, self.import_body())
+        self.assertEqual(len(self.manager.rows()), 1)
+
+    def test_binding_appends_optional_identity_mapping_without_changing_existing_entries(self):
+        mapping = self.root / 'mapping.json'
+        existing = {'target_rs_id': 'existing', 'management_id': 'existing-management'}
+        atomic(mapping, [existing])
+        self.adapter.identity_mapping = mapping
+        self.adapter.call('/api/admin/accounts/import', {}, self.import_body())
+        rows = json.loads(mapping.read_text())
+        self.assertEqual(rows[0], existing)
+        self.assertEqual(rows[1]['target_rs_id'], self.account['id'])
+        self.assertEqual(rows[1]['management_id'], self.manager.rows()[0]['management_id'])
+
+    def test_native_save_and_binding_share_the_background_allocator_lock(self):
+        held = []
+        @contextlib.contextmanager
+        def lock(_):
+            self.assertFalse(held)
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        real = self.backend
+        def backend(path, *args):
+            if path.endswith('/oauth/complete') or path.startswith('/api/admin/accounts/detail?'):
+                self.assertTrue(held)
+            return real(path, *args)
+        self.module.allocation_lock = lock
+        self.adapter.backend = backend
+        started = self.start()
+        self.adapter.call('/api/admin/accounts/oauth/complete', {}, self.body(started))
 
 
 if __name__ == '__main__':

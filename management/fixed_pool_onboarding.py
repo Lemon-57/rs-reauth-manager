@@ -46,13 +46,14 @@ def atomic(path, value):
 
 
 class Adapter:
-    def __init__(self, manager, pool_module, private, gateway_port, origin):
+    def __init__(self, manager, pool_module, private, gateway_port, origin, identity_mapping=None):
         self.manager = manager
         self.module = pool_module
         self.private = Path(private)
         self.private.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.gateway_port = gateway_port
         self.origin = origin
+        self.identity_mapping = Path(identity_mapping) if identity_mapping else None
         self.lock = threading.RLock()
 
     def backend(self, path, headers, body=None):
@@ -108,7 +109,7 @@ class Adapter:
     def receipt_path(self, email):
         return self.private / (hashlib.sha256(email.casefold().encode()).hexdigest() + '.json')
 
-    def reserve(self, email, request_id):
+    def reserve(self, email, request_id, account_ids):
         path = self.receipt_path(email)
         if path.exists():
             # Including after process restart or an uncertain native start/complete.
@@ -119,7 +120,10 @@ class Adapter:
             rows = self.manager.rows()
             if any(str(row.get('email') or '').casefold() == email.casefold() for row in rows):
                 raise Rejected()
-            counts = {family: sum(row['family'] == family for row in rows) for family in (4, 6)}
+            # Historical registrations remain valid identities, but do not count
+            # deleted accounts as current pool consumers. Pending reservations count.
+            current = [row for row in rows if not row.get('rs_account_id') or row['rs_account_id'] in account_ids]
+            counts = {family: sum(row['family'] == family for row in current) for family in (4, 6)}
             family = self.module.choose_family(counts)
             templates = json.loads((self.manager.root / 'private/pool.json').read_text())
             ports = {row['port'] for row in templates if row['family'] == family}
@@ -150,7 +154,7 @@ class Adapter:
         rows = self.directory(headers)
         if any(row.get('provider') == 'openai' and str(row.get('email') or '').casefold() == email.casefold() for row in rows):
             raise Rejected()
-        path, receipt, entry = self.reserve(email, request_id)
+        path, receipt, entry = self.reserve(email, request_id, {row['id'] for row in rows})
         self.verify_exit(entry)
         receipt['phase'] = 'native_start_pending'
         atomic(path, receipt)
@@ -179,6 +183,7 @@ class Adapter:
         fields = notes.split('----')
         if len(fields) != 3 or not all(fields) or fields[0].casefold() != receipt['email'].casefold():
             raise Rejected(422)
+        body = {**body, 'settings': {**settings, 'concurrencyLimit': 3}}
         rows = self.directory(headers)
         if any(row.get('provider') == 'openai' and str(row.get('email') or '').casefold() == receipt['email'].casefold() for row in rows):
             raise Rejected()
@@ -189,29 +194,74 @@ class Adapter:
         self.verify_exit(entry)
         receipt['phase'] = 'native_complete_pending'
         atomic(path, receipt)
-        result = self.backend('/api/admin/accounts/oauth/complete', headers, body)
-        receipt.update({'phase': 'native_saved', 'accountId': result['accountId']})
-        atomic(path, receipt)
-        account = self.backend('/api/admin/accounts/detail?accountId=' + urllib.parse.quote(result['accountId']), headers)['account']
+        # Keep the existing background allocator from racing native persistence
+        # and assigning the new account a second identity before binding finishes.
+        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
+            result = self.backend('/api/admin/accounts/oauth/complete', headers, body)
+            receipt.update({'phase': 'native_saved', 'accountId': result['accountId']})
+            atomic(path, receipt)
+            self.bind(headers, path, receipt, entry, result['accountId'], notes, rows)
+        return result
+
+    def bind(self, headers, path, receipt, entry, account_id, notes, rows):
+        account = self.backend('/api/admin/accounts/detail?accountId=' + urllib.parse.quote(account_id), headers)['account']
         expected_endpoint = f"http://{entry['host']}:{entry['port']}"
         if (account['enabled'] is not False or account['email'].casefold() != receipt['email'].casefold()
                 or account['notes'] != notes or account.get('provider') != 'openai'
-                or account.get('authenticationKind') != 'oauth'
+                or account.get('authenticationKind') != 'oauth' or account.get('concurrencyLimit') != 3
                 or account.get('outboundProxyEndpoint', '').rstrip('/') != expected_endpoint
                 or not account.get('hasRefreshToken') or account.get('capacity', {}).get('usedSlots') != 0
                 or not account.get('userId') or not account.get('accountId')
                 or any(row['id'] == account['id'] or (row.get('provider') == 'openai' and
                        (row.get('userId'), row.get('accountId')) == (account['userId'], account['accountId'])) for row in rows)):
             raise Rejected(502)
-        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
-            registered = self.manager.rows()
-            selected = next(row for row in registered if row['management_id'] == receipt['entryId'])
-            if selected.get('rs_account_id'):
+        registered = self.manager.rows()
+        selected = next(row for row in registered if row['management_id'] == receipt['entryId'])
+        if selected.get('rs_account_id'):
+            raise Rejected()
+        if self.identity_mapping:
+            mapping = json.loads(self.identity_mapping.read_text())
+            if not isinstance(mapping, list) or any(row.get('target_rs_id') == account['id'] or
+                    row.get('management_id') == entry['management_id'] for row in mapping):
                 raise Rejected()
-            selected.update({'rs_account_id': account['id'], 'user_id': account['userId']})
-            self.module.atomic(self.manager.reg, registered)
+            atomic(self.identity_mapping, mapping + [{'original_rs_id': account['id'],
+                'target_rs_id': account['id'], 'management_id': entry['management_id'],
+                'email': account['email'], 'user_id': account['userId'], 'workspace_id': account['accountId']}])
+        selected.update({'rs_account_id': account['id'], 'user_id': account['userId']})
+        self.module.atomic(self.manager.reg, registered)
         receipt.update({'phase': 'bound', 'nativeCompleteConfirmed': True})
         atomic(path, receipt)
+
+    def import_token(self, headers, body):
+        if set(body) != {'provider', 'data', 'settings'} or body['provider'] != 'openai':
+            raise Rejected(422)
+        data, settings = body['data'], body['settings']
+        if not isinstance(data, dict) or set(data) != {'email', 'refreshToken'} or not isinstance(settings, dict):
+            raise Rejected(422)
+        email, token, notes = data['email'], data['refreshToken'], settings.get('notes')
+        if (not isinstance(email, str) or email.count('@') != 1 or len(email) > 254 or any(c.isspace() for c in email)
+                or not isinstance(token, str) or not 1 <= len(token) <= 32768 or any(c.isspace() for c in token)
+                or settings.get('enabled') is not False or not isinstance(notes, str)):
+            raise Rejected(422)
+        fields = notes.split('----')
+        if len(fields) != 3 or not all(fields) or fields[0].casefold() != email.casefold():
+            raise Rejected(422)
+        rows = self.directory(headers)
+        if any(row.get('provider') == 'openai' and str(row.get('email') or '').casefold() == email.casefold() for row in rows):
+            raise Rejected()
+        path, receipt, entry = self.reserve(email, str(uuid.uuid4()), {row['id'] for row in rows})
+        self.verify_exit(entry)
+        receipt['phase'] = 'native_import_pending'
+        atomic(path, receipt)
+        with self.module.allocation_lock(self.manager.root / 'private/allocation.lock'):
+            result = self.backend('/api/admin/accounts/import', headers, {**body,
+                'data': {**data, 'outboundProxyUrl': self.url(entry)}, 'settings': {**settings, 'concurrencyLimit': 3}})
+            ids = result.get('accountIds')
+            if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str):
+                raise Rejected(502)
+            receipt.update({'phase': 'native_saved', 'accountId': ids[0]})
+            atomic(path, receipt)
+            self.bind(headers, path, receipt, entry, ids[0], notes, rows)
         return result
 
     def call(self, path, headers, body):
@@ -222,12 +272,24 @@ class Adapter:
                 return self.start(headers, body)
             if path == '/api/admin/accounts/oauth/complete':
                 return self.complete(headers, body)
+            if path == '/api/admin/accounts/import':
+                return self.import_token(headers, body)
             raise Rejected(404)
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
+
+    def do_GET(self):
+        status = 200 if self.path == '/health' else 404
+        raw = json.dumps({'code': status}).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(raw)
 
     def do_POST(self):
         status, document = 503, {'code': 503}
@@ -264,6 +326,7 @@ def main():
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--gateway-port', type=int, required=True)
+    parser.add_argument('--identity-mapping')
     args = parser.parse_args()
     if subprocess.check_output(['systemctl', 'is-active', args.manager_unit], text=True).strip() != 'active':
         raise RuntimeError('effective_pool_manager_unavailable')
@@ -278,7 +341,11 @@ def main():
     spec.loader.exec_module(module)
     os.umask(0o077)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    server.adapter = Adapter(module.Manager(args.pool_root), module, args.private, args.gateway_port, args.public_origin)
+    if args.identity_mapping:
+        mapping = Path(args.identity_mapping).resolve(strict=True)
+        if not isinstance(json.loads(mapping.read_text()), list):
+            raise RuntimeError('identity_mapping_invalid')
+    server.adapter = Adapter(module.Manager(args.pool_root), module, args.private, args.gateway_port, args.public_origin, args.identity_mapping)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     server.serve_forever()
 
