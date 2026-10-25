@@ -292,6 +292,39 @@ try {
    check(id+': verified Team metadata reconciles without replacing token material or replaying OAuth')
   }
   await stop();console.log(`Verified ${passed} Team consistency scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='import-row-limit') {
+  const row=i=>`large_import_${i}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`
+  for(const size of [101,200,201,242,500]) {
+   const requestId=randomUUID(),line=Array.from({length:size},(_,i)=>row(i)).join('\n')
+   const before=[starts.length,completes.length,providedImports.length]
+   const response=await request('import-line',{requestId,line,groupIds:[]})
+   assert.equal(response.status,200,JSON.stringify(response.value))
+   const batch=response.value.jobs.filter(j=>j.requestId.startsWith(requestId+':'))
+   assert.equal(batch.length,size);assert.ok(batch.every(j=>j.status==='queued'))
+   assert.deepEqual(batch.map(j=>j.importInfo.line),Array.from({length:size},(_,i)=>i+1))
+   assert.deepEqual([starts.length,completes.length,providedImports.length],before)
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   assert.equal((await request('jobs')).value.jobs.filter(j=>j.requestId.startsWith(requestId+':')).length,size)
+   assert.equal((await request('cancel',{requestId:null})).status,200)
+   assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)))
+   check(`${size} import rows queue atomically without truncation, duplicate submission or credential execution; cancellation clears all intents`)
+  }
+  const saved=structuredClone(records.get('queue'))
+  for(const line of [Array.from({length:242},(_,i)=>row(i)).join('\n')+'\ninvalid',Array.from({length:242},(_,i)=>row(i)).join('\n')+'\n'+row(0).toUpperCase(),Array.from({length:2000},(_,i)=>row(i)).join('\n')]) {
+   const before=[starts.length,completes.length,providedImports.length]
+   assert.equal((await request('import-line',{requestId:randomUUID(),line,groupIds:[]})).status,400)
+   assert.deepEqual(records.get('queue'),saved)
+   assert.deepEqual([starts.length,completes.length,providedImports.length],before)
+  }
+  check('Invalid or duplicate tail rows and over-budget intent state reject the entire batch before any write or account operation')
+  const requestId=randomUUID(),line=Array.from({length:242},(_,i)=>row(i)).join('\n')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  const n=starts.length
+  await tick()
+  assert.equal(starts.length,n+1)
+  assert.equal((await request('jobs')).value.jobs.filter(j=>j.status==='running').length,1)
+  await request('cancel',{requestId:null})
+  await stop();console.log(`Verified ${passed} import row-limit scenarios`)
  } else if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
   await verifyDurableBatches();await stop();console.log(`Verified ${passed} durable batch scenarios`)
  } else if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {

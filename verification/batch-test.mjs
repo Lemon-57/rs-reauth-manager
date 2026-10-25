@@ -328,7 +328,17 @@ try {
   const importModule=await server.ssrLoadModule('/src/importInput.ts')
   assert.throws(()=>importModule.validateImportLine(mixed+'\ninvalid-private-input'),/第 4 行/)
   assert.throws(()=>importModule.validateImportLine(mixed.split('\r\n')[0]+'\n'+mixed.split('\r\n')[0].toUpperCase()),/重复/)
-  assert.throws(()=>importModule.validateImportLine(Array.from({length:101},(_,i)=>`row${i}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`).join('\n')),/100/)
+  const largeImport=Array.from({length:242},(_,i)=>`row${i}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`).join('\n')
+  assert.equal(importModule.validateImportLine(largeImport),largeImport)
+  assert.throws(()=>importModule.validateImportLine(largeImport+'\ninvalid'),/第 243 行/)
+  assert.throws(()=>importModule.validateImportLine(largeImport+'\nROW0@example.com----fixture-password----GEZDGNBVGY3TQOJQ'),/重复/)
+  assert.throws(()=>importModule.validateImportLine(' '.repeat(500*1024+1)),/过长/)
+  state.openImport();state.importText.value=largeImport
+  const beforeLargeImport=calls.filter(c=>c.path==='api/import-line').length
+  await state.submitImport()
+  assert.equal(calls.filter(c=>c.path==='api/import-line').length,beforeLargeImport+1)
+  assert.equal(JSON.parse(calls.filter(c=>c.path==='api/import-line').at(-1).body).line,largeImport)
+  assert.equal(state.importText.value,'')
   check('Multiline UI submits one mixed batch, preserves physical row numbers and displays independent results without retaining secrets')
 
   const format = await server.ssrLoadModule('/src/format.ts')

@@ -20,7 +20,7 @@ with tarfile.open(path) as archive:
     assert manifest["package"]["protocolVersion"] == 5
     assert manifest["contributes"]["management"]["version"] == 2
     assert manifest["contributes"]["maintenance"]["version"] == 1
-    assert manifest["engines"] == {"codex-proxy-rs": ">=3.29.7, <3.31.0"}
+    assert manifest["engines"] == {"codex-proxy-rs": ">=3.29.7, <3.32.0"}
     assert manifest["package"]["target"] == {"os": "linux", "architecture": "x86_64"}
     expected = manifest["package"]["files"]
     validate_page_resources(archive.extractfile("web/index.html").read().decode("utf-8"), manifest["resources"])

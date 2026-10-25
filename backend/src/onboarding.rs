@@ -162,14 +162,14 @@ pub struct Pending {
 }
 
 pub fn parse_lines(text: &str) -> Result<Vec<(usize, Input)>, PluginFault> {
+    if text.len() > 500 * 1024 {
+        return Err(fault("本批内容过长，请拆分提交"));
+    }
     let mut entries = Vec::new();
     let mut emails = std::collections::BTreeSet::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
-        }
-        if entries.len() >= 100 {
-            return Err(fault("每批最多导入 100 行"));
         }
         let input = parse(line).map_err(|_| {
             fault(&format!(
@@ -279,9 +279,12 @@ pub async fn submit(
     // 整批校验通过后一次持久化非敏感意图，敏感输入仅留在当前进程内存
     let single = entries.len() == 1;
     let mut pending = Vec::new();
-    while queue.jobs.len() + entries.len() > 200 {
-        queue.jobs.remove(0);
-    }
+    // The history budget must never truncate the new batch or drain an empty
+    // queue when the batch itself exceeds 200 rows. Storage is checked by save
+    // before any sensitive input is retained or any account operation begins.
+    let history_to_keep = 200usize.saturating_sub(entries.len());
+    let remove = queue.jobs.len().saturating_sub(history_to_keep);
+    queue.jobs.drain(..remove);
     for (line, input) in entries {
         let request_id = if single {
             prefix.clone()
@@ -519,12 +522,31 @@ mod tests {
         );
     }
     #[test]
-    fn batch_limit_is_checked_before_any_credentials_are_executed() {
-        let text = (0..101)
+    fn large_batches_preserve_all_rows_and_validate_the_tail() {
+        let text = (0..500)
             .map(|n| format!("row{n}@example.com----fixture-password----JBSWY3DPEHPK3PXP"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(parse_lines(&text).err().unwrap().message.contains("100"));
+        let entries = parse_lines(&text).unwrap();
+        assert_eq!(entries.len(), 500);
+        assert_eq!(entries.last().unwrap().0, 500);
+        assert!(
+            parse_lines(&format!("{text}\ninvalid"))
+                .err()
+                .unwrap()
+                .message
+                .contains("第 501 行")
+        );
+        assert!(
+            parse_lines(&format!(
+                "{text}\nROW0@example.com----fixture-password----JBSWY3DPEHPK3PXP"
+            ))
+            .err()
+            .unwrap()
+            .message
+            .contains("重复")
+        );
+        assert!(parse_lines(&" ".repeat(500 * 1024 + 1)).is_err());
     }
     #[test]
     fn rejects_partial_multiline_and_ambiguous_input_without_echoing_it() {

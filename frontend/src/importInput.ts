@@ -2,7 +2,6 @@ export function validateImportLine(text: string): string {
   const lines = text.split(/\r?\n/).map((line, index) => ({ line: line.trim(), number: index + 1 })).filter(item => item.line)
   if (new TextEncoder().encode(text).length > 500 * 1024) throw new Error('本批内容过长，请拆分提交')
   if (!lines.length) throw new Error('请至少输入一行账号')
-  if (lines.length > 100) throw new Error('每批最多导入 100 行')
   const seen = new Set<string>()
   for (const { line, number } of lines) {
     const fields = line.split('----')
