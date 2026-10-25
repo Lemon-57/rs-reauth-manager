@@ -176,9 +176,18 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(self.manager.rows()[-1]['family'], 4)
 
     def test_pending_reservations_count_toward_balance(self):
-        atomic(self.manager.reg, [{'family': 4, 'email': 'pending@example.com', 'rs_account_id': None}])
+        atomic(self.manager.reg, [{'management_id': 'pending', 'family': 4, 'email': 'pending@example.com', 'rs_account_id': None}])
+        atomic(self.adapter.receipt_path('pending@example.com'),
+               {'entryId': 'pending', 'phase': 'reserved', 'created': time.time()})
         self.start()
         self.assertEqual(self.manager.rows()[-1]['family'], 6)
+
+    def test_historical_unbound_reservations_do_not_skew_balance(self):
+        atomic(self.manager.reg, [{'management_id': 'old', 'family': 4, 'email': 'old@example.com', 'rs_account_id': None}])
+        atomic(self.adapter.receipt_path('old@example.com'),
+               {'entryId': 'old', 'phase': 'native_started', 'created': time.time()-1800})
+        self.start()
+        self.assertEqual(self.manager.rows()[-1]['family'], 4)
 
     def import_body(self):
         return {'provider': 'openai', 'data': {'email': 'fixture@example.com', 'refreshToken': 'fixture-rt'},
@@ -329,6 +338,77 @@ class OnboardingTests(unittest.TestCase):
         approval = json.loads(permits.read_text());approval[path.stem]['receiptSha256'] = hashlib.sha256(path.read_bytes()).hexdigest();atomic(permits, approval)
         with self.assertRaises(Rejected):
             self.start()
+
+    def test_explicit_recovery_of_reserved_or_expired_started_keeps_auth(self):
+        for phase in ['reserved', 'native_started']:
+            with self.subTest(phase=phase):
+                path, permits = self.prepare_recovery()
+                old = json.loads(path.read_text()); old['phase'] = phase
+                if phase == 'reserved': old.pop('flowId')
+                atomic(path, old)
+                approval = {path.stem: {'receiptSha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'oldFlowAbsent': True, 'receiptPhase': phase, 'expiresAt': time.time()+600}}
+                atomic(permits, approval)
+                original = self.manager.rows()
+                self.start()
+                self.assertEqual(self.manager.rows(), original)
+                recovered = json.loads(path.read_text())
+                self.assertEqual(recovered['recoveryHistory'], [old])
+                self.assertTrue(recovered['recoveryApproved'])
+                self.assertEqual(recovered['entryId'], old['entryId'])
+                # Start the next subcase with a fresh receipt and registry.
+                path.unlink(); atomic(self.manager.reg, [])
+
+    def test_explicit_import_replacement_creates_auth_and_preserves_old_identity(self):
+        path, permits = self.prepare_recovery()
+        old = dict(self.manager.rows()[0])
+        approval = json.loads(permits.read_text())
+        approval[path.stem].update(newFixedIdentity=True, currentAccountIds=['existing-account'])
+        atomic(permits, approval)
+        self.start()
+        rows = self.manager.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({key: rows[0][key] for key in old}, old)
+        self.assertEqual(rows[0]['superseded_by'], rows[1]['management_id'])
+        self.assertNotEqual(rows[1]['username'], old['username'])
+        self.assertNotEqual(rows[1]['password'], old['password'])
+        self.assertEqual(rows[1]['family'], 4)
+        self.assertEqual(json.loads(path.read_text())['entryId'], rows[1]['management_id'])
+
+    def test_prestart_recovery_requires_exact_phase_and_rejects_uncertain_start(self):
+        path, permits = self.prepare_recovery()
+        for phase, flow, approved in [('reserved', None, None), ('reserved', 'unexpected-flow', 'reserved'),
+                ('native_started', 'expired-flow', 'reserved'), ('native_start_pending', None, 'native_start_pending')]:
+            receipt = json.loads(path.read_text()); receipt['phase'] = phase
+            if flow: receipt['flowId'] = flow
+            else: receipt.pop('flowId', None)
+            atomic(path, receipt)
+            atomic(permits, {path.stem: {'receiptSha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'oldFlowAbsent': True, 'receiptPhase': approved, 'expiresAt': time.time()+600}})
+            with self.assertRaises(Rejected): self.start()
+
+    def test_replacement_balancing_ignores_historical_unbound_identities(self):
+        path, permits = self.prepare_recovery()
+        rows = self.manager.rows()
+        rows.append({**rows[0], 'management_id': 'historical-unbound', 'email': 'old@example.com'})
+        atomic(self.manager.reg, rows)
+        approval = json.loads(permits.read_text())
+        approval[path.stem].update(newFixedIdentity=True, currentAccountIds=['existing-account'])
+        atomic(permits, approval)
+        self.start()
+        self.assertEqual(self.manager.rows()[-1]['family'], 4)
+
+    def test_replacement_registry_failure_blocks_automatic_replay(self):
+        path, permits = self.prepare_recovery()
+        original = self.manager.rows()
+        approval = json.loads(permits.read_text())
+        approval[path.stem].update(newFixedIdentity=True, currentAccountIds=['existing-account'])
+        atomic(permits, approval)
+        self.module.atomic = lambda *args: (_ for _ in ()).throw(OSError())
+        with self.assertRaises(OSError): self.start()
+        self.assertEqual(self.manager.rows(), original)
+        self.assertEqual(json.loads(path.read_text())['phase'], 'replacement_pending')
+        with self.assertRaises(Rejected): self.start()
 
 
 if __name__ == '__main__':

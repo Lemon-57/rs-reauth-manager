@@ -24,8 +24,9 @@ from pathlib import Path
 
 
 class Rejected(Exception):
-    def __init__(self, status=409):
+    def __init__(self, status=409, reason='guard'):
         self.status = status
+        self.reason = reason
 
 
 def atomic(path, value):
@@ -68,7 +69,7 @@ class Adapter:
                 lock.__enter__()
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise Rejected(409) from None
+                    raise Rejected(409, 'allocator_busy') from None
                 time.sleep(0.1)
                 continue
             break
@@ -109,7 +110,7 @@ class Adapter:
             if expected is None:
                 expected = total
             if total != expected:
-                raise Rejected()
+                raise Rejected(409, 'directory_changed')
             rows.extend(document['items'])
             if len(document['items']) < 100:
                 if len(rows) != expected or len({row['id'] for row in rows}) != expected:
@@ -141,11 +142,18 @@ class Adapter:
             if (self.manager.root / 'private/pending.json').exists():
                 raise Rejected()
             rows = self.manager.rows()
-            if any(str(row.get('email') or '').casefold() == email.casefold() for row in rows):
+            if any(not row.get('superseded_by') and str(row.get('email') or '').casefold() == email.casefold() for row in rows):
                 raise Rejected()
             # Historical registrations remain valid identities, but do not count
             # deleted accounts as current pool consumers. Pending reservations count.
-            current = [row for row in rows if not row.get('rs_account_id') or row['rs_account_id'] in account_ids]
+            pending = set()
+            for receipt_file in self.private.glob('*.json'):
+                previous = json.loads(receipt_file.read_text())
+                if (previous.get('phase') in {'reserved', 'native_start_pending', 'native_started'}
+                        and time.time() - previous.get('created', 0) < 900):
+                    pending.add(previous.get('entryId'))
+            current = [row for row in rows if not row.get('superseded_by')
+                       and (row.get('rs_account_id') in account_ids or row.get('management_id') in pending)]
             counts = {family: sum(row['family'] == family for row in current) for family in (4, 6)}
             family = self.module.choose_family(counts)
             templates = json.loads((self.manager.root / 'private/pool.json').read_text())
@@ -175,11 +183,20 @@ class Adapter:
             permits = json.loads(self.recovery_permits.read_text())
             permit = permits.get(path.stem, {})
             now = time.time()
+            phase = receipt.get('phase')
+            # A pre-start reservation has no flow to replay. A started flow
+            # must first be proven absent by the operator's reconciliation.
+            recoverable = (
+                phase == 'native_complete_pending' and bool(receipt.get('flowId'))
+                or phase == 'native_started' and bool(receipt.get('flowId'))
+                    and permit.get('receiptPhase') == phase
+                or phase == 'reserved' and not receipt.get('flowId')
+                    and permit.get('receiptPhase') == phase
+            )
             if (permit.get('receiptSha256') != hashlib.sha256(raw).hexdigest()
                     or permit.get('oldFlowAbsent') is not True
                     or not now < permit.get('expiresAt', 0) <= now + 900
-                    or receipt.get('phase') != 'native_complete_pending'
-                    or not receipt.get('flowId') or now - receipt.get('created', now) < 900
+                    or not recoverable or now - receipt.get('created', now) < 900
                     or receipt.get('email', '').casefold() != email.casefold()):
                 raise Rejected()
             entries = [entry for entry in self.manager.rows()
@@ -191,12 +208,41 @@ class Adapter:
             if self.identity_mapping and any(row.get('management_id') == receipt['entryId']
                     for row in json.loads(self.identity_mapping.read_text())):
                 raise Rejected()
-            # Keep the previous flow and first ownership; never alter credentials.
+            entry = entries[0]
+            if permit.get('newFixedIdentity') is True:
+                rows = self.manager.rows()
+                account_ids = set(permit.get('currentAccountIds', []))
+                if not account_ids:
+                    raise Rejected()
+                current = [row for row in rows if row.get('management_id') != entry['management_id']
+                           and not row.get('superseded_by')
+                           and (row.get('rs_account_id') in account_ids
+                                or row.get('management_id') in permit.get('activeReservationIds', []))]
+                counts = {family: sum(row['family'] == family for row in current) for family in (4, 6)}
+                family = self.module.choose_family(counts)
+                templates = json.loads((self.manager.root / 'private/pool.json').read_text())
+                ports = {row['port'] for row in templates if row['family'] == family}
+                if len(ports) != 1 or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports):
+                    raise Rejected(503)
+                entry = {'management_id': 'onboarding_' + uuid.uuid4().hex,
+                         'reservation_id': request_id, 'email': email, 'rs_account_id': None,
+                         'username': 'fixed' + secrets.token_hex(12), 'password': secrets.token_hex(24),
+                         'family': family, 'host': '127.0.0.1', 'port': ports.pop(),
+                         'exit_ip': self.manager.cfg['exits'][str(family)]}
+                for row in rows:
+                    if row['management_id'] == receipt['entryId']:
+                        row['superseded_by'] = entry['management_id']
+                # Preserve old authentication and ownership while consumers drain.
+                atomic(path, {'email': email, 'requestId': request_id, 'phase': 'replacement_pending',
+                              'entryId': entry['management_id'], 'created': now,
+                              'recoveryHistory': [receipt], 'recoveryApproved': True})
+                self.module.atomic(self.manager.reg, rows + [entry])
+            # Preserve the previous flow and ownership in the receipt history.
             updated = {'email': email, 'requestId': request_id, 'phase': 'reserved',
-                       'entryId': receipt['entryId'], 'created': now,
+                       'entryId': entry['management_id'], 'created': now,
                        'recoveryHistory': [receipt], 'recoveryApproved': True}
             atomic(path, updated)
-            return path, updated, entries[0]
+            return path, updated, entry
 
     def start(self, headers, body):
         if set(body) != {'email', 'requestId'}:
@@ -229,10 +275,10 @@ class Adapter:
         matches = [(path, json.loads(path.read_text())) for path in self.private.glob('*.json')]
         matches = [(path, receipt) for path, receipt in matches if receipt.get('flowId') == body['flowId']]
         if len(matches) != 1:
-            raise Rejected()
+            raise Rejected(409, 'flow_match')
         path, receipt = matches[0]
         if receipt['phase'] != 'native_started':
-            raise Rejected()
+            raise Rejected(409, 'receipt_phase')
         settings = body['settings']
         notes = settings.get('notes') if isinstance(settings, dict) else None
         if not isinstance(settings, dict) or settings.get('enabled') is not False or not isinstance(notes, str):
@@ -243,10 +289,10 @@ class Adapter:
         body = {**body, 'settings': {**settings, 'concurrencyLimit': 3}}
         rows = self.directory(headers)
         if any(row.get('provider') == 'openai' and str(row.get('email') or '').casefold() == receipt['email'].casefold() for row in rows):
-            raise Rejected()
+            raise Rejected(409, 'existing_email')
         entries = [entry for entry in self.manager.rows() if entry.get('management_id') == receipt['entryId']]
         if len(entries) != 1 or entries[0].get('rs_account_id'):
-            raise Rejected()
+            raise Rejected(409, 'entry_bound')
         entry = entries[0]
         self.verify_exit(entry)
         # Keep the existing background allocator from racing native persistence
@@ -365,6 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             status, document = 200, {'code': 200, 'data': data}
         except Rejected as error:
             status, document = error.status, {'code': error.status}
+            print(json.dumps({'onboardingRejected': error.reason, 'status': status}), flush=True)
         except Exception:
             pass
         raw = json.dumps(document).encode()
