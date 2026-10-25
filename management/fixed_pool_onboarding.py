@@ -46,7 +46,7 @@ def atomic(path, value):
 
 
 class Adapter:
-    def __init__(self, manager, pool_module, private, gateway_port, origin, identity_mapping=None):
+    def __init__(self, manager, pool_module, private, gateway_port, origin, identity_mapping=None, recovery_permits=None):
         self.manager = manager
         self.module = pool_module
         self.private = Path(private)
@@ -54,6 +54,7 @@ class Adapter:
         self.gateway_port = gateway_port
         self.origin = origin
         self.identity_mapping = Path(identity_mapping) if identity_mapping else None
+        self.recovery_permits = Path(recovery_permits) if recovery_permits else None
         self.lock = threading.RLock()
 
     @contextlib.contextmanager
@@ -135,8 +136,7 @@ class Adapter:
     def reserve(self, email, request_id, account_ids):
         path = self.receipt_path(email)
         if path.exists():
-            # Including after process restart or an uncertain native start/complete.
-            raise Rejected()
+            return self.recover_reservation(path, email, request_id)
         with self.allocation_lock():
             if (self.manager.root / 'private/pending.json').exists():
                 raise Rejected()
@@ -163,6 +163,40 @@ class Adapter:
             # The already-running authentication service notices the registry mtime.
             self.module.atomic(self.manager.reg, rows + [entry])
         return path, receipt, entry
+
+    def recover_reservation(self, path, email, request_id):
+        # Operator-only, short-lived approval after directory/flow reconciliation.
+        # Ordinary retries still stop. A changed receipt invalidates the approval.
+        if not self.recovery_permits:
+            raise Rejected()
+        with self.allocation_lock():
+            raw = path.read_bytes()
+            receipt = json.loads(raw)
+            permits = json.loads(self.recovery_permits.read_text())
+            permit = permits.get(path.stem, {})
+            now = time.time()
+            if (permit.get('receiptSha256') != hashlib.sha256(raw).hexdigest()
+                    or permit.get('oldFlowAbsent') is not True
+                    or not now < permit.get('expiresAt', 0) <= now + 900
+                    or receipt.get('phase') != 'native_complete_pending'
+                    or not receipt.get('flowId') or now - receipt.get('created', now) < 900
+                    or receipt.get('email', '').casefold() != email.casefold()):
+                raise Rejected()
+            entries = [entry for entry in self.manager.rows()
+                       if entry.get('management_id') == receipt.get('entryId')]
+            if (len(entries) != 1 or entries[0].get('rs_account_id')
+                    or entries[0].get('email', '').casefold() != email.casefold()
+                    or (self.manager.root / 'private/pending.json').exists()):
+                raise Rejected()
+            if self.identity_mapping and any(row.get('management_id') == receipt['entryId']
+                    for row in json.loads(self.identity_mapping.read_text())):
+                raise Rejected()
+            # Keep the previous flow and first ownership; never alter credentials.
+            updated = {'email': email, 'requestId': request_id, 'phase': 'reserved',
+                       'entryId': receipt['entryId'], 'created': now,
+                       'recoveryHistory': [receipt], 'recoveryApproved': True}
+            atomic(path, updated)
+            return path, updated, entries[0]
 
     def start(self, headers, body):
         if set(body) != {'email', 'requestId'}:
@@ -350,6 +384,7 @@ def main():
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--gateway-port', type=int, required=True)
     parser.add_argument('--identity-mapping')
+    parser.add_argument('--recovery-permits')
     args = parser.parse_args()
     if subprocess.check_output(['systemctl', 'is-active', args.manager_unit], text=True).strip() != 'active':
         raise RuntimeError('effective_pool_manager_unavailable')
@@ -368,7 +403,7 @@ def main():
         mapping = Path(args.identity_mapping).resolve(strict=True)
         if not isinstance(json.loads(mapping.read_text()), list):
             raise RuntimeError('identity_mapping_invalid')
-    server.adapter = Adapter(module.Manager(args.pool_root), module, args.private, args.gateway_port, args.public_origin, args.identity_mapping)
+    server.adapter = Adapter(module.Manager(args.pool_root), module, args.private, args.gateway_port, args.public_origin, args.identity_mapping, args.recovery_permits)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     server.serve_forever()
 

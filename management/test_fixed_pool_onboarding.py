@@ -1,8 +1,10 @@
 import contextlib
+import hashlib
 import json
 import tempfile
 import types
 import unittest
+import time
 from pathlib import Path
 from unittest.mock import patch
 from fixed_pool_onboarding import Adapter, Rejected, atomic
@@ -280,6 +282,53 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(sum(path.endswith('/oauth/complete') for path, _ in self.calls), 1)
         receipt = json.loads(self.adapter.receipt_path('fixture@example.com').read_text())
         self.assertEqual(receipt['phase'], 'native_complete_pending')
+
+    def prepare_recovery(self):
+        self.start()
+        path = self.adapter.receipt_path('fixture@example.com')
+        receipt = json.loads(path.read_text())
+        receipt.update(phase='native_complete_pending', created=time.time()-1800)
+        atomic(path, receipt)
+        permits = self.root/'permits.json'
+        atomic(permits, {path.stem: {'receiptSha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'oldFlowAbsent': True, 'expiresAt': time.time()+600}})
+        self.adapter.recovery_permits = permits
+        return path, permits
+
+    def test_explicit_recovery_keeps_original_fixed_auth_and_history(self):
+        path, _ = self.prepare_recovery()
+        entry = self.manager.rows()[0]
+        old = json.loads(path.read_text())
+        started = self.start()
+        self.assertEqual(self.manager.rows(), [entry])
+        self.assertEqual(started['outboundProxyUrl'], self.adapter.url(entry))
+        receipt = json.loads(path.read_text())
+        self.assertEqual(receipt['recoveryHistory'], [old])
+        self.assertNotEqual(receipt['flowId'], old['flowId'])
+        with self.assertRaises(Rejected):
+            self.start()
+
+    def test_recovery_requires_fresh_exact_receipt_approval_and_absent_old_flow(self):
+        path, permits = self.prepare_recovery()
+        valid = json.loads(permits.read_text())
+        for field, value in [('receiptSha256', 'changed'), ('oldFlowAbsent', False), ('expiresAt', 0)]:
+            invalid = json.loads(json.dumps(valid));invalid[path.stem][field] = value
+            atomic(permits, invalid)
+            with self.assertRaises(Rejected):
+                self.start()
+        self.assertEqual(len(self.manager.rows()), 1)
+
+    def test_recovery_rejects_bound_identity_and_live_flow(self):
+        path, permits = self.prepare_recovery()
+        entries = self.manager.rows();entries[0]['rs_account_id'] = 'already-bound'
+        atomic(self.manager.reg, entries)
+        with self.assertRaises(Rejected):
+            self.start()
+        entries[0]['rs_account_id'] = None;atomic(self.manager.reg, entries)
+        receipt = json.loads(path.read_text());receipt['created'] = time.time();atomic(path, receipt)
+        approval = json.loads(permits.read_text());approval[path.stem]['receiptSha256'] = hashlib.sha256(path.read_bytes()).hexdigest();atomic(permits, approval)
+        with self.assertRaises(Rejected):
+            self.start()
 
 
 if __name__ == '__main__':
