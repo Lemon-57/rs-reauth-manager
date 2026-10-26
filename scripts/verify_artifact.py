@@ -17,10 +17,10 @@ with tarfile.open(path) as archive:
     manifest = json.load(archive.extractfile("plugin.json"))
     assert manifest["version"] == version, "Package version differs from source manifest"
     assert manifest["manifestVersion"] == 2
-    assert manifest["package"]["protocolVersion"] == 5
+    assert manifest["package"]["protocolVersion"] == 7
     assert manifest["contributes"]["management"]["version"] == 2
     assert manifest["contributes"]["maintenance"]["version"] == 1
-    assert manifest["engines"] == {"codex-proxy-rs": ">=3.29.7, <3.32.0"}
+    assert manifest["engines"] == {"codex-proxy-rs": ">=3.33.0, <3.34.0"}
     assert manifest["package"]["target"] == {"os": "linux", "architecture": "x86_64"}
     expected = manifest["package"]["files"]
     validate_page_resources(archive.extractfile("web/index.html").read().decode("utf-8"), manifest["resources"])
