@@ -14,9 +14,20 @@ import { displayTime, isActive, planLabel, planType, progress, resultMessage, st
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
 
-const { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
+const { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, filtered, visible, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
 const statusOptions = [{ value: 'all', label: '全部状态' }, { value: 'error', label: '账号异常' }, { value: 'ready', label: '可重新授权' }, { value: 'active', label: '处理中' }, { value: 'failed', label: '本次未完成' }, { value: 'success', label: '本次成功' }, { value: 'invalid', label: '备注或代理缺失' }, { value: 'disabled', label: '已停用' }]
-const columns: TableColumn<Account>[] = [{ key: 'select', label: '', kind: 'selection', hideable: false }, { key: 'identity', label: '账号', kind: 'identity', width: 300, hideable: false }, { key: 'groups', label: '分组', kind: 'meta', width: 160 }, { key: 'plan', label: '订阅', width: 85 }, { key: 'status', label: '账号状态', width: 110 }, { key: 'credentials', label: '登录资料', width: 112 }, { key: 'proxy', label: '账号代理', minWidth: 165 }, { key: 'expiry', label: '访问令牌到期', width: 170 }, { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210 }, { key: 'actions', label: '操作', kind: 'actions', width: 86, hideable: false }]
+const columns: TableColumn<Account>[] = [
+ { key: 'select', label: '', kind: 'selection', align: 'center', hideable: false },
+ { key: 'identity', label: '账号', kind: 'identity', width: 300, align: 'center', hideable: false },
+ { key: 'status', label: '状态', width: 110, align: 'center' },
+ { key: 'plan', label: '订阅', width: 85, align: 'center' },
+ { key: 'groups', label: '分组', kind: 'meta', width: 140, align: 'center' },
+ { key: 'supplier', label: '供应商', width: 160, align: 'center' },
+ { key: 'manualExpiry', label: '到期时间', width: 175, align: 'center' },
+ { key: 'lastUsed', label: '最后使用', width: 150, align: 'center' },
+ { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210, align: 'center' },
+ { key: 'actions', label: '操作', kind: 'actions', width: 86, align: 'center', hideable: false }
+]
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(columns, 'reauth-manager-accounts')
 </script>
 
@@ -37,6 +48,7 @@ const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetCo
       <ZInput v-model="search" class="search" placeholder="搜索邮箱、分组或代理" clearable aria-label="搜索账号"><template #prefix><Search :size="16" /></template></ZInput>
       <ZSelect v-model="plan" class="filter" :options="planOptions" aria-label="按订阅类型筛选" />
       <ZSelect v-model="filter" class="filter" :options="statusOptions" aria-label="状态筛选" />
+      <ZSelect v-model="supplier" class="filter" :options="supplierOptions" filterable aria-label="按供应商筛选" />
       <div class="commands"><ZButton :disabled="busy || !!active" @click="openImport"><template #icon><Upload :size="16" /></template>导入账号</ZButton><ZIconButton title="读取最新账号" aria-label="读取最新账号" :disabled="loading || busy" @click="load"><RefreshCw :size="17" :class="{ spin: loading }" /></ZIconButton><ZButton v-if="active" :disabled="busy" @click="cancel()"><template #icon><Square :size="14" /></template>停止队列</ZButton><ZButton type="danger" :loading="deleting" :disabled="busy || !chosen.length" title="直接从 RS 网关删除所选账号" @click="deleteSelected"><template #icon><Trash2 :size="16" /></template>删除所选<span v-if="chosen.length">（{{ chosen.length }}）</span></ZButton><ZButton type="primary" :disabled="busy || !reauthChosen.length" @click="submit(reauthChosen)"><template #icon><KeyRound :size="16" /></template>重新授权所选<span v-if="reauthChosen.length">（{{ reauthChosen.length }}）</span></ZButton></div>
     </div>
     <div class="selection"><ZCheckbox class="account-checkbox" :model-value="allSelected" :indeterminate="allIndeterminate" :disabled="!filtered.length || busy" label="全选" title="选择当前筛选结果的全部账号（包含所有页）" @change="selectAll" /><span>已选 {{ chosen.length }} / {{ filtered.length }} 个账号</span><ZIconButton v-if="selected.length" size="small" title="清空选择" aria-label="清空选择" :disabled="busy" @click="selected = []"><X :size="14" /></ZIconButton></div>
@@ -48,10 +60,13 @@ const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetCo
     </details>
     <p class="refresh-status muted" role="status"><span v-if="refreshWarning">{{ refreshWarning }}</span><span v-else-if="lastUpdated">状态更新于 {{ displayTime(lastUpdated) }}</span></p>
     <div class="table-controls"><ZTableColumnSettings :options="columnOptions" @change="setColumnVisible" @reorder="setColumnOrder" @reset="resetColumns" /></div>
-    <ZTable :columns="visibleColumns" :data="visible" :row-key="a => a.id" :loading="loading && !accounts.length" :empty-text="loading ? '正在读取账号' : '没有匹配的 OAuth 账号'">
+    <ZTable class="account-table" :columns="visibleColumns" :data="visible" :row-key="a => a.id" :loading="loading && !accounts.length" :empty-text="loading ? '正在读取账号' : '没有匹配的 OAuth 账号'">
       <template #header-select><ZCheckbox class="account-checkbox" :model-value="pageSelected" :indeterminate="pageIndeterminate" :disabled="!pageCandidates.length || busy" aria-label="选择当前页" title="选择当前页" @change="selectPage" /></template>
       <template #select="{ row }"><ZCheckbox class="account-checkbox" :model-value="selected.includes(row.id)" :disabled="busy" :aria-label="`选择 ${row.email || row.name}`" @change="selectOne(row.id, $event)" /></template>
       <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> {{ statusText(row) }}</span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span :class="{ success: resultOf(row)?.status === 'success', danger: ['failed', 'review', 'interrupted'].includes(resultOf(row)?.status || '') }">{{ progress(resultOf(row)) }}<span v-if="resultOf(row)?.message"> · {{ resultMessage(resultOf(row)) }}</span></span></div></div></div></template>
+      <template #supplier="{ row }"><span class="supplier-name" :title="row.supplier || undefined">{{ row.supplier || '—' }}</span></template>
+      <template #manualExpiry="{ row }"><span class="date" :title="row.manualExpiresAt || undefined">{{ row.manualExpiresAtDisplay || displayTime(row.manualExpiresAt) }}</span></template>
+      <template #lastUsed="{ row }"><span class="date" :title="row.usage?.lastUsedAtFullDisplay || row.usage?.lastUsedAt || undefined">{{ row.usage?.lastUsedAtDisplay || (row.usage?.lastUsedAt ? displayTime(row.usage.lastUsedAt) : '从未使用') }}</span></template>
       <template #plan="{ row }"><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag></template>
       <template #groups="{ row }"><div v-if="row.groups.length" class="group-tags"><ZTag v-for="group in row.groups" :key="group.id" size="small" :title="group.name">{{ group.name }}</ZTag></div><span v-else class="muted">未分组</span></template>
       <template #status="{ row }"><span class="status" :class="{ danger: row.status === 'error', muted: !row.enabled, success: row.enabled && row.status === 'normal' }"><i></i>{{ statusText(row) }}</span></template>

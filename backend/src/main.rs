@@ -480,6 +480,9 @@ async fn directory(host: &HostClient) -> Result<Vec<Value>, PluginFault> {
     }
     Err(fault("账号超过本次读取上限"))
 }
+fn account_row(a: &Value, groups: Vec<Value>) -> Value {
+    json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a),"groups":groups,"supplier":a["supplier"],"manualExpiresAt":a["manualExpiresAt"],"manualExpiresAtDisplay":a["manualExpiresAtDisplay"],"usage":{"lastUsedAt":a["usage"]["lastUsedAt"],"lastUsedAtDisplay":a["usage"]["lastUsedAtDisplay"],"lastUsedAtFullDisplay":a["usage"]["lastUsedAtFullDisplay"]}})
+}
 async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
     let accounts = directory(host).await?;
     let mut rows = vec![];
@@ -495,7 +498,7 @@ async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
                 },
             )
             .collect::<Result<Vec<_>, _>>()?;
-        rows.push(json!({"id":a["id"],"name":a["name"],"email":a["email"],"enabled":a["enabled"],"planType":a["planType"],"status":a["status"],"accessTokenExpiresAt":a["accessTokenExpiresAt"],"proxy":a["outboundProxyEndpoint"],"notesValid":notes_valid(a),"groups":groups}));
+        rows.push(account_row(a, groups));
     }
     Ok(json!({"accounts":rows}))
 }
@@ -1386,4 +1389,16 @@ mod tests {
             &json!({"provider":"other","authenticationKind":"oauth","planType":"free"})
         ));
     }
+    #[test]
+    fn display_fields_use_manual_expiry_and_safe_usage_projection() {
+        let a = json!({"id":"synthetic", "supplier":"Vendor A", "manualExpiresAt":"2026-11-21T00:00:00Z", "manualExpiresAtDisplay":"2026-11-21 00:00:00", "accessTokenExpiresAt":"2026-10-28T00:00:00Z", "usage":{"lastUsedAt":"2026-10-27T12:00:00Z", "lastUsedAtDisplay":"3分钟前", "lastUsedAtFullDisplay":"2026-10-27 12:00:00", "secret":"excluded"}, "accessToken":"excluded"});
+        let row = account_row(&a, vec![]);
+        assert_eq!(row["supplier"], a["supplier"]);
+        assert_eq!(row["manualExpiresAt"], a["manualExpiresAt"]);
+        assert_ne!(row["manualExpiresAt"], row["accessTokenExpiresAt"]);
+        assert_eq!(row["usage"]["lastUsedAtDisplay"], "3分钟前");
+        assert!(!row.to_string().contains("excluded"));
+        assert!(account_row(&json!({}), vec![])["manualExpiresAt"].is_null());
+    }
+
 }

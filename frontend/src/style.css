@@ -35,3 +35,9 @@ body { margin: 0; min-width: 0; min-height: inherit; font-size: var(--cp-font-si
 .import-results[open] > summary { margin-bottom: 8px; }
 .refresh-status { margin: 4px 0 8px; font-size: 12px; }
 .table-controls { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+
+.account-table th,.account-table td{text-align:center}
+.account-table .identity,.account-table .status,.account-table .group-tags,.account-table .result>span{justify-content:center}
+.account-table .result{justify-items:center}
+.account-table .identity-text{text-align:center}
+.supplier-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

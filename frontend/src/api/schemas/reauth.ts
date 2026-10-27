@@ -4,7 +4,10 @@ import { isRecord } from '../request'
 const nullableString = (value: unknown) => value === null || typeof value === 'string'
 const nullableTime = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value) && value >= 0
 function account(value: unknown): value is Account {
+  const usage = isRecord(value) ? value.usage : undefined
   return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string'
+    && ['supplier', 'manualExpiresAt', 'manualExpiresAtDisplay'].every(key => value[key] === undefined || nullableString(value[key]))
+    && (usage === undefined || isRecord(usage) && ['lastUsedAt', 'lastUsedAtDisplay', 'lastUsedAtFullDisplay'].every(key => usage[key] === undefined || nullableString(usage[key])))
     && nullableString(value.email) && nullableString(value.planType) && nullableString(value.proxy)
     && nullableString(value.accessTokenExpiresAt) && typeof value.enabled === 'boolean'
     && typeof value.notesValid === 'boolean' && typeof value.status === 'string'

@@ -392,6 +392,16 @@ try {
   check('A lost 242-account submission response is read back once without re-submitting or double-queuing accounts')
 
   }
+  {
+    accounts=[{...account('vendor-a'),supplier:'Vendor A'},{...account('vendor-b'),supplier:'Vendor B'}];jobs=[]
+    await state.load();state.supplier.value='Vendor A';state.filter.value='all';state.plan.value='all';await flush()
+    assert.deepEqual(state.filtered.value.map(a=>a.id),['vendor-a'])
+    assert.deepEqual(state.supplierOptions.value.map(o=>o.label),['全部供应商','Vendor A','Vendor B'])
+    state.selected.value=[];state.selectAll(true);assert.deepEqual(state.selected.value,['vendor-a'])
+    state.page.value=4;state.supplier.value='Vendor B';await flush();assert.equal(state.page.value,1)
+    state.showResults('error');assert.equal(state.supplier.value,'')
+    check('Supplier filter uses the full directory, scopes select-all, resets pagination and clears with result cards')
+  }
   console.log(`Verified ${checks} batch scenarios`)
 } finally { mounted?.unmount(); delete globalThis.window; await server.close() }
 

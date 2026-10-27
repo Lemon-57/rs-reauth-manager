@@ -2,6 +2,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './api'
 import { importResult, isActive, isUnfinished, needsReauth, planKey, planLabel } from './format'
 import type { Account, Job } from './types'
+import { supplierOptions as makeSupplierOptions, supplierMatches } from './suppliers'
 import { validateImportLine } from './importInput'
 
 export function useReauthManager() {
@@ -36,7 +37,7 @@ export function useReauthManager() {
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
   const lastUpdated = ref<number | null>(null), readWarning = ref(''), tickWarning = ref('')
   const refreshWarning = computed(() => readWarning.value || tickWarning.value)
-  const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), filter = ref('all'), page = ref(1), pageSize = ref(20)
+  const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), supplier = ref(''), filter = ref('all'), page = ref(1), pageSize = ref(20)
   const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
   let automationChange = 0
   async function setAutomation(enabled: boolean) {
@@ -119,7 +120,9 @@ export function useReauthManager() {
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
   const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
   const planOptions = computed(() => [{ value: 'all', label: '全部订阅' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
+  const supplierOptions = computed(() => makeSupplierOptions(accounts.value))
   const filtered = computed(() => accounts.value.filter(a => {
+    if (!supplierMatches(a, supplier.value)) return false
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
     const job = jobOf(a)
@@ -134,7 +137,7 @@ export function useReauthManager() {
   const allIndeterminate = computed(() => !allSelected.value && filtered.value.some(a => selected.value.includes(a.id)))
   const chosen = computed(() => accounts.value.filter(a => selected.value.includes(a.id)))
   const reauthChosen = computed(() => chosen.value.filter(ready))
-  watch([search, plan, filter, pageSize], () => page.value = 1)
+  watch([search, plan, supplier, filter, pageSize], () => page.value = 1)
   watch(() => filtered.value.length, n => { page.value = Math.min(page.value, Math.max(1, Math.ceil(n / pageSize.value))) })
   function selectOne(id: string, checked: boolean) { selected.value = checked ? [...new Set([...selected.value, id])] : selected.value.filter(v => v !== id) }
   function selectPage(checked: boolean) { for (const a of pageCandidates.value) selectOne(a.id, checked) }
@@ -154,7 +157,7 @@ export function useReauthManager() {
     }
     return changed
   }
-  function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; filter.value = value; page.value = 1 }
+  function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; supplier.value = ''; filter.value = value; page.value = 1 }
   async function load() {
     loading.value = true; error.value = ''
     const settingChange = automationChange
@@ -238,5 +241,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
-  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }
