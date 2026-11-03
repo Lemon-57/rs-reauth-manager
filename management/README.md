@@ -1,5 +1,7 @@
 # Protected onboarding adapter
 
+`native_ipv6_verification.py` verifies the exact IPv6 recorded for a native allocator entry through its own fixed proxy authentication. Network failures can use either ipify or Cloudflare Trace within an 18-second overall budget; an invalid or different address fails immediately. The helper never allocates an address, changes a reservation, exchanges a token or repeats an OAuth request. A native manager integration must retain permanent ownership registration before calling it and map failures to its existing policy error.
+
 The optional loopback adapter forwards administrator authentication to the effective protected RS manager. It discovers the allocator from the active service working directory and keeps native flow, PKCE, account binding and fixed proxy protections. It never exchanges tokens.
 
 Native start and complete may return HTTP 201 with the standard business code 200. The adapter preserves that data and normalizes successful transport to HTTP 200 for the plugin. A transport status alone never proves business success. Non-success business codes, missing data and uncertain results are rejected without replay.
