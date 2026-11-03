@@ -1,16 +1,61 @@
 import contextlib
 import hashlib
+import http.client
+import http.server
+import io
 import json
 import tempfile
 import types
 import unittest
 import time
+import threading
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
-from fixed_pool_onboarding import Adapter, Rejected, atomic
+from unittest.mock import Mock, patch
+from fixed_pool_onboarding import Adapter, Handler, Rejected, SOURCE_SHA256, atomic
 
 
 class OnboardingTests(unittest.TestCase):
+    def test_exit_probe_retries_same_auth_before_native_start(self):
+        entry = {'username': 'fixture-user', 'password': 'fixture-pass', 'host': '127.0.0.1',
+                 'port': 31001, 'exit_ip': '192.0.2.1'}
+        opener = types.SimpleNamespace(open=Mock(
+            side_effect=[urllib.error.URLError('fixture temporary failure'), io.BytesIO(b'192.0.2.1')]))
+        with patch('fixed_pool_onboarding.urllib.request.build_opener', return_value=opener) as build, patch('fixed_pool_onboarding.time.sleep'):
+            Adapter.verify_exit(self.adapter, entry)
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(opener.open.call_args_list[0], opener.open.call_args_list[1])
+        self.assertFalse(any(path.endswith('/oauth/start') for path, _ in self.calls))
+
+    def test_exit_probe_failure_is_bounded_and_mismatch_is_never_retried(self):
+        entry = {'username': 'fixture-user', 'password': 'fixture-pass', 'host': '127.0.0.1',
+                 'port': 31001, 'exit_ip': '192.0.2.1'}
+        mock = Mock
+        for replies, count, reason in [([urllib.error.URLError('fixture failure')] * 3, 3, 'proxy_exit_unavailable'),
+                                       ([io.BytesIO(b'192.0.2.2')], 1, 'exit_address_mismatch')]:
+            opener = types.SimpleNamespace(open=mock(side_effect=replies))
+            with patch('fixed_pool_onboarding.urllib.request.build_opener', return_value=opener), patch('fixed_pool_onboarding.time.sleep'):
+                with self.assertRaises(Rejected) as error:
+                    Adapter.verify_exit(self.adapter, entry)
+            self.assertEqual(error.exception.reason, reason)
+            self.assertEqual(opener.open.call_count, count)
+
+    def test_health_reports_the_loaded_adapter_source(self):
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+        try:
+            connection.request('GET', '/health')
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response), {'code': 200, 'data': {'sourceSha256': SOURCE_SHA256}})
+        finally:
+            connection.close()
+            thread.join(timeout=2)
+            server.server_close()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -413,3 +458,4 @@ class OnboardingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

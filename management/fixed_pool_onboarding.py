@@ -17,10 +17,13 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class Rejected(Exception):
@@ -125,11 +128,23 @@ class Adapter:
     def verify_exit(self, entry):
         proxy = self.url(entry)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy, 'https': proxy}))
-        # One bounded, authenticated request, with no direct or alternate-exit fallback.
-        with opener.open('https://api64.ipify.org', timeout=20) as response:
-            actual = response.read(128).decode().strip()
-        if ipaddress.ip_address(actual) != ipaddress.ip_address(entry['exit_ip']):
-            raise Rejected(502)
+        # 仅重试提交前的只读出口检测，始终使用同一个固定认证和出口
+        for attempt in range(3):
+            try:
+                with opener.open('https://api64.ipify.org', timeout=5) as response:
+                    actual = response.read(128).decode().strip()
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+                if attempt == 2:
+                    raise Rejected(503, 'proxy_exit_unavailable') from None
+                time.sleep(0.25)
+                continue
+            try:
+                matches = ipaddress.ip_address(actual) == ipaddress.ip_address(entry['exit_ip'])
+            except ValueError:
+                raise Rejected(502, 'exit_address_invalid') from None
+            if not matches:
+                raise Rejected(502, 'exit_address_mismatch')
+            return
 
     def receipt_path(self, email):
         return self.private / (hashlib.sha256(email.casefold().encode()).hexdigest() + '.json')
@@ -386,7 +401,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         status = 200 if self.path == '/health' else 404
-        raw = json.dumps({'code': status}).encode()
+        document = {'code': status}
+        if status == 200:
+            document['data'] = {'sourceSha256': SOURCE_SHA256}
+        raw = json.dumps(document).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(raw)))
@@ -412,8 +430,9 @@ class Handler(BaseHTTPRequestHandler):
         except Rejected as error:
             status, document = error.status, {'code': error.status}
             print(json.dumps({'onboardingRejected': error.reason, 'status': status}), flush=True)
-        except Exception:
-            pass
+        except Exception as error:
+            # 只记录异常类型，禁止把回调、代理认证或账号资料写入日志
+            print(json.dumps({'onboardingFailure': type(error).__name__, 'status': status}), flush=True)
         raw = json.dumps(document).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
