@@ -1,6 +1,7 @@
 """Authenticated loopback adapter to the effective protected manager, never a second allocator."""
 import argparse
 import http.client
+import hashlib
 import importlib
 import json
 import os
@@ -42,12 +43,32 @@ def normalize_success(status, result):
 
 
 class Adapter:
-    def __init__(self, allocator, manager_port, gateway_port, manager_host='127.0.0.1'):
+    def __init__(self, allocator, manager_port, gateway_port, manager_host='127.0.0.1', state_dir=None):
         self.allocator = allocator
         self.manager_port = manager_port
         self.manager_host = manager_host
         self.gateway_port = gateway_port
         self.pending = {}
+        self.state_dir = Path(state_dir) if state_dir is not None else None
+        if self.state_dir is not None:
+            self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def receipt(self, email):
+        if self.state_dir is None:
+            return None
+        return self.state_dir / (hashlib.sha256(email.encode()).hexdigest() + '.json')
+
+    def remember(self, email, record):
+        path = self.receipt(email)
+        if path is not None:
+            temporary = path.with_suffix('.tmp')
+            with temporary.open('w', encoding='utf-8') as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(record, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        self.pending[email] = record
 
     def call(self, path, headers, body):
         # Validate the original administrator authentication before reading input or reserving a slot.
@@ -82,10 +103,20 @@ class Adapter:
                     break
             else:
                 return 503, {'code': 503}
-            if key in self.pending or len(self.pending) >= 1000:
+            prior = self.pending.get(key)
+            receipt = self.receipt(key)
+            if prior is None and receipt is not None and receipt.exists():
+                prior = json.loads(receipt.read_text(encoding='utf-8'))
+                self.pending[key] = prior
+            if prior is not None:
+                # A matching request may recover its saved response, never create another flow.
+                if prior.get('requestId') == request_id and prior.get('phase') == 'ready':
+                    return 200, prior['result']
+                return 409, {'code': 409}
+            if len(self.pending) >= 1000:
                 # No second allocation or OAuth flow on response uncertainty.
                 return 409, {'code': 409}
-            self.pending[key] = request_id
+            self.remember(key, {'requestId': request_id, 'phase': 'unconfirmed'})
             status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': 'team+' + email}, host=self.manager_host)
             if status not in (200, 201) or result.get('code') != 200:
                 return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502}
@@ -94,7 +125,9 @@ class Adapter:
             if account_id or self.allocator.owner(entry):
                 return 409, {'code': 409}
             # The manager already verified the slot, actual exit, credentials and registered its native flow.
-            return 200, {'code': 200, 'data': {**data, 'outboundProxyUrl': self.allocator.url(entry)}}
+            result = {'code': 200, 'data': {**data, 'outboundProxyUrl': self.allocator.url(entry)}}
+            self.remember(key, {'requestId': request_id, 'phase': 'ready', 'result': result})
+            return 200, result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -146,6 +179,7 @@ def main():
     parser.add_argument('--gateway-port', type=int, required=True)
     parser.add_argument('--public-origin', required=True)
     parser.add_argument('--manager-unit', required=True)
+    parser.add_argument('--state-dir', required=True, type=Path)
     args = parser.parse_args()
     parsed = urllib.parse.urlsplit(args.public_origin)
     if parsed.scheme != 'https' or not parsed.netloc or parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username or parsed.password:
@@ -166,7 +200,7 @@ def main():
     allocator.slots()
     os.umask(0o077)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    server.adapter = Adapter(allocator, args.manager_port, args.gateway_port, args.manager_host)
+    server.adapter = Adapter(allocator, args.manager_port, args.gateway_port, args.manager_host, args.state_dir)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     try:
         server.serve_forever()

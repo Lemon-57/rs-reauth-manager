@@ -25,6 +25,13 @@ fn final_status_confirmed(status: &Value) -> bool {
     )
 }
 
+fn paid_import_plan(plan: &str) -> bool {
+    matches!(
+        plan.trim().to_ascii_lowercase().as_str(),
+        "team" | "business" | "plus" | "pro" | "prolite" | "promax" | "go"
+    )
+}
+
 // 接受原生保存所投影的已验证套餐/工作区，其他控制字段仍逐项一致
 fn native_settings_match(actual: &Value, expected: &Value, workspace: &str, plan: &str) -> bool {
     let mut actual = settings(actual);
@@ -464,6 +471,8 @@ async fn complete_new_account(
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| fault("RS 新增 OAuth 未返回账号 ID"))?;
+    // Keep the authoritative receipt even when a later check requires review.
+    snapshot["createdAccountId"] = json!(id);
     let account = detail(host, id).await?;
     if account["provider"] != "openai"
         || account["authenticationKind"] != "oauth"
@@ -472,10 +481,8 @@ async fn complete_new_account(
             !email.eq_ignore_ascii_case(snapshot["email"].as_str().unwrap_or_default())
         })
         || account["planType"].as_str().is_none_or(|plan| {
-            !(matches!(
-                plan.trim().to_ascii_lowercase().as_str(),
-                "team" | "business"
-            ) || (snapshot["allowFreeNew"] == true && plan.trim().eq_ignore_ascii_case("free")))
+            !(paid_import_plan(plan)
+                || (snapshot["allowFreeNew"] == true && plan.trim().eq_ignore_ascii_case("free")))
         })
         || require_idle(&account).is_err()
     {
@@ -520,14 +527,12 @@ async fn complete_new_account(
     )
     .await?;
     snapshot["postAuthorizationSettings"] = verified_settings;
-    let team = account["planType"]
-        .as_str()
-        .is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "team" | "business"));
-    snapshot["resumeEnabled"] = json!(team);
+    let paid = account["planType"].as_str().is_some_and(paid_import_plan);
+    snapshot["resumeEnabled"] = json!(paid);
     snapshot["authorizedCredentialRevision"] = json!(credential.credential_revision);
     Ok((
-        if team {
-            "RS 原生 OAuth 已创建并保存 Team RT，备注与分组已读回确认".into()
+        if paid {
+            "RS 原生 OAuth 已创建并保存付费账号 RT，备注与分组已读回确认".into()
         } else {
             "RS 原生 OAuth 已保存 Free RT，未发现唯一 Team 成员资格，账号保持暂停".into()
         },
@@ -539,6 +544,25 @@ async fn complete_new_account(
 mod tests {
     use super::final_status_confirmed;
     use serde_json::json;
+
+    #[test]
+    fn paid_import_accepts_pro_variants_without_accepting_unknown_plans() {
+        for plan in [
+            "team",
+            "business",
+            "plus",
+            "pro",
+            "prolite",
+            "promax",
+            "go",
+            " ProLite ",
+        ] {
+            assert!(super::paid_import_plan(plan));
+        }
+        for plan in ["free", "", "unknown", "professional"] {
+            assert!(!super::paid_import_plan(plan));
+        }
+    }
 
     #[test]
     fn proxy_normalization_preserves_authentication_and_fixed_endpoint() {

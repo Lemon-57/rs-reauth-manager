@@ -18,6 +18,10 @@ struct Submission {
     request_id: String,
     line: String,
     group_ids: Vec<String>,
+    #[serde(default)]
+    concurrency_limit: Option<u32>,
+    #[serde(default)]
+    weight: Option<u32>,
 }
 
 pub struct Input {
@@ -143,6 +147,12 @@ pub async fn request(
     let result: Value = serde_json::from_slice(&raw)
         .map_err(|_| fault("导入回执格式未确认，请核对账号，勿重复提交"))?;
     if !(200..300).contains(&status) || result["code"] != 200 {
+        if status == 422 && result["message"] == "RT exchange failed; private diagnostics withheld"
+        {
+            return Err(fault(
+                "提供的 RT 未能通过受保护接口换取授权，未确认入库；请核对账号目录，不会自动重试或改用账密登录",
+            ));
+        }
         return Err(fault(&format!(
             "受保护导入未确认（HTTP {status}），请核对账号与任务，未自动重试"
         )));
@@ -159,6 +169,8 @@ pub struct Pending {
     input: Input,
     group_ids: Vec<String>,
     transport: Value,
+    concurrency_limit: u32,
+    weight: u32,
 }
 
 pub fn parse_lines(text: &str) -> Result<Vec<(usize, Input)>, PluginFault> {
@@ -232,6 +244,11 @@ pub async fn submit(
     let data: Submission =
         serde_json::from_slice(&call.payload).map_err(|_| fault("导入参数无效"))?;
     let entries = parse_lines(&data.line)?;
+    let concurrency_limit = data.concurrency_limit.unwrap_or(3);
+    let weight = data.weight.unwrap_or(1);
+    if !(1..=1000).contains(&concurrency_limit) || !(1..=100).contains(&weight) {
+        return Err(fault("新增账号并发或权重超出允许范围"));
+    }
     if uuid::Uuid::parse_str(&data.request_id).is_err()
         || data.group_ids.len() > 20
         || data.group_ids.iter().any(|v| {
@@ -298,6 +315,8 @@ pub async fn submit(
             input,
             group_ids: data.group_ids.clone(),
             transport: transport.clone(),
+            concurrency_limit,
+            weight,
         });
     }
     crate::host::save(&call.host, &queue, version).await?;
@@ -368,7 +387,7 @@ async fn execute(
     input: &Input,
     request_id: &str,
 ) -> Result<(), PluginFault> {
-    let config = json!({"enabled":false,"concurrencyLimit":null,"weight":1,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
+    let config = json!({"enabled":false,"concurrencyLimit":data.concurrency_limit,"weight":data.weight,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
     if let Some(rt) = &input.refresh_token {
         let result = request(host, transport, "/api/admin/accounts/import", json!({"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config})).await?;
         let ids = result["accountIds"]
@@ -407,11 +426,11 @@ async fn execute(
             .to_ascii_lowercase()
             .as_str()
         {
-            "team" | "business" => {
+            "team" | "business" | "plus" | "pro" | "prolite" | "promax" | "go" => {
                 recovery::validate(
                     &json!({"event":"same_workspace","workspaceId":a["accountId"],"originalWorkspaceId":a["accountId"],"tokens":recovery::tokens(&credential)}),
                     &settings(&a),
-                ).map_err(|_| fault("RT 已保存，但 Team 工作区或套餐声明未确认，账号保持暂停，请核对"))?;
+                ).map_err(|_| fault("RT 已保存，但工作区或套餐声明未确认，账号保持暂停，请核对"))?;
                 crate::native::restore(
                     host,
                     id,
@@ -428,7 +447,7 @@ async fn execute(
                     .ok_or_else(|| fault("导入任务缺失"))?
                     .finish(
                         "success",
-                        "提供的 Team RT 已验证、保存并移入 GPT Pro，已启用，未发起账密登录",
+                        "提供的付费账号 RT 已验证并保存，分组已读回确认，已启用，未发起账密登录",
                     );
                 crate::host::save(host, &queue, version).await?;
             }
@@ -448,7 +467,7 @@ async fn execute(
             }
             _ => {
                 return Err(fault(
-                    "提供的 RT 套餐既非 Team/Business 也非 Free，已保留暂停，请核对",
+                    "提供的 RT 套餐不在当前支持范围内，已保留暂停，请核对",
                 ));
             }
         }
@@ -493,6 +512,24 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_request_accepts_explicit_scheduling_without_changing_legacy_inputs() {
+        let line = "fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP";
+        let base =
+            json!({"requestId":"12345678-1234-4234-9234-123456789012","line":line,"groupIds":[]});
+        let legacy: Submission = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.concurrency_limit.unwrap_or(3), 3);
+        assert_eq!(legacy.weight.unwrap_or(1), 1);
+        let mut explicit = base;
+        explicit["concurrencyLimit"] = json!(20);
+        explicit["weight"] = json!(2);
+        let request: Submission = serde_json::from_value(explicit.clone()).unwrap();
+        assert_eq!(request.concurrency_limit, Some(20));
+        assert_eq!(request.weight, Some(2));
+        explicit["concurrencyLimit"] = json!(-1);
+        assert!(serde_json::from_value::<Submission>(explicit).is_err());
+    }
     #[test]
     fn accepts_both_formats_without_putting_rt_in_notes() {
         let three = "fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP";

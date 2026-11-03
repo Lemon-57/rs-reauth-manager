@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from unittest.mock import patch
 import sys
 from pathlib import Path
@@ -49,7 +50,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(result['data']['flowId'], 'native-flow')
         self.assertTrue(result['data']['outboundProxyUrl'].endswith(':24001'))
         self.assertEqual(sum(c[1] == '/api/admin/accounts/oauth/start' for c in self.calls), 1)
-        self.assertEqual(self.start()[0], 409)
+        self.assertEqual(self.start()[0], 200)
         self.assertEqual(sum(c[1] == '/api/admin/accounts/oauth/start' for c in self.calls), 1)
 
     def test_created_native_start_keeps_original_flow_and_proxy(self):
@@ -59,7 +60,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(result['data']['flowId'],'native-flow')
         self.assertEqual(result['data']['authorizationUrl'],'fixture-native-url')
         self.assertIn('outboundProxyUrl',result['data'])
-        self.assertEqual(self.start()[0],409)
+        self.assertEqual(self.start()[0],200)
         self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
 
     def test_created_completion_is_normalized_without_replacing_native_data(self):
@@ -69,6 +70,23 @@ class Tests(unittest.TestCase):
                 status,result=self.adapter.call(path,{'X-Api-Key':'fixture-key'},{'fixture':True})
                 self.assertEqual(status,200)
                 self.assertEqual(result,{'code':200,'data':{}})
+
+    def test_restart_recovers_same_receipt_without_starting_another_native_flow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
+            original=self.start()
+            self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
+            self.assertEqual(self.start(),original)
+            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
+
+    def test_uncertain_native_start_is_not_replayed_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.native_status=503
+            self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
+            self.assertEqual(self.start()[0],503)
+            self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
+            self.assertEqual(self.start()[0],409)
+            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
 
     def test_transport_success_does_not_hide_business_failure_or_bad_envelope(self):
         for status,body in [(201,{'code':403,'data':{}}),(200,{'code':200}),(202,{'code':200,'data':{}}),(503,{'code':200,'data':{}})]:

@@ -106,7 +106,7 @@ def _run_once(data, used_codes):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
-    from fallback import WorkspaceUnavailable, WorkspaceUpgrade, automatic_free_candidate, free_workspace_candidate, merge_workspace_evidence, recover_free, recover_team, recover_unbound_free, team_candidate, workspace_choices
+    from fallback import WorkspaceUnavailable, WorkspaceUpgrade, automatic_free_candidate, free_workspace_candidate, new_account_workspace_candidate, merge_workspace_evidence, recover_free, recover_team, recover_unbound_free, team_candidate, workspace_choices
 
     target = str(data.get("accountId") or "")
     forced = data.get("forceWorkspaceId")
@@ -185,7 +185,7 @@ def _run_once(data, used_codes):
                 self.selected_plan = 'team' if candidate else 'free'
                 if not candidate and allow_free_new:
                     try:
-                        candidate = free_workspace_candidate(session, "")
+                        candidate = (free_workspace_candidate if recover_workspace else new_account_workspace_candidate)(session, "")
                     except ValueError as exc:
                         if str(exc) != "free_workspace_missing":
                             raise
@@ -223,7 +223,7 @@ def _run_once(data, used_codes):
                 self.selected_plan = 'team' if candidate else 'free'
                 if not candidate and allow_free_new:
                     try:
-                        candidate = free_workspace_candidate(evidence, "")
+                        candidate = (free_workspace_candidate if recover_workspace else new_account_workspace_candidate)(evidence, "")
                     except ValueError as exc:
                         if str(exc) != "free_workspace_missing":
                             raise
