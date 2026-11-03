@@ -262,7 +262,7 @@ class Adapter:
         receipt['phase'] = 'native_start_pending'
         atomic(path, receipt)
         data = self.backend('/api/admin/accounts/oauth/start', headers,
-                            {'provider': 'openai', 'name': 'team+' + email, 'outboundProxyUrl': self.url(entry)})
+                            {'provider': 'openai', 'name': email, 'outboundProxyUrl': self.url(entry)})
         if not isinstance(data.get('flowId'), str) or not isinstance(data.get('authorizationUrl'), str):
             raise Rejected(502)
         receipt.update({'phase': 'native_started', 'flowId': data['flowId'], 'exitVerified': True})

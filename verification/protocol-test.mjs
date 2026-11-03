@@ -95,7 +95,8 @@ async function callback(meta,payload) {
   if(url.pathname==='/api/admin/accounts/oauth/start'&&!data.accountId){
    assert.deepEqual(Object.keys(data).sort(),['name','outboundProxyUrl','provider'])
    assert.equal(data.outboundProxyUrl,'http://fixture:pass@127.0.0.1:21001')
-   const id=data.name.slice('team+'.length).split('@')[0],flowId='import_'+id
+   assert.match(data.name,/^[^@]+@example\.com$/);assert.ok(!data.name.startsWith('team+'))
+   const id=data.name.split('@')[0],flowId='import_'+id
    importFlows.set(flowId,id);starts.push(structuredClone(data));dataReply={flowId,authorizationUrl:nativeAuthorization};status=201
   }else if(url.pathname==='/api/admin/accounts/oauth/complete'&&data.settings){
    assert.deepEqual(Object.keys(data).sort(),['callbackUrl','flowId','provider','settings'])

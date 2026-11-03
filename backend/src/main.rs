@@ -897,7 +897,7 @@ async fn handle(
             "/api/admin/accounts/oauth/start",
             Some(json!({
                 "provider":"openai",
-                "name":format!("team+{}", request.email.trim()),
+                "name":request.email.trim(),
                 "outboundProxyUrl":request.proxy_url
             })),
         )

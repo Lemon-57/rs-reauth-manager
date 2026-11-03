@@ -117,7 +117,7 @@ class Adapter:
                 # No second allocation or OAuth flow on response uncertainty.
                 return 409, {'code': 409}
             self.remember(key, {'requestId': request_id, 'phase': 'unconfirmed'})
-            status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': 'team+' + email}, host=self.manager_host)
+            status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': email}, host=self.manager_host)
             if status not in (200, 201) or result.get('code') != 200:
                 return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502}
             data = result['data']
