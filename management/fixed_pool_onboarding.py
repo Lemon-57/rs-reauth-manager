@@ -129,12 +129,16 @@ class Adapter:
         proxy = self.url(entry)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy, 'https': proxy}))
         # 仅重试提交前的只读出口检测，始终使用同一个固定认证和出口
-        for attempt in range(3):
+        checks = ('https://api64.ipify.org', 'https://www.cloudflare.com/cdn-cgi/trace',
+                  'https://api64.ipify.org')
+        for attempt, url in enumerate(checks):
             try:
-                with opener.open('https://api64.ipify.org', timeout=5) as response:
-                    actual = response.read(128).decode().strip()
+                with opener.open(url, timeout=5) as response:
+                    raw = response.read(4096).decode().strip()
+                actual = (next((line[3:] for line in raw.splitlines() if line.startswith('ip=')), '')
+                          if attempt == 1 else raw)
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
-                if attempt == 2:
+                if attempt == len(checks) - 1:
                     raise Rejected(503, 'proxy_exit_unavailable') from None
                 time.sleep(0.25)
                 continue
@@ -154,6 +158,8 @@ class Adapter:
         if path.exists():
             return self.recover_reservation(path, email, request_id)
         with self.allocation_lock():
+            if path.exists():
+                raise Rejected(409, 'receipt_phase')
             if (self.manager.root / 'private/pending.json').exists():
                 raise Rejected()
             rows = self.manager.rows()
@@ -313,6 +319,10 @@ class Adapter:
         # Keep the existing background allocator from racing native persistence
         # and assigning the new account a second identity before binding finishes.
         with self.allocation_lock():
+            # During a staged switch two adapter processes can observe the same flow
+            # before either acquires the shared file lock. Only one may submit it.
+            if json.loads(path.read_text()) != receipt:
+                raise Rejected(409, 'receipt_phase')
             receipt['phase'] = 'native_complete_pending'
             atomic(path, receipt)
             result = self.backend('/api/admin/accounts/oauth/complete', headers, body)

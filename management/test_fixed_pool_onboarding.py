@@ -20,12 +20,13 @@ class OnboardingTests(unittest.TestCase):
         entry = {'username': 'fixture-user', 'password': 'fixture-pass', 'host': '127.0.0.1',
                  'port': 31001, 'exit_ip': '192.0.2.1'}
         opener = types.SimpleNamespace(open=Mock(
-            side_effect=[urllib.error.URLError('fixture temporary failure'), io.BytesIO(b'192.0.2.1')]))
+            side_effect=[urllib.error.URLError('fixture temporary failure'), io.BytesIO(b'ip=192.0.2.1\n')]))
         with patch('fixed_pool_onboarding.urllib.request.build_opener', return_value=opener) as build, patch('fixed_pool_onboarding.time.sleep'):
             Adapter.verify_exit(self.adapter, entry)
         self.assertEqual(build.call_count, 1)
         self.assertEqual(opener.open.call_count, 2)
-        self.assertEqual(opener.open.call_args_list[0], opener.open.call_args_list[1])
+        self.assertEqual([call.args[0] for call in opener.open.call_args_list],
+                         ['https://api64.ipify.org', 'https://www.cloudflare.com/cdn-cgi/trace'])
         self.assertFalse(any(path.endswith('/oauth/start') for path, _ in self.calls))
 
     def test_exit_probe_failure_is_bounded_and_mismatch_is_never_retried(self):
@@ -321,6 +322,23 @@ class OnboardingTests(unittest.TestCase):
         receipt = json.loads(self.adapter.receipt_path('fixture@example.com').read_text())
         self.assertEqual(receipt['phase'], 'native_started')
         self.assertFalse(any(path.endswith('/oauth/complete') for path, _ in self.calls))
+
+    def test_complete_refuses_receipt_changed_by_another_process_before_lock(self):
+        started = self.start()
+        path = self.adapter.receipt_path('fixture@example.com')
+
+        @contextlib.contextmanager
+        def changed(_):
+            receipt = json.loads(path.read_text())
+            receipt['phase'] = 'native_complete_pending'
+            atomic(path, receipt)
+            yield
+
+        self.module.allocation_lock = changed
+        with self.assertRaises(Rejected) as failure:
+            self.adapter.call('/api/admin/accounts/oauth/complete', {}, self.body(started))
+        self.assertEqual(failure.exception.reason, 'receipt_phase')
+        self.assertFalse(any(route.endswith('/oauth/complete') for route, _ in self.calls))
 
     def test_exception_inside_held_lock_is_not_retried(self):
         started = self.start()
