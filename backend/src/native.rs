@@ -526,6 +526,14 @@ async fn complete_new_account(
         credential.credential_revision,
     )
     .await?;
+    let verified_settings = crate::import_profile::apply(
+        host,
+        &snapshot["protectedTransport"],
+        id,
+        &verified_settings,
+        credential.credential_revision,
+    )
+    .await?;
     snapshot["postAuthorizationSettings"] = verified_settings;
     let paid = account["planType"].as_str().is_some_and(paid_import_plan);
     snapshot["resumeEnabled"] = json!(paid);

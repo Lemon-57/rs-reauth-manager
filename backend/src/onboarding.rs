@@ -111,6 +111,7 @@ pub async fn request(
     if !matches!(
         path,
         "/_management/onboarding/start"
+            | "/_management/onboarding/prolite-check"
             | "/api/admin/accounts/import"
             | "/api/admin/accounts/oauth/complete"
             | "/api/admin/accounts/batch-update"
@@ -431,14 +432,16 @@ async fn execute(
                     &json!({"event":"same_workspace","workspaceId":a["accountId"],"originalWorkspaceId":a["accountId"],"tokens":recovery::tokens(&credential)}),
                     &settings(&a),
                 ).map_err(|_| fault("RT 已保存，但工作区或套餐声明未确认，账号保持暂停，请核对"))?;
-                crate::native::restore(
+                let expected = crate::import_profile::apply(
                     host,
+                    transport,
                     id,
                     &settings(&a),
                     credential.credential_revision,
-                    true,
                 )
                 .await?;
+                crate::native::restore(host, id, &expected, credential.credential_revision, true)
+                    .await?;
                 let (mut queue, version) = crate::host::load(host).await?;
                 queue
                     .jobs

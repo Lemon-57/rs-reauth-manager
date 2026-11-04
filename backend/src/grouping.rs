@@ -51,7 +51,7 @@ fn membership(existing: &[Value], name: &str, id: &str) -> Result<Vec<String>, P
     Ok(ids)
 }
 
-async fn destination(host: &HostClient, name: &str) -> Result<String, PluginFault> {
+pub(crate) async fn destination(host: &HostClient, name: &str) -> Result<String, PluginFault> {
     let mut rows = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut total = None;

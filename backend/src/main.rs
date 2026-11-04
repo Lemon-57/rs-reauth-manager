@@ -7,6 +7,7 @@ mod diagnostics;
 mod executor;
 mod grouping;
 mod host;
+mod import_profile;
 mod native;
 mod onboarding;
 mod recovery;
@@ -1400,5 +1401,4 @@ mod tests {
         assert!(!row.to_string().contains("excluded"));
         assert!(account_row(&json!({}), vec![])["manualExpiresAt"].is_null());
     }
-
 }

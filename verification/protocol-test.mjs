@@ -71,18 +71,30 @@ async function callback(meta,payload) {
    const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,3);assert.equal(data.settings.enabled,false)
    assert.equal(data.data.refreshToken,'fixture-provided-rt')
    const a=add(id);Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:[],planType:(id.startsWith('up_')||id.startsWith('unbound_'))?'free':id.startsWith('rt_business')?'business':'team'})
+   if(id.includes('prolite'))a.planType='prolite'
+   if(id==='rt_profile_pro')a.planType='pro'
+   if(id==='rt_profile_plus')a.planType='plus'
+   a.concurrencyLimit=data.settings.concurrencyLimit;a.weight=data.settings.weight
    credentials.set(id,credential(a));
    if(id.startsWith('unbound_')) {
     a.accountId=null;const c=credentials.get(id);c.facts.upstream_account_id=null
     for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
    }
    reply={accountIds:[id]};if(id==='rt_lost_batch')protectedStatus=503
+  } else if(url.pathname==='/_management/onboarding/prolite-check') {
+   const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);assert.equal(a.planType,'prolite');assert.equal(data.credentialRevision,revisions.get(a.id))
+   reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
+   if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
-   const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0);a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled';reply={}
+   const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.equal(a.planType,'prolite');assert.equal(data.concurrencyLimit,50);assert.equal(data.weight,100);assert.deepEqual(data.groupIds,['gpt-pro']);a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('write_lost'))protectedStatus=503}
+   else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
+   reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
    const id=importFlows.get(data.flowId);assert.ok(id);const a=add(id)
    Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:[],concurrencyLimit:null,weight:1,modelAccess:data.settings.modelAccess})
    if(id==='new_import_free_ui')a.planType='free'
+   if(id.includes('prolite'))a.planType='prolite'
    credentials.set(a.id,credential(a));completes.push({protected:true,flowId:data.flowId});reply={accountId:id}
   } else throw Error('Unexpected protected route '+url.pathname)
   const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:200,data:reply})))
@@ -194,7 +206,9 @@ function parse() {
       else if (meta.type === 'result') meta.result = data
     }
     payload = payload.subarray(requestBytes + dataBytes)
-    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 5); ready.resolve() }
+    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 7); ready.resolve() }
+    else if (meta.type === 'resume') send({type:'resumed',id:meta.id,epoch:meta.epoch})
+    else if (meta.type === 'suspend' || meta.type === 'callback_consumed') {}
     else if (meta.type === 'callback') callback(meta, payload).catch(e => { ready.reject(e); for (const w of pending.values()) w.reject(e) })
     else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result') w.resolve({ result: meta.result, payload }); else w.reject(new Error(JSON.stringify(meta.error))) } }
   }
@@ -205,13 +219,13 @@ async function start() {
   child.stdout.on('data', data => { buffer = Buffer.concat([buffer, data]); parse() }); child.stderr.on('data', data => errors += data)
   child.on('error', e => ready.reject(e))
   child.on('exit', code => { if (code) { const e = new Error(`Plugin exit ${code}: ${errors}`); ready.reject(e); for (const w of pending.values()) w.reject(e) } })
-  send({ type: 'hello', handshake: { protocol_version: 5, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration: {protectedManagementUrl:'http://127.0.0.1:18139'}, contributes: { management: { id: 'personal.reauth-manager.management', version: 2, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
+  send({ type: 'hello', handshake: { protocol_version: 7, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration: {protectedManagementUrl:'http://127.0.0.1:18139'}, contributes: { management: { id: 'personal.reauth-manager.management', version: 2, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
   await ready.promise
 }
 async function stop() { const exited = new Promise(resolve => child.once('exit', resolve)); send({ type: 'shutdown' }); child.stdin.end(); await exited }
 async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'management') {
   const id = sequence += 2, w = Promise.withResolvers(); pending.set(id, w)
-  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: 60000, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
+  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: 1000, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
   return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), 10000).unref())])
 }
 async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [{name:'x-api-key',value:Array.from(Buffer.from('fixture-admin-key'))}] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
@@ -333,6 +347,27 @@ try {
  } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
+ for(const id of ['rt_prolite_profile','new_prolite_profile','rt_prolite_shared','rt_prolite_proof_unavailable','rt_prolite_write_lost','rt_profile_pro','rt_profile_plus']) {
+  const requestId=randomUUID(),hasRT=id.startsWith('rt_'),n=starts.length,c=completes.length
+  const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(hasRT?'----fixture-provided-rt':''),groupIds:[],concurrencyLimit:7,weight:4}
+  assert.equal((await request('import-line',body)).status,200)
+  let done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')
+  for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
+  const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost/.test(id)
+  assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
+  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(!id.includes('prolite')){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
+  assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
+  assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
+  const counts=[starts.length,completes.length,refreshes.length];await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
+  accounts.splice(accounts.findIndex(x=>x.id===id),1)
+  check(id+': only verified new ProLite imports use 50/100, GPT Pro, unique IPv6 proof and fail closed without replay')
+ }
+ {
+  const a=add('existing_prolite');a.planType='prolite';a.concurrencyLimit=9;a.weight=6;credentials.set(a.id,credential(a));const original=structuredClone(a)
+  await submit([a.id]);assert.equal((await finish(a.id)).status,'success');assert.equal(a.concurrencyLimit,9);assert.equal(a.weight,6);assert.deepEqual(a.groups,original.groups)
+  accounts.splice(accounts.findIndex(x=>x.id===a.id),1);check('Existing ProLite reauthorization preserves manual concurrency, weight, group and proxy')
+ }
  for(const [id,hasRT] of [['new_import_ui',false],['new_import_free_ui',false],['rt_team_ui',true],['rt_business_ui',true],['up_import_ui',true]]) {
   const requestId=randomUUID(),n=starts.length,c=completes.length
   const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(hasRT?'----fixture-provided-rt':''),groupIds:[]}
