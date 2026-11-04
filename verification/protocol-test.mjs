@@ -15,7 +15,7 @@ const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revi
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
 let groupMode='normal'
 const importFlows=new Map(), providedImports=[]
-let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null
+let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null,protectedGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
 function credential(a,workspace=a.accountId,plan=a.planType) {
@@ -97,6 +97,7 @@ async function callback(meta,payload) {
    if(id.includes('prolite'))a.planType='prolite'
    credentials.set(a.id,credential(a));completes.push({protected:true,flowId:data.flowId});reply={accountId:id}
   } else throw Error('Unexpected protected route '+url.pathname)
+  if(protectedGate?.path===url.pathname){protectedGate.reached.resolve();await protectedGate.release.promise}
   const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:200,data:reply})))
   return result(meta.id,{status:protectedStatus,http_version:'HTTP/1.1',headers:[],stream,trailers:[]})
  }
@@ -210,7 +211,7 @@ function parse() {
     else if (meta.type === 'resume') send({type:'resumed',id:meta.id,epoch:meta.epoch})
     else if (meta.type === 'suspend' || meta.type === 'callback_consumed') {}
     else if (meta.type === 'callback') callback(meta, payload).catch(e => { ready.reject(e); for (const w of pending.values()) w.reject(e) })
-    else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result') w.resolve({ result: meta.result, payload }); else w.reject(new Error(JSON.stringify(meta.error))) } }
+    else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result' || meta.type === 'cancelled') w.resolve({ result: meta.result, payload, cancelled:meta.type==='cancelled' }); else w.reject(new Error(JSON.stringify(meta.error))) } }
   }
 }
 async function start() {
@@ -277,7 +278,46 @@ async function verifyDurableBatches() {
 }
 try {
  await start()
- if(process.env.RS_REAUTH_TEST_CASE==='team-consistency') {
+ if(process.env.RS_REAUTH_TEST_CASE==='import-cancellation') {
+  for(const phase of ['start','complete','rt']) {
+   const id='new_cancel_'+phase,requestId=randomUUID(),path=phase==='start'?'/_management/onboarding/start':phase==='rt'?'/api/admin/accounts/import':'/api/admin/accounts/oauth/complete'
+   const line=id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(phase==='rt'?'----fixture-provided-rt':'')
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   if(phase==='complete'){await tick();await sleep(150)}
+   protectedGate={path,reached:Promise.withResolvers(),release:Promise.withResolvers()}
+   const reconcile=call('plugin.reconcile',{},Buffer.alloc(0),'maintenance'),callId=sequence
+   await protectedGate.reached.promise
+   assert.equal(records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import').status,'running')
+   send({type:'cancel',id:callId});assert.equal((await reconcile).cancelled,true)
+   const counts=[starts.length,completes.length,providedImports.length,refreshes.length]
+   protectedGate.release.resolve();protectedGate=null;await sleep(60)
+   await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+   const done=(await request('jobs')).value.jobs.find(j=>j.requestId===requestId+':import')
+   assert.equal(done.status,'review','Cancelled parent calls must not leave a running job with no worker')
+   assert.ok(done.finishedAt);assert.match(done.message,/未确认|中断/)
+   assert.deepEqual([starts.length,completes.length,providedImports.length,refreshes.length],counts,'Uncertain native operations are never replayed')
+   if(phase!=='start')assert.equal(accounts.find(a=>a.id===id).enabled,false)
+   await tick();assert.deepEqual([starts.length,completes.length,providedImports.length,refreshes.length],counts)
+   check(phase+': cancellation settles orphaned intent and preserves native receipts, fixed exit and paused accounts without replay')
+  }
+  {
+   const requestId=randomUUID(),ids=['new_cancel_batch','new_after_cancel'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ').join('\n')
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   protectedGate={path:'/_management/onboarding/start',reached:Promise.withResolvers(),release:Promise.withResolvers()}
+   const reconcile=call('plugin.reconcile',{},Buffer.alloc(0),'maintenance'),callId=sequence
+   await protectedGate.reached.promise;send({type:'cancel',id:callId});assert.equal((await reconcile).cancelled,true)
+   protectedGate.release.resolve();protectedGate=null;await sleep(60)
+   await tick();let all=(await request('jobs')).value.jobs
+   assert.equal(all.find(j=>j.requestId===requestId+':import:1').status,'review')
+   assert.equal(all.find(j=>j.requestId===requestId+':import:2').status,'queued')
+   for(let i=0;i<60;i++){await tick();await sleep(60);all=(await request('jobs')).value.jobs;if(all.find(j=>j.requestId===requestId+':import:2').status==='success')break}
+   assert.equal(all.find(j=>j.requestId===requestId+':import:2').status,'success')
+   assert.equal(starts.filter(s=>s.email===ids[0]+'@example.com').length,1)
+   assert.equal(accounts.find(a=>a.id===ids[1]).enabled,true)
+   check('The next queued import survives cancellation and completes once while the uncertain row remains in review')
+  }
+  await stop();console.log(`Verified ${passed} import cancellation scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='team-consistency') {
   for(const id of ['up_projection_ok','up_projection_control','saved_team_ok','saved_team_projected','saved_team_expired','saved_team_wrong_user','saved_team_wrong_email','saved_team_wrong_subject','saved_team_wrong_workspace']) {
    const a=add(id);a.enabled=false;a.status='disabled';a.planType=id.startsWith('up_')?'free':'team';credentials.set(id,credential(a))
    if(id.startsWith('saved_')) {

@@ -545,6 +545,30 @@ impl Manager {
     async fn tick(&mut self, host: &HostClient) -> Result<(), PluginFault> {
         self.recover(host).await?;
         let (mut queue, mut version) = host::load(host).await?;
+        // SDK 取消父调用时会直接丢弃 future，跳过原调用的错误收尾。
+        // 此时已持久化的 running 意图可能还在，但准备资料或取出的 worker
+        // 已随 future 释放。管理锁保证这里不会与仍在执行的同步阶段重叠。
+        // 只收尾无本地 worker 的任务，绝不重新提交未知结果的原生操作。
+        let mut orphaned = false;
+        for job in &mut queue.jobs {
+            if job.status == "running"
+                && !self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.request_id == job.request_id)
+            {
+                job.finish(
+                    "review",
+                    "后台调用已中断，执行结果未确认；请核对账号、原生授权回执与固定代理，未自动重放",
+                );
+                orphaned = true;
+            }
+        }
+        if orphaned {
+            host::save(host, &queue, version).await?;
+            onboarding::prune(self, &queue);
+            return Ok(());
+        }
         if !queue.automation.enabled {
             let mut cancelled = false;
             for job in &mut queue.jobs {

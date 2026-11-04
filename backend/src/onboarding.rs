@@ -353,6 +353,7 @@ pub async fn advance(manager: &mut Manager, host: &HostClient) -> Result<bool, P
         .ok_or_else(|| fault("待导入任务状态冲突"))?;
     job.status = "running".into();
     job.step = "preparing".into();
+    job.message = "正在检查运行环境、固定代理与原生 OAuth 流程".into();
     job.started_at = Some(now());
     job.implementation_version = Some(env!("CARGO_PKG_VERSION").into());
     crate::host::save(host, &queue, version).await?;
