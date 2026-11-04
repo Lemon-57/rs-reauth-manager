@@ -59,13 +59,13 @@ pub async fn apply(
         host,
         transport,
         "/api/admin/accounts/batch-update",
-        json!({"accountIds":[id],"concurrencyLimit":50,"weight":100,"groupIds":[group]}),
+        json!({"accountIds":[id],"concurrencyLimit":100,"weight":100,"groupIds":[group]}),
     )
     .await?;
     let after = detail(host, id).await?;
     let saved = recovery::credential(host, id).await?;
     let mut wanted = expected.clone();
-    wanted["concurrencyLimit"] = json!(50);
+    wanted["concurrencyLimit"] = json!(100);
     wanted["weight"] = json!(100);
     wanted["groups"] = after["groups"].clone();
     let groups = after["groups"].as_array();

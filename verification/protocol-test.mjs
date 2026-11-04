@@ -87,7 +87,7 @@ async function callback(meta,payload) {
    if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.equal(a.planType,'prolite');assert.equal(data.concurrencyLimit,50);assert.equal(data.weight,100);assert.deepEqual(data.groupIds,['gpt-pro']);a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('write_lost'))protectedStatus=503}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.equal(a.planType,'prolite');assert.equal(data.concurrencyLimit,100);assert.equal(data.weight,100);assert.deepEqual(data.groupIds,['gpt-pro']);a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('write_lost'))protectedStatus=503}
    else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
    reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
@@ -355,13 +355,13 @@ try {
   for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
   const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost/.test(id)
   assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
-  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(!id.includes('prolite')){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
   assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
   const counts=[starts.length,completes.length,refreshes.length];await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
   accounts.splice(accounts.findIndex(x=>x.id===id),1)
-  check(id+': only verified new ProLite imports use 50/100, GPT Pro, unique IPv6 proof and fail closed without replay')
+  check(id+': only verified new ProLite imports use 100/100, GPT Pro, unique IPv6 proof and fail closed without replay')
  }
  {
   const a=add('existing_prolite');a.planType='prolite';a.concurrencyLimit=9;a.weight=6;credentials.set(a.id,credential(a));const original=structuredClone(a)
