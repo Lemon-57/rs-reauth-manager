@@ -1,5 +1,9 @@
 import unittest
 import tempfile
+import json
+import hashlib
+import os
+import time
 from unittest.mock import patch
 import sys
 from pathlib import Path
@@ -87,6 +91,59 @@ class Tests(unittest.TestCase):
             self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
             self.assertEqual(self.start()[0],409)
             self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
+
+    def recovery_fixture(self, directory, phase='unconfirmed'):
+        self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory,
+                                       recovery_permits=Path(directory) / 'permits.fixture')
+        path = self.adapter.receipt('fixture@example.com')
+        prior = {'requestId': 'old-request', 'phase': phase}
+        if phase == 'ready':
+            prior['result'] = {'code': 200, 'data': {'flowId': 'expired-fixture-flow'}}
+        self.adapter.remember('fixture@example.com', prior)
+        os.utime(path, (time.time() - 1800,) * 2)
+        permit = {'receiptSha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'receiptPhase': phase,
+                  'directoryReconciled': True, 'nativeFlowsReconciled': True, 'oldFlowAbsent': True,
+                  'allowNewNativeReservation': True, 'expiresAt': time.time() + 600}
+        self.adapter.recovery_permits.write_text(json.dumps({path.stem: permit}))
+        return path, prior, permit
+
+    def test_operator_recovery_preserves_history_and_cannot_be_consumed_twice(self):
+        for phase in ['unconfirmed', 'ready']:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                self.calls = []
+                path, prior, _ = self.recovery_fixture(directory, phase)
+                self.assertEqual(self.start()[0], 200)
+                current = json.loads(path.read_text())
+                self.assertEqual(current['recoveryHistory'], [prior])
+                self.assertTrue(current['recoveryApproved'])
+                self.assertEqual(self.start()[0], 200)
+                self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls), 1)
+                self.assertFalse(self.adapter.approved_recovery(path, current, 'another-request'))
+
+    def test_recovery_requires_every_exact_operator_approval(self):
+        for key, value in [('receiptSha256', 'different'), ('receiptPhase', 'ready'),
+                           ('directoryReconciled', False), ('nativeFlowsReconciled', False),
+                           ('oldFlowAbsent', False), ('allowNewNativeReservation', False),
+                           ('expiresAt', 0), ('expiresAt', time.time() + 1200)]:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                self.calls = []
+                path, prior, permit = self.recovery_fixture(directory)
+                permit[key] = value
+                self.adapter.recovery_permits.write_text(json.dumps({path.stem: permit}))
+                self.assertEqual(self.start()[0], 409)
+                self.assertEqual(json.loads(path.read_text()), prior)
+                self.assertFalse(any(c[1].endswith('oauth/start') for c in self.calls))
+
+    def test_recovery_uncertain_result_does_not_replay_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, prior, _ = self.recovery_fixture(directory)
+            self.native_status = 503
+            self.assertEqual(self.start()[0], 503)
+            self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory,
+                                           recovery_permits=Path(directory) / 'permits.fixture')
+            self.assertEqual(self.start()[0], 409)
+            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls), 1)
+            self.assertEqual(json.loads(path.read_text())['recoveryHistory'], [prior])
 
     def test_transport_success_does_not_hide_business_failure_or_bad_envelope(self):
         for status,body in [(201,{'code':403,'data':{}}),(200,{'code':200}),(202,{'code':200,'data':{}}),(503,{'code':200,'data':{}})]:

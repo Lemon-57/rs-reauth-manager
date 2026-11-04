@@ -29,3 +29,21 @@ and applying a newly authorized binding requires a separate protected workflow.
 
 The HTTP handler logs only fixed rejection categories and status codes; it never
 logs the request, email, callback, proxy authentication or login notes.
+
+## Native immutable IPv6 manager adapter
+
+`onboarding_service.py` accepts an optional private `--recovery-permits` file for
+an operator-reconciled failed new-account start. Each entry is keyed by the
+receipt filename stem and requires the exact `receiptSha256`, `receiptPhase`,
+`directoryReconciled: true`, `nativeFlowsReconciled: true`, `oldFlowAbsent: true`,
+`allowNewNativeReservation: true` and an expiry within the next 900 seconds. The
+receipt must be at least 900 seconds old and in `unconfirmed` or `ready` phase.
+
+Reconcile the complete directory, pending native flows and unbound permanent
+ownership history before approving recovery. A new manually approved native
+flow may reserve a never-used identity through the current protected manager.
+Existing reservations and permanent IPv6 ownership are retained and never
+transferred or returned to the pool. The old receipt stays in `recoveryHistory`.
+The new pending receipt invalidates the old approval before submission, so an
+uncertain result blocks another recovery attempt, including after restart.
+Ordinary starts still reject duplicates and never use this path automatically.

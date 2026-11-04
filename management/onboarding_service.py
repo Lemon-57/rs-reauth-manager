@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +19,7 @@ AUTH_HEADERS = {'cookie', 'x-api-key', 'authorization', 'origin', 'x-csrf-token'
 LOCK = threading.RLock()
 PUBLIC_ORIGIN = 'https://rs.example.invalid'
 MANAGER_UNIT = 'rs-protected-manager.service'
+SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def send(port, path, headers, body=None, host='127.0.0.1'):
@@ -43,13 +45,14 @@ def normalize_success(status, result):
 
 
 class Adapter:
-    def __init__(self, allocator, manager_port, gateway_port, manager_host='127.0.0.1', state_dir=None):
+    def __init__(self, allocator, manager_port, gateway_port, manager_host='127.0.0.1', state_dir=None, recovery_permits=None):
         self.allocator = allocator
         self.manager_port = manager_port
         self.manager_host = manager_host
         self.gateway_port = gateway_port
         self.pending = {}
         self.state_dir = Path(state_dir) if state_dir is not None else None
+        self.recovery_permits = Path(recovery_permits) if recovery_permits else None
         if self.state_dir is not None:
             self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -69,6 +72,23 @@ class Adapter:
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
         self.pending[email] = record
+
+    def approved_recovery(self, receipt, prior, request_id):
+        # 仅允许管理员核对完整目录及旧原生流程后，恢复精确的旧回执
+        if self.recovery_permits is None or receipt is None or not receipt.is_file():
+            return False
+        raw = receipt.read_bytes()
+        permit = json.loads(self.recovery_permits.read_text()).get(receipt.stem, {})
+        now = time.time()
+        return (json.loads(raw) == prior and prior.get('phase') in {'unconfirmed', 'ready'}
+                and prior.get('requestId') != request_id and now - receipt.stat().st_mtime >= 900
+                and permit.get('receiptSha256') == hashlib.sha256(raw).hexdigest()
+                and permit.get('receiptPhase') == prior['phase']
+                and permit.get('directoryReconciled') is True
+                and permit.get('nativeFlowsReconciled') is True
+                and permit.get('oldFlowAbsent') is True
+                and permit.get('allowNewNativeReservation') is True
+                and now < permit.get('expiresAt', 0) <= now + 900)
 
     def call(self, path, headers, body):
         # Validate the original administrator authentication before reading input or reserving a slot.
@@ -105,18 +125,25 @@ class Adapter:
                 return 503, {'code': 503}
             prior = self.pending.get(key)
             receipt = self.receipt(key)
-            if prior is None and receipt is not None and receipt.exists():
+            if receipt is not None and receipt.exists():
                 prior = json.loads(receipt.read_text(encoding='utf-8'))
                 self.pending[key] = prior
+            history = []
             if prior is not None:
                 # A matching request may recover its saved response, never create another flow.
                 if prior.get('requestId') == request_id and prior.get('phase') == 'ready':
                     return 200, prior['result']
-                return 409, {'code': 409}
+                if not self.approved_recovery(receipt, prior, request_id):
+                    return 409, {'code': 409}
+                history = [prior]
             if len(self.pending) >= 1000:
                 # No second allocation or OAuth flow on response uncertainty.
                 return 409, {'code': 409}
-            self.remember(key, {'requestId': request_id, 'phase': 'unconfirmed'})
+            record = {'requestId': request_id, 'phase': 'unconfirmed', 'createdAt': time.time()}
+            if history:
+                # 原回执和永久 IPv6 归属完整保留，失败或未知结果不自动重放
+                record.update({'recoveryHistory': history, 'recoveryApproved': True})
+            self.remember(key, record)
             status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': email}, host=self.manager_host)
             if status not in (200, 201) or result.get('code') != 200:
                 return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502}
@@ -126,7 +153,7 @@ class Adapter:
                 return 409, {'code': 409}
             # The manager already verified the slot, actual exit, credentials and registered its native flow.
             result = {'code': 200, 'data': {**data, 'outboundProxyUrl': self.allocator.url(entry)}}
-            self.remember(key, {'requestId': request_id, 'phase': 'ready', 'result': result})
+            self.remember(key, {**record, 'phase': 'ready', 'result': result})
             return 200, result
 
 
@@ -135,6 +162,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def do_GET(self):
+        status = 200 if self.path == '/health' else 404
+        raw = json.dumps({'code': status, 'data': {'sourceSha256': SOURCE_SHA256} if status == 200 else None}).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(raw)
 
     def do_POST(self):
         status, result = 503, {'code': 503}
@@ -153,9 +190,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0 < size <= 49152:
                     raise ValueError('body_limit')
                 status, result = self.server.adapter.call(self.path, dict(self.headers), json.loads(self.rfile.read(size)))
-        except Exception:
+        except Exception as error:
             # Do not send exceptions, headers, input or backend bodies to diagnostics.
             status, result = 503, {'code': 503}
+            print(json.dumps({'onboardingFailure': type(error).__name__, 'status': status}), flush=True)
         raw = json.dumps(result).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
@@ -180,6 +218,7 @@ def main():
     parser.add_argument('--public-origin', required=True)
     parser.add_argument('--manager-unit', required=True)
     parser.add_argument('--state-dir', required=True, type=Path)
+    parser.add_argument('--recovery-permits', type=Path)
     args = parser.parse_args()
     parsed = urllib.parse.urlsplit(args.public_origin)
     if parsed.scheme != 'https' or not parsed.netloc or parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username or parsed.password:
@@ -200,7 +239,7 @@ def main():
     allocator.slots()
     os.umask(0o077)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    server.adapter = Adapter(allocator, args.manager_port, args.gateway_port, args.manager_host, args.state_dir)
+    server.adapter = Adapter(allocator, args.manager_port, args.gateway_port, args.manager_host, args.state_dir, args.recovery_permits)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     try:
         server.serve_forever()
