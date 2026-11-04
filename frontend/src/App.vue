@@ -7,12 +7,13 @@ import { ZIconButton } from '@codex-proxy/ui/icon-button'
 import { ZInput } from '@codex-proxy/ui/input'
 import { ZPagination } from '@codex-proxy/ui/pagination'
 import { ZSelect } from '@codex-proxy/ui/select'
-import { ZTable, ZTableColumnSettings, useTableColumns, type TableColumn } from '@codex-proxy/ui/table'
+import { ZTable, ZTableColumnSettings, type TableColumn } from '@codex-proxy/ui/table'
 import { ZTag } from '@codex-proxy/ui/tag'
 import { ZTextarea } from '@codex-proxy/ui/textarea'
 import { displayTime, isActive, planLabel, planType, progress, resultMessage, statusText } from './format'
 import { useReauthManager } from './useReauthManager'
 import type { Account } from './types'
+import { useAccountColumns } from './useAccountColumns'
 
 const { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, filtered, visible, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
 const statusOptions = [{ value: 'all', label: '全部状态' }, { value: 'error', label: '账号异常' }, { value: 'ready', label: '可重新授权' }, { value: 'active', label: '处理中' }, { value: 'failed', label: '本次未完成' }, { value: 'success', label: '本次成功' }, { value: 'invalid', label: '备注或代理缺失' }, { value: 'disabled', label: '已停用' }]
@@ -28,7 +29,7 @@ const columns: TableColumn<Account>[] = [
  { key: 'result', label: '重新授权', kind: 'custom', minWidth: 210, align: 'center' },
  { key: 'actions', label: '操作', kind: 'actions', width: 86, align: 'center', hideable: false }
 ]
-const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(columns, 'reauth-manager-accounts')
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useAccountColumns(columns, 'reauth-manager-accounts')
 </script>
 
 <template>

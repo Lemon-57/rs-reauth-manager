@@ -31,4 +31,5 @@ verification/*
 !verification/batch-test.mjs
 !verification/executor-test.py
 !verification/polling-test.mjs
+!verification/columns-sandbox-test.mjs
 !verification/conventions.mjs
