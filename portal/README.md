@@ -34,6 +34,14 @@ handled by resolving the current revision rather than replaying stale mutations.
 The portal administrator password is independent of the RS administrator password.
 Native session cookies and client-supplied API keys are not forwarded. The server
 uses its runtime credential only after validating a portal administrator session.
+The browser Origin is checked by the portal and is not forwarded with the
+server-to-server API-key request. This preserves the existing native management
+origin policy when the portal uses a different hostname.
+
+For a parallel upgrade, `--previous-auth-port` may point at the previous portal's
+loopback listener. Existing sessions are validated there for at most eight hours;
+logout revokes the previous session as well. Keep that listener available until
+its original sessions expire. Credentials and session tokens are not exported.
 
 New imports keep the installed plugin's policies, including its default account
 concurrency and any verified subscription-specific exceptions. This application

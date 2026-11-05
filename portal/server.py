@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import socket
 import threading
+import time
 from urllib.parse import urlsplit
 from auth import Auth
 
@@ -85,7 +86,7 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, upstream, origin, credentials):
+    def __init__(self, address, upstream, origin, credentials, previous_auth_port=None):
         self.upstream, self.origin = urlsplit(upstream), origin.rstrip("/")
         if self.upstream.scheme != "http" or self.upstream.hostname not in ("127.0.0.1", "localhost"):
             raise ValueError("Upstream must be the local protected RS listener")
@@ -96,8 +97,37 @@ class Server(ThreadingHTTPServer):
             raise ValueError("Public origins require HTTPS")
         self.host = parsed.netloc
         self.auth = Auth(credentials)
+        if previous_auth_port is not None and (not 1024 <= previous_auth_port <= 65535 or previous_auth_port == address[1]):
+            raise ValueError('Invalid previous authentication listener')
+        self.previous_auth_port = previous_auth_port
+        self.previous_auth_until = time.monotonic() + 8 * 3600
         self.slots = threading.BoundedSemaphore(16)
         super().__init__(address, Handler)
+
+    def previous_auth(self, cookie, logout=False):
+        if (self.previous_auth_port is None or time.monotonic() >= self.previous_auth_until
+                or not self.auth.token_id(cookie)):
+            return False
+        conn = http.client.HTTPConnection('127.0.0.1', self.previous_auth_port, timeout=3)
+        try:
+            headers = {'Host': self.host, 'Cookie': cookie}
+            if logout:
+                headers.update({'Origin': self.origin, 'Content-Type': 'application/json'})
+            conn.request('POST' if logout else 'GET', '/api/logout' if logout else '/api/session',
+                         body=b'{}' if logout else None, headers=headers)
+            response = conn.getresponse()
+            raw = response.read(1025)
+            if response.status != 200 or len(raw) > 1024:
+                return False
+            result = json.loads(raw)
+            return result.get('ok' if logout else 'authenticated') is True
+        except (OSError, http.client.HTTPException, ValueError, AttributeError):
+            return False
+        finally:
+            conn.close()
+
+    def authenticated(self, cookie):
+        return self.auth.authenticated(cookie) or self.previous_auth(cookie)
 
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
@@ -170,7 +200,10 @@ class Handler(BaseHTTPRequestHandler):
         headers = {"Host": self.server.host, "Accept": "application/json"}
         headers["X-API-Key"] = self.server.auth.upstream_key
         if method == "POST":
-            headers.update({"Content-Type": "application/json", "Origin": self.server.origin})
+            # Browser Origin is validated at this portal's boundary. This is a
+            # server-to-server API-key call; forwarding the portal Origin would
+            # make the plugin's protected native-OAuth entry reject it.
+            headers["Content-Type"] = "application/json"
         body = None if value is None else json.dumps(value).encode()
         conn = http.client.HTTPConnection(self.server.upstream.hostname, self.server.upstream.port, timeout=50)
         try:
@@ -210,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.upstream(method, path, value)
 
     def require_auth(self):
-        if not self.server.auth.authenticated(self.headers.get('Cookie', '')):
+        if not self.server.authenticated(self.headers.get('Cookie', '')):
             raise Rejected(401, '请先登录导入网页')
 
     def dispatch(self):
@@ -225,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "GET" and self.path == "/healthz":
                 return self.json_reply({"ok": True})
             if self.command == "GET" and self.path == "/api/session":
-                return self.json_reply({"authenticated": self.server.auth.authenticated(self.headers.get('Cookie', ''))})
+                return self.json_reply({"authenticated": self.server.authenticated(self.headers.get('Cookie', ''))})
             if self.command == "POST" and self.path == "/api/login":
                 value = self.read_json()
                 if (not isinstance(value, dict) or set(value) != {"username", "password"}
@@ -234,11 +267,15 @@ class Handler(BaseHTTPRequestHandler):
                 token, status = self.server.auth.login(value['username'], value['password'], self.headers.get('X-Real-IP', self.client_address[0]), self.headers.get('Cookie', ''))
                 if status != 200:
                     raise Rejected(status, '尝试过于频繁，请稍后再试' if status == 429 else '用户名或密码不正确')
+                self.server.previous_auth(self.headers.get('Cookie', ''), logout=True)
                 cookie = self.server.auth.cookie(token, self.server.origin.startswith('https:'))
                 return self.json_reply({"authenticated": True}, cookies=[cookie])
             if self.command == "POST" and self.path == "/api/logout":
                 if self.read_json() != {}:
                     raise Rejected(400, "请求格式无效")
+                old_cookie = self.headers.get('Cookie', '')
+                if self.server.previous_auth(old_cookie) and not self.server.previous_auth(old_cookie, logout=True):
+                    raise Rejected(503, '退出状态未确认，请稍后重试')
                 self.server.auth.logout(self.headers.get('Cookie', ''))
                 return self.json_reply({"ok": True}, cookies=[self.server.auth.cookie('', self.server.origin.startswith('https:'))])
             if self.command == "GET" and self.path == "/api/jobs":
@@ -267,6 +304,7 @@ if __name__ == "__main__":
     parser.add_argument("--upstream", default="http://127.0.0.1:18118")
     parser.add_argument("--origin", required=True)
     parser.add_argument("--credentials", type=Path, required=True)
+    parser.add_argument("--previous-auth-port", type=int)
     args = parser.parse_args()
     credentials = json.loads(args.credentials.read_text())
-    Server(("127.0.0.1", args.port), args.upstream, args.origin, credentials).serve_forever()
+    Server(("127.0.0.1", args.port), args.upstream, args.origin, credentials, args.previous_auth_port).serve_forever()

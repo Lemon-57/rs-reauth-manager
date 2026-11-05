@@ -59,6 +59,8 @@ class Upstream(BaseHTTPRequestHandler):
         if self.headers.get('X-API-Key') != 'test-upstream-key' or self.headers.get('Cookie'):
             return self.answer(401, {})
         if self.path.endswith('/api/api/import-line'):
+            if self.headers.get('Origin') or self.headers.get('Cookie'):
+                return self.answer(403, {'message': 'Protected native origin rejected'})
             if value.get('groupIds') != []:
                 return self.answer(400, {'message': '导入参数无效'})
             type(self).imports += 1
@@ -195,6 +197,19 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(headers['cache-control'], 'no-store')
         self.assertIn("frame-ancestors 'none'", headers['content-security-policy'])
         self.assertEqual(self.call('GET', '/web/')[0], 404)
+
+    def test_existing_sessions_survive_handover_and_logout_revokes_both(self):
+        candidate = Server(('127.0.0.1', 0), f'http://127.0.0.1:{self.upstream.server_port}',
+                           'https://import.example.com', TEST_CREDENTIALS, self.portal.server_port)
+        threading.Thread(target=candidate.serve_forever, daemon=True).start()
+        try:
+            self.assertFalse(candidate.auth.authenticated(self.cookie))
+            self.assertTrue(candidate.authenticated(self.cookie))
+            self.assertTrue(candidate.previous_auth(self.cookie, logout=True))
+            self.assertFalse(candidate.authenticated(self.cookie))
+            self.assertFalse(self.portal.auth.authenticated(self.cookie))
+        finally:
+            candidate.shutdown(); candidate.server_close()
 
 
 if __name__ == '__main__':
