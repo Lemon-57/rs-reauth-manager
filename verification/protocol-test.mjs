@@ -14,7 +14,7 @@ const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
 let groupMode='normal'
-const importFlows=new Map(), providedImports=[]
+const importFlows=new Map(), providedImports=[], startReceipts=new Map(), startRequests=[]
 let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null,protectedGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
@@ -66,7 +66,12 @@ async function callback(meta,payload) {
   let reply,protectedStatus=200
   if(url.pathname==='/_management/onboarding/start') {
    const id=data.email.split('@')[0],flowId='import_'+id
-   importFlows.set(flowId,id);starts.push({protected:true,email:data.email});reply={flowId,authorizationUrl:nativeAuthorization,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'}
+   startRequests.push({email:data.email,requestId:data.requestId})
+   if(startReceipts.has(data.requestId))reply=startReceipts.get(data.requestId)
+   else {
+    importFlows.set(flowId,id);starts.push({protected:true,email:data.email});reply={flowId,authorizationUrl:nativeAuthorization,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001',expiresAt:new Date(Date.now()+900000).toISOString()}
+    startReceipts.set(data.requestId,reply)
+   }
   } else if(url.pathname==='/api/admin/accounts/import') {
    const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,3);assert.equal(data.settings.enabled,false)
    assert.equal(data.data.refreshToken,'fixture-provided-rt')
@@ -231,7 +236,8 @@ async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'man
 }
 async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [{name:'x-api-key',value:Array.from(Buffer.from('fixture-admin-key'))}] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
 const submit = async (ids, requestId = randomUUID()) => { const result = await request('submit', { accountIds: ids, requestId }); if (process.env.RS_REAUTH_TEST_CASE !== 'durable-batches') await tick(); return result }
-const tick = () => request('tick', {})
+// Business progression belongs to host maintenance, never to a browser request.
+const tick = () => call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
 // Compact persisted jobs omit false defaults; expose the same decoded fields as api/jobs.
 const job = id => { const row = records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1); return row && new Proxy(row, { get: (value, key) => value[key] ?? (['automatic','logoutOthers','cleanupStarted','freeFallback','newAccount'].includes(key) ? false : undefined) }) }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -283,10 +289,16 @@ try {
    const id='new_cancel_'+phase,requestId=randomUUID(),path=phase==='start'?'/_management/onboarding/start':phase==='rt'?'/api/admin/accounts/import':'/api/admin/accounts/oauth/complete'
    const line=id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(phase==='rt'?'----fixture-provided-rt':'')
    assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   const beforeBrowser=[starts.length,completes.length,providedImports.length]
+   assert.equal((await request('tick',{})).value.background,true)
+   assert.deepEqual([starts.length,completes.length,providedImports.length],beforeBrowser)
    if(phase==='complete'){await tick();await sleep(150)}
    protectedGate={path,reached:Promise.withResolvers(),release:Promise.withResolvers()}
    const reconcile=call('plugin.reconcile',{},Buffer.alloc(0),'maintenance'),callId=sequence
    await protectedGate.reached.promise
+   const browserTick=await request('tick',{})
+   assert.equal(browserTick.status,200);assert.equal(browserTick.value.background,true)
+   assert.equal((await request('tick',{unexpected:true})).status,400)
    assert.equal(records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import').status,'running')
    send({type:'cancel',id:callId});assert.equal((await reconcile).cancelled,true)
    const counts=[starts.length,completes.length,providedImports.length,refreshes.length]
@@ -299,6 +311,19 @@ try {
    if(phase!=='start')assert.equal(accounts.find(a=>a.id===id).enabled,false)
    await tick();assert.deepEqual([starts.length,completes.length,providedImports.length,refreshes.length],counts)
    check(phase+': cancellation settles orphaned intent and preserves native receipts, fixed exit and paused accounts without replay')
+   if(phase==='start') {
+    const originalNonce=done.importInfo.nativeStartId,beforeStarts=starts.length
+    assert.match(originalNonce,/^[0-9a-f-]{36}$/)
+    // Same persisted receipt survives a plugin restart and is recovered immediately.
+    await stop();records.get('executor').value.expires=0;await start()
+    const resumedId=randomUUID()
+    assert.equal((await request('import-line',{requestId:resumedId,line,groupIds:[]})).status,200)
+    for(let i=0;i<60;i++){await tick();await sleep(60);if(records.get('queue').value.jobs.find(j=>j.requestId===resumedId+':import').status==='success')break}
+    assert.equal(records.get('queue').value.jobs.find(j=>j.requestId===resumedId+':import').status,'success')
+    assert.equal(starts.length,beforeStarts,'Recovery must not reserve another flow or exit')
+    assert.equal(startRequests.at(-1).requestId,originalNonce)
+    check('Explicit three-field resubmission immediately recovers the exact unconsumed native start after restart without allocating or replaying complete')
+   }
   }
   {
    const requestId=randomUUID(),ids=['new_cancel_batch','new_after_cancel'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ').join('\n')

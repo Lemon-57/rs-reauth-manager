@@ -33,6 +33,9 @@ use tokio::sync::Mutex;
 struct ImportInfo {
     line: usize,
     email: String,
+    // Non-secret idempotency key; never persist login inputs or native tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_start_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -840,13 +843,6 @@ async fn handle(
         manager.runtime.prepare().await?;
         return Ok(json!({"ready":true}));
     }
-    if call.request.path == "api/tick" {
-        if call.payload != b"{}" {
-            return Err(fault("请求格式无效"));
-        }
-        manager.tick(&call.host).await?;
-        return Ok(json!({"ok":true}));
-    }
     if call.request.path == "api/import-line" {
         return onboarding::submit(manager, &call).await;
     }
@@ -1279,6 +1275,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && call.request.query.is_empty()
                 {
                     rows(&call.host).await
+                } else if call.request.path == "api/tick" {
+                    // Browser requests may be cancelled when a frame closes. Native
+                    // operations belong to the independent maintenance lifecycle.
+                    if call.request.method == "POST" && call.payload == b"{}"
+                        && call.request.query.is_empty() {
+                        Ok(json!({"ok":true,"background":true}))
+                    } else {
+                        Err(fault("请求格式无效"))
+                    }
                 } else if call.request.path == "api/executor"
                     && call.request.method == "GET"
                     && call.payload.is_empty()

@@ -225,6 +225,7 @@ fn job(request_id: String, line: usize, email: &str) -> Job {
         import_info: Some(ImportInfo {
             line,
             email: email.into(),
+            native_start_id: None,
         }),
     }
 }
@@ -236,6 +237,35 @@ pub fn prune(manager: &mut Manager, queue: &Queue) {
             .iter()
             .any(|j| j.request_id == p.request_id && j.active())
     });
+}
+
+fn recover_start_id(queue: &Queue, input: &Input) -> Option<String> {
+    if input.refresh_token.is_some() {
+        return None;
+    }
+    // Only the most recent attempt for this identity can authorize recovery.
+    // Once a worker may have logged in, or RT import/complete may have run,
+    // never use an older start receipt to replay the uncertain operation.
+    let previous = queue.jobs.iter().rev().find(|job| {
+        job.import_info
+            .as_ref()
+            .is_some_and(|info| info.email.eq_ignore_ascii_case(&input.email))
+    })?;
+    if !matches!(
+        previous.status.as_str(),
+        "review" | "interrupted" | "cancelled"
+    ) || previous.new_account
+        || !previous.account_id.is_empty()
+    {
+        return None;
+    }
+    previous
+        .import_info
+        .as_ref()?
+        .native_start_id
+        .as_ref()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .cloned()
 }
 
 pub async fn submit(
@@ -294,6 +324,12 @@ pub async fn submit(
             )));
         }
     }
+    let nonces: Vec<_> = entries
+        .iter()
+        .map(|(_, input)| {
+            recover_start_id(&queue, input).unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        })
+        .collect();
     // 整批校验通过后一次持久化非敏感意图，敏感输入仅留在当前进程内存
     let single = entries.len() == 1;
     let mut pending = Vec::new();
@@ -303,16 +339,20 @@ pub async fn submit(
     let history_to_keep = 200usize.saturating_sub(entries.len());
     let remove = queue.jobs.len().saturating_sub(history_to_keep);
     queue.jobs.drain(..remove);
-    for (line, input) in entries {
+    for ((line, input), nonce) in entries.into_iter().zip(nonces) {
         let request_id = if single {
             prefix.clone()
         } else {
             format!("{prefix}:{line}")
         };
-        queue.jobs.push(job(request_id.clone(), line, &input.email));
+        let mut queued = job(request_id.clone(), line, &input.email);
+        if input.refresh_token.is_none() {
+            queued.import_info.as_mut().unwrap().native_start_id = Some(nonce.clone());
+        }
+        queue.jobs.push(queued);
         pending.push(Pending {
             request_id,
-            nonce: uuid::Uuid::new_v4().to_string(),
+            nonce,
             input,
             group_ids: data.group_ids.clone(),
             transport: transport.clone(),
@@ -494,6 +534,15 @@ async fn execute(
         .as_str()
         .filter(|v| crate::import_proxy_valid(v))
         .ok_or_else(|| fault("受保护固定代理缺失，未启动登录"))?;
+    let expires = start["expiresAt"]
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis());
+    if !expires.is_some_and(|expiry| expiry > now() as i64 + 30_000) {
+        return Err(fault(
+            "原生开始回执已过期或有效期不足，未登录、未分配新代理；请核对该精确流程后恢复",
+        ));
+    }
     let (mut queue, version) = crate::host::load(host).await?;
     queue
         .jobs
@@ -516,6 +565,31 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumes_only_latest_unconsumed_native_start() {
+        let input = parse("fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP").unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let mut old = job("old:import".into(), 1, "FIXTURE@example.com");
+        old.import_info.as_mut().unwrap().native_start_id = Some(nonce.clone());
+        old.finish("review", "start response lost");
+        let mut queue = Queue::default();
+        queue.jobs.push(old.clone());
+        assert_eq!(recover_start_id(&queue, &input), Some(nonce));
+        queue.jobs[0].new_account = true;
+        assert_eq!(recover_start_id(&queue, &input), None);
+        queue.jobs[0] = old;
+        let rt = parse("fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP----fixture-rt")
+            .unwrap();
+        assert_eq!(recover_start_id(&queue, &rt), None);
+        let mut latest = job("later:import".into(), 1, &input.email);
+        latest.finish("review", "RT import uncertain");
+        queue.jobs.push(latest);
+        assert_eq!(recover_start_id(&queue, &input), None);
+        queue.jobs.pop();
+        queue.jobs[0].account_id = "saved".into();
+        assert_eq!(recover_start_id(&queue, &input), None);
+    }
 
     #[test]
     fn import_request_accepts_explicit_scheduling_without_changing_legacy_inputs() {
