@@ -169,8 +169,7 @@ def install(service):
                     'userId', 'accountId', 'name', 'email', 'notes', 'modelAccess', 'outboundProxyEndpoint')}
                 fields = {'accountIds': [account_id], 'enabled': desired[
                     (account['userId'], account['accountId'])]}
-                if plan in ('pro', 'prolite') and getattr(self, 'new_identities', {}).get(
-                        (account['userId'], account['accountId']), True):
+                if plan in ('pro', 'prolite'):
                     groups = []
                     for page in range(1, 1001):
                         batch = self.backend('/api/admin/account-groups/options?page=' + str(page)
@@ -180,7 +179,7 @@ def install(service):
                             break
                     if len(groups) != 1:
                         raise Error('需要唯一启用的 GPT Pro 分组，账号保持暂停', 409)
-                    fields.update(enabled=True, concurrencyLimit=100, weight=100,
+                    fields.update(concurrencyLimit=100, weight=100,
                                   groupIds=[groups[0]['id']])
                     # 启用前先保存并回读配置，不能把一次写入成功当作验收
                     self.backend('/api/admin/accounts/batch-update', {**fields, 'enabled': False})

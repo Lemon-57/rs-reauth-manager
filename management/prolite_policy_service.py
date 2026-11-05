@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CHECK = '/_management/onboarding/prolite-check'
+IPV6_CHECK = '/_management/onboarding/ipv6-check'
 FORWARD = {'/_management/onboarding/start', '/api/admin/accounts/import',
            '/api/admin/accounts/oauth/complete', '/api/admin/accounts/batch-update'}
 AUTH = {'cookie', 'authorization', 'x-api-key', 'origin', 'x-csrf-token'}
@@ -68,7 +69,7 @@ class Application:
             return 403, {'code': 403}
         if path in FORWARD:
             return self.send(self.forward_port, path, headers, body)
-        if path != CHECK or set(body) != {'accountId', 'credentialRevision'}:
+        if path not in {CHECK, IPV6_CHECK} or set(body) != {'accountId', 'credentialRevision'}:
             return 422, {'code': 422}
         account_id, revision = body['accountId'], body['credentialRevision']
         if not isinstance(account_id, str) or not account_id or len(account_id) > 128 or type(revision) is not int or revision < 1:
@@ -80,7 +81,7 @@ class Application:
         before = self.read('/api/admin/accounts/detail?' + query, headers)['account']
         if (before.get('id') != account_id or before.get('provider') != 'openai'
                 or before.get('authenticationKind') != 'oauth' or before.get('enabled') is not False
-                or str(before.get('planType', '')).strip().lower() != 'prolite'
+                or (path == CHECK and str(before.get('planType', '')).strip().lower() != 'prolite')
                 or before.get('capacity', {}).get('usedSlots') != 0):
             return 409, {'code': 409}
         export = self.read('/api/admin/accounts/export?' + urllib.parse.urlencode(
@@ -130,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         status, result = 503, {'code': 503}
         try:
-            if self.client_address[0] != '127.0.0.1' or self.path not in FORWARD | {CHECK}:
+            if self.client_address[0] != '127.0.0.1' or self.path not in FORWARD | {CHECK, IPV6_CHECK}:
                 status, result = 404, {'code': 404}
             elif self.headers.get('Transfer-Encoding'):
                 status, result = 400, {'code': 400}

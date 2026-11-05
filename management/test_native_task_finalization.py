@@ -262,7 +262,7 @@ class Tests(unittest.TestCase):
                 (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
         self.assertEqual(backend.writes, [])
 
-    def test_paused_existing_account_keeps_settings_proxy_and_record_identity(self):
+    def test_explicit_pro_reimport_applies_pro_group_and_capacity_to_the_same_record(self):
         service = fixture()
         allocator, backend = Allocator(), Backend('pro')
         backend.account.update(concurrencyLimit=7, weight=9, groups=[{'id': 'fixture-group'}], notes='fixture-notes')
@@ -276,8 +276,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(prepared['settings']['notes'], 'fixture-notes')
         policy.finish(['fixture-account'], allocations)
         self.assertTrue(backend.account['enabled'])
-        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (7, 9))
-        self.assertEqual(backend.account['groups'], [{'id': 'fixture-group'}])
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100))
+        self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_known_older_refresh_version_cannot_overwrite_current_credentials(self):
         service = fixture()

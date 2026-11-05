@@ -246,7 +246,9 @@ struct ImportSubmit {
     request_id: String,
     email: String,
     notes: String,
-    proxy_url: String,
+    #[serde(default, rename = "proxyUrl")]
+    _proxy_url: String,
+    #[serde(default)]
     group_ids: Vec<String>,
 }
 
@@ -858,8 +860,6 @@ async fn handle(
                 .chars()
                 .any(|c| c.is_control() || c.is_whitespace())
             || !import_notes_valid(&request.email, &request.notes)
-            || !import_proxy_valid(&request.proxy_url)
-            || request.group_ids.is_empty()
             || request.group_ids.len() > 16
             || request.group_ids.iter().any(|id| {
                 id.is_empty()
@@ -896,33 +896,19 @@ async fn handle(
         }) {
             return Err(fault("账号邮箱已存在，拒绝重复新增"));
         }
-        let mut endpoint =
-            url::Url::parse(&request.proxy_url).map_err(|_| fault("新增账号代理格式无效"))?;
-        endpoint
-            .set_username("")
-            .map_err(|_| fault("新增账号代理格式无效"))?;
-        endpoint
-            .set_password(None)
-            .map_err(|_| fault("新增账号代理格式无效"))?;
-        if accounts.iter().any(|account| {
-            account["outboundProxyEndpoint"]
-                .as_str()
-                .and_then(|value| url::Url::parse(value).ok())
-                .is_some_and(|value| value == endpoint)
-        }) {
-            return Err(fault("该代理已绑定其他账号，拒绝共享出口"));
-        }
-        let start = admin(
+        let transport = onboarding::transport(&call, &manager.protected_management_url)?;
+        let start = onboarding::request(
             &call.host,
-            "POST",
-            "/api/admin/accounts/oauth/start",
-            Some(json!({
-                "provider":"openai",
-                "name":request.email.trim(),
-                "outboundProxyUrl":request.proxy_url
-            })),
+            &transport,
+            "/_management/onboarding/start",
+            json!({"email":request.email.trim(),"requestId":request.request_id}),
         )
         .await?;
+        let proxy = start["outboundProxyUrl"]
+            .as_str()
+            .filter(|proxy| import_proxy_valid(proxy))
+            .ok_or_else(|| fault("独立 IPv6 预留代理回执无效"))?
+            .to_owned();
         let flow = start["flowId"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -952,22 +938,25 @@ async fn handle(
         let input = json!({
             "notes":request.notes.clone(),
             "email":request.email.trim(),
-            "proxy":request.proxy_url.clone(),
+            "proxy":proxy,
             "authorizationUrl":start["authorizationUrl"],
             "accountId":"",
             "userId":"",
             "planType":"team",
             "automatic":false,
-            "newAccount":true
+            "newAccount":true,
+            "allowFreeNew":true
         });
         let snapshot = json!({
             "newAccount":true,
+            "allowFreeNew":true,
             "flowId":flow,
-            "proxy":request.proxy_url.clone(),
+            "proxy":proxy,
             "email":request.email.trim(),
+            "protectedTransport":transport,
             "settings":{
                 "enabled":false,
-                "concurrencyLimit":null,
+                "concurrencyLimit":3,
                 "weight":1,
                 "groupIds":request.group_ids,
                 "notes":request.notes.clone(),
