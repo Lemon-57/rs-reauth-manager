@@ -109,6 +109,36 @@ pub async fn request(
     path: &str,
     body: Value,
 ) -> Result<Value, PluginFault> {
+    match request_inner(host, transport, path, body, false).await? {
+        ImportReply::Success(value) => Ok(value),
+        ImportReply::InvalidRt(_) => Err(fault("当前操作不允许回退登录")),
+    }
+}
+
+enum ImportReply {
+    Success(Value),
+    InvalidRt(String),
+}
+
+fn invalid_rt_reason(status: u16, result: &Value) -> Option<&str> {
+    let diagnostic = &result["diagnostic"];
+    if status != 422 || diagnostic["code"] != "rt_rejected"
+        || !matches!(diagnostic["upstreamStatus"].as_u64(), Some(400 | 401)) {
+        return None;
+    }
+    diagnostic["reason"].as_str().filter(|reason| matches!(*reason,
+        "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token"
+        | "refresh_token_expired" | "token_expired" | "refresh_token_reused"
+        | "token_revoked" | "refresh_token_revoked" | "token_invalidated"))
+}
+
+async fn request_inner(
+    host: &HostClient,
+    transport: &Value,
+    path: &str,
+    body: Value,
+    allow_rt_fallback: bool,
+) -> Result<ImportReply, PluginFault> {
     // 仅允许固定管理路径，导入内容不能指定任意 URL
     crate::executor::check(host).await?;
     if !matches!(
@@ -152,11 +182,17 @@ pub async fn request(
     let result: Value = serde_json::from_slice(&raw)
         .map_err(|_| fault("导入回执格式未确认，请核对账号，勿重复提交"))?;
     if !(200..300).contains(&status) || result["code"] != 200 {
+        if allow_rt_fallback && path == "/api/admin/accounts/import" {
+            if let Some(reason) = invalid_rt_reason(status, &result) {
+                return Ok(ImportReply::InvalidRt(reason.to_owned()));
+            }
+        }
         return Err(fault(&import_error(status, &result)));
     }
     result
         .get("data")
         .cloned()
+        .map(ImportReply::Success)
         .ok_or_else(|| fault("导入回执缺少结果"))
 }
 
@@ -266,6 +302,7 @@ fn job(request_id: String, line: usize, email: &str) -> Job {
             line,
             email: email.into(),
             native_start_id: None,
+            rt_fallback_reason: None,
         }),
     }
 }
@@ -471,7 +508,35 @@ async fn execute(
 ) -> Result<(), PluginFault> {
     let config = json!({"enabled":false,"concurrencyLimit":data.concurrency_limit,"weight":data.weight,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
     if let Some(rt) = &input.refresh_token {
-        let result = request(host, transport, "/api/admin/accounts/import", json!({"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config})).await?;
+        let result = match request_inner(host, transport, "/api/admin/accounts/import", json!({"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config}), true).await? {
+            ImportReply::Success(result) => result,
+            ImportReply::InvalidRt(reason) => {
+                // A definite rejection cannot have persisted tokens. Still read
+                // the entire directory again to protect concurrent imports.
+                if directory(host).await?.iter().any(|account| account["email"].as_str()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(&input.email))) {
+                    return Err(fault("RT 失效后复查发现账号已存在，已停止三字段回退，请核对原记录"));
+                }
+                let (mut queue, version) = crate::host::load(host).await?;
+                let job = queue.jobs.iter_mut().find(|job| job.request_id == request_id)
+                    .ok_or_else(|| fault("导入任务缺失"))?;
+                let info = job.import_info.as_mut().ok_or_else(|| fault("导入回退记录缺失"))?;
+                if info.rt_fallback_reason.is_some() {
+                    return Err(fault("本任务已尝试三字段回退，不会重复登录"));
+                }
+                info.rt_fallback_reason = Some(match reason.as_str() {
+                    "refresh_token_expired" | "token_expired" => "expired",
+                    "refresh_token_reused" => "reused",
+                    "token_revoked" | "refresh_token_revoked" | "token_invalidated" => "revoked",
+                    _ => "invalid",
+                }.into());
+                info.native_start_id = Some(data.nonce.clone());
+                job.step = "rt_fallback".into();
+                job.message = "提供的 RT 已被上游明确判定失效，正在使用三字段进行一次 RS 原生 OAuth 授权".into();
+                crate::host::save(host, &queue, version).await?;
+                return start_native(manager, host, transport, data, input, request_id, config).await;
+            }
+        };
         let ids = result["accountIds"]
             .as_array()
             .filter(|v| v.len() == 1)
@@ -557,6 +622,18 @@ async fn execute(
         }
         return Ok(());
     }
+    start_native(manager, host, transport, data, input, request_id, config).await
+}
+
+async fn start_native(
+    manager: &mut Manager,
+    host: &HostClient,
+    transport: &Value,
+    data: &Pending,
+    input: &Input,
+    request_id: &str,
+    config: Value,
+) -> Result<(), PluginFault> {
     manager.runtime.prepare().await?;
     let start = request(
         host,
@@ -605,6 +682,28 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_definitive_token_rejection_allows_native_fallback() {
+        for reason in ["refresh_token_expired", "refresh_token_reused", "token_revoked",
+            "invalid_token", "refresh_token_invalid", "invalid_refresh_token", "token_expired",
+            "refresh_token_revoked", "token_invalidated"] {
+            let result = json!({"diagnostic":{"code":"rt_rejected","upstreamStatus":400,"reason":reason}});
+            assert_eq!(invalid_rt_reason(422, &result), Some(reason));
+            assert_eq!(invalid_rt_reason(502, &result), None);
+        }
+        for reason in ["invalid_grant", "account_deactivated", "access_denied", "invalid_client",
+            "rate_limit_exceeded", "invalid_request_error", "unknown"] {
+            assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
+                "code":"rt_rejected","upstreamStatus":400,"reason":reason}})), None);
+        }
+        for code in ["identity_mismatch", "rt_transport_unconfirmed", "rt_result_unconfirmed"] {
+            assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
+                "code":code,"upstreamStatus":400,"reason":"token_expired"}})), None);
+        }
+        assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
+            "code":"rt_rejected","upstreamStatus":429,"reason":"token_expired"}})), None);
+    }
 
     #[test]
     fn import_error_reports_only_safe_structured_causes() {

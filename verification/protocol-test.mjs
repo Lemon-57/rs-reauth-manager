@@ -63,7 +63,7 @@ async function callback(meta,payload) {
  if(meta.method==='host.http.do_stream') {
   const url=new URL(meta.params.url);assert.equal(url.origin,'http://127.0.0.1:18139')
   assert.ok(meta.params.headers.some(([name,value])=>name==='x-api-key'&&Buffer.from(value).toString()==='fixture-admin-key'))
-  let reply,protectedStatus=200
+  let reply,protectedStatus=200,diagnostic
   if(url.pathname==='/_management/onboarding/start') {
    const id=data.email.split('@')[0],flowId='import_'+id
    startRequests.push({email:data.email,requestId:data.requestId})
@@ -75,6 +75,12 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/api/admin/accounts/import') {
    const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,3);assert.equal(data.settings.enabled,false)
    assert.equal(data.data.refreshToken,'fixture-provided-rt')
+   if(id.startsWith('rt_fallback_')) {
+    const reason=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated'][Number(id.slice('rt_fallback_'.length))]
+    protectedStatus=reason==='network'?502:422
+    diagnostic={code:reason==='network'?'rt_transport_unconfirmed':reason==='identity'?'identity_mismatch':'rt_rejected',upstreamStatus:400,reason}
+    reply=null
+   } else {
    const a=add(id);Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:[],planType:(id.startsWith('up_')||id.startsWith('unbound_'))?'free':id.startsWith('rt_business')?'business':'team'})
    if(id.includes('prolite'))a.planType='prolite'
    if(/^(rt|new|legacy)_profile_pro(?:_|$)/.test(id))a.planType='pro'
@@ -86,6 +92,7 @@ async function callback(meta,payload) {
     for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
    }
    reply={accountIds:[id]};if(id==='rt_lost_batch')protectedStatus=503
+   }
   } else if(url.pathname==='/_management/onboarding/ipv6-check') {
    const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);assert.equal(data.credentialRevision,revisions.get(a.id))
    reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
@@ -105,7 +112,7 @@ async function callback(meta,payload) {
    credentials.set(a.id,credential(a));if(id==='new_wrong_user'){const c=credentials.get(a.id),p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'));p[AUTH].chatgpt_user_id='wrong-user';c.facts.material.access_token=jwt(p)};if(id==='new_missing_rt')credentials.get(a.id).facts.material.refresh_token='';completes.push({protected:true,flowId:data.flowId});reply={accountId:id}
   } else throw Error('Unexpected protected route '+url.pathname)
   if(protectedGate?.path===url.pathname){protectedGate.reached.resolve();await protectedGate.release.promise}
-  const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:200,data:reply})))
+  const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:diagnostic?protectedStatus:200,data:reply,diagnostic})))
   return result(meta.id,{status:protectedStatus,http_version:'HTTP/1.1',headers:[],stream,trailers:[]})
  }
  if(meta.method==='host.http.stream_read'){const v=handles.get(meta.params.stream);if(v){handles.delete(meta.params.stream);return result(meta.id,{eof:false,trailers:[]},v)}return result(meta.id,{eof:true,trailers:[]})}
@@ -414,6 +421,23 @@ try {
  } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
+ for(const [index,reason] of ['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated'].entries()) {
+  const id='rt_fallback_'+index,requestId=randomUUID(),n=starts.length,c=completes.length,r=providedImports.length
+  const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]}
+  assert.equal((await request('import-line',body)).status,200)
+  let done
+  for(let i=0;i<100;i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break}
+  const fallback=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked'].includes(reason)
+  assert.equal(done.status,fallback?'success':'review',done.message)
+  assert.equal(starts.length,n+Number(fallback));assert.equal(completes.length,c+Number(fallback));assert.equal(providedImports.length,r+1)
+  assert.equal(done.importInfo.rtFallbackReason,fallback?['expired','reused','invalid','revoked'][index]:undefined)
+  if(fallback){const a=accounts.find(a=>a.id===id);assert.equal(a.enabled,true);assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'));assert.ok(credentials.get(id).facts.material.refresh_token)}
+  else assert.equal(accounts.some(a=>a.id===id),false)
+  const counts=[starts.length,completes.length,providedImports.length]
+  await request('import-line',body);await tick();assert.deepEqual([starts.length,completes.length,providedImports.length],counts)
+  if(fallback)accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check('RT fallback '+reason+': exact one native login only for definite token rejection, no repeated RT exchange')
+ }
  for(const id of ['rt_prolite_daily_weight','new_profile_pro_daily_weight','rt_prolite_profile','new_prolite_profile','rt_prolite_shared','rt_prolite_proof_unavailable','rt_prolite_write_lost','rt_profile_pro','new_profile_pro','rt_profile_pro_write_lost','new_profile_pro_write_lost','rt_profile_pro_readback_wrong','rt_profile_pro_group_readback_wrong','new_profile_pro_group_readback_wrong','rt_profile_pro_group_disabled_readback','rt_profile_pro_group_missing','new_profile_pro_group_disabled','rt_profile_pro_group_duplicate','rt_profile_plus']) {
   const requestId=randomUUID(),hasRT=id.startsWith('rt_'),n=starts.length,c=completes.length
   groupMode=id.endsWith('group_missing')?'missing':id.endsWith('group_disabled')?'disabled':id.endsWith('group_duplicate')?'duplicate':'normal'

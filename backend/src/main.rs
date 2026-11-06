@@ -36,6 +36,8 @@ struct ImportInfo {
     // Non-secret idempotency key; never persist login inputs or native tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_start_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rt_fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
