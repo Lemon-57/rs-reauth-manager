@@ -76,7 +76,7 @@ async function callback(meta,payload) {
    const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,3);assert.equal(data.settings.enabled,false)
    assert.equal(data.data.refreshToken,'fixture-provided-rt')
    if(id.startsWith('rt_fallback_')) {
-    const reason=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated'][Number(id.slice('rt_fallback_'.length))]
+    const reason=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'][Number(id.slice('rt_fallback_'.length))]
     protectedStatus=reason==='network'?502:422
     diagnostic={code:reason==='network'?'rt_transport_unconfirmed':reason==='identity'?'identity_mismatch':'rt_rejected',upstreamStatus:400,reason}
     reply=null
@@ -96,11 +96,11 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/_management/onboarding/ipv6-check') {
    const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);assert.equal(data.credentialRevision,revisions.get(a.id))
    reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
-   if(a.id.includes('daily_weight'))reply.importWeight={weight:99,ordinal:2,timezone:'Asia/Shanghai'}
+   if(a.planType==='prolite')reply.importWeight={weight:a.id.includes('daily_weight')?99:100,ordinal:2,timezone:'Asia/Shanghai'}
    if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,100);assert.equal(data.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=99;if(a.id.includes('write_lost'))protectedStatus=503}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='prolite'?100:10);assert.equal(data.weight,a.planType==='prolite'?(a.id.includes('daily_weight')?99:100):1);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
    else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
    reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
@@ -421,16 +421,16 @@ try {
  } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
- for(const [index,reason] of ['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated'].entries()) {
+ for(const [index,reason] of ['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'].entries()) {
   const id='rt_fallback_'+index,requestId=randomUUID(),n=starts.length,c=completes.length,r=providedImports.length
   const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]}
   assert.equal((await request('import-line',body)).status,200)
   let done
   for(let i=0;i<100;i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break}
-  const fallback=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked'].includes(reason)
+  const fallback=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_client','unauthorized_client'].includes(reason)
   assert.equal(done.status,fallback?'success':'review',done.message)
   assert.equal(starts.length,n+Number(fallback));assert.equal(completes.length,c+Number(fallback));assert.equal(providedImports.length,r+1)
-  assert.equal(done.importInfo.rtFallbackReason,fallback?['expired','reused','invalid','revoked'][index]:undefined)
+  assert.equal(done.importInfo.rtFallbackReason,fallback?({refresh_token_expired:'expired',refresh_token_reused:'reused',invalid_token:'invalid',token_revoked:'revoked',invalid_client:'client_rejected',unauthorized_client:'client_rejected'}[reason]):undefined)
   if(fallback){const a=accounts.find(a=>a.id===id);assert.equal(a.enabled,true);assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'));assert.ok(credentials.get(id).facts.material.refresh_token)}
   else assert.equal(accounts.some(a=>a.id===id),false)
   const counts=[starts.length,completes.length,providedImports.length]
@@ -448,14 +448,14 @@ try {
   const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost|readback_wrong|group_missing|group_disabled|group_duplicate/.test(id)
   assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
   if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
-  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
+  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,10);assert.equal(a.weight,1);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
   if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
   assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
   const counts=[starts.length,completes.length,refreshes.length];await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
   accounts.splice(accounts.findIndex(x=>x.id===id),1)
   groupMode='normal'
-  check(id+': verified Pro/ProLite imports require concurrency 100, assigned weight and enabled GPT Pro group, preserving egress and failing closed without replay')
+  check(id+': verified plan-specific import concurrency and assigned weight and enabled GPT Pro group, preserving egress and failing closed without replay')
  }
  for(const plan of ['prolite','pro']) {
   const a=add('existing_'+plan);a.planType=plan;a.concurrencyLimit=9;a.weight=6;credentials.set(a.id,credential(a));const original=structuredClone(a)
@@ -532,7 +532,7 @@ try {
   for(let i=0;i<80;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
   assert.equal(done.status,'success',done.message)
   const a=accounts.find(a=>a.id===id)
-  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,10);assert.equal(a.weight,1);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   else{assert.equal(a.enabled,false);assert.equal(a.concurrencyLimit,3)}
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(id+': legacy import also reserves its fresh proxy automatically without caller proxy or group fields')

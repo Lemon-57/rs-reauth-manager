@@ -175,7 +175,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(allocator.entries), 1)
 
     def policy(self, plan='pro', receipt_root=None):
-        service = load_service(Path(__file__).with_name('native_core'), receipt_root)
+        service = load_service(Path(__file__).with_name('native_core'), receipt_root, __import__('types').SimpleNamespace(reserve=lambda *args: {'weight':100}))
         # Proxy-budget logic is independently inherited; these cases test import
         # identity, pool reservation, native persistence and scheduling completion.
         service.NativePolicy.ensure_new_proxy_budget = lambda *_: None
@@ -203,9 +203,9 @@ class Tests(unittest.TestCase):
                     self.assertEqual(len(allocator.entries), 1)
                     self.assertGreaterEqual(allocator.verifications, 2)
                     self.assertEqual(allocator.refreshes, int(kind == 'rt'))
-                    self.assertEqual(account['concurrencyLimit'], 100 if plan in ['pro', 'prolite'] else 3)
+                    self.assertEqual(account['concurrencyLimit'], 100 if plan == 'prolite' else 10 if plan == 'pro' else 3)
                     if plan in ['pro', 'prolite']:
-                        self.assertEqual(account['weight'], 100)
+                        self.assertEqual(account['weight'], 100 if plan == 'prolite' else 1)
                         self.assertEqual(account['groups'], [{'id': 'gpt-pro', 'name': 'GPT Pro', 'enabled': True}])
 
     def test_plugin_rt_import_remains_paused_until_plugin_completion(self):
@@ -223,7 +223,7 @@ class Tests(unittest.TestCase):
         account = backend.accounts[result['accountId']]
         self.assertTrue(account['enabled'])
         self.assertEqual(account['groups'][0]['name'], 'GPT Pro')
-        self.assertEqual((account['concurrencyLimit'], account['weight']), (100, 100))
+        self.assertEqual((account['concurrencyLimit'], account['weight']), (10, 1))
 
     def test_distinct_submissions_never_reuse_a_failed_reservation(self):
         policy, backend, allocator = self.policy()

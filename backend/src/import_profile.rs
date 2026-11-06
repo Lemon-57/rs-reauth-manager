@@ -1,4 +1,4 @@
-//! Pro/ProLite 导入并发 100，权重采用受保护管理层的持久化分配回执。
+//! ProLite 并发 100、每日递减权重；Pro 固定 10/1。
 use crate::{detail, host::fault, onboarding, recovery, require_idle, settings};
 use gateway_plugin_sdk::{PluginFault, client::HostClient};
 use serde_json::{Value, json};
@@ -51,7 +51,7 @@ pub async fn apply(
     if !supported(expected) {
         return Ok(expected.clone());
     }
-    let weight = import_weight(&proof)?;
+    let (concurrency, weight) = scheduling(expected, &proof)?;
     let group = crate::grouping::destination(host, "GPT Pro").await?;
     let guard = detail(host, id).await?;
     require_idle(&guard)?;
@@ -59,12 +59,12 @@ pub async fn apply(
         return Err(fault("Pro/ProLite 策略写入前配置或凭据变化，账号保持暂停"));
     }
     let update =
-        json!({"accountIds":[id],"concurrencyLimit":100,"weight":weight,"groupIds":[group]});
+        json!({"accountIds":[id],"concurrencyLimit":concurrency,"weight":weight,"groupIds":[group]});
     onboarding::request(host, transport, "/api/admin/accounts/batch-update", update).await?;
     let after = detail(host, id).await?;
     let saved = recovery::credential(host, id).await?;
     let mut wanted = expected.clone();
-    wanted["concurrencyLimit"] = json!(100);
+    wanted["concurrencyLimit"] = json!(concurrency);
     wanted["weight"] = json!(weight);
     let groups = after["groups"].as_array();
     if !groups.is_some_and(|groups| {
@@ -88,17 +88,17 @@ pub async fn apply(
     Ok(wanted)
 }
 
-fn import_weight(proof: &Value) -> Result<u64, PluginFault> {
-    match proof.get("importWeight") {
-        None => Ok(100), // 未启用每日策略的实例保持固定权重
-        Some(receipt) => receipt["weight"]
-            .as_u64()
-            .filter(|weight| (1..=100).contains(weight))
-            .filter(|_| {
-                receipt["timezone"] == "Asia/Shanghai"
-                    && receipt["ordinal"].as_u64().is_some_and(|n| n > 0)
-            })
-            .ok_or_else(|| fault("Pro/ProLite 导入权重回执无效，账号保持暂停")),
+fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault> {
+    match expected["planType"].as_str().unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "prolite" => {
+            let receipt = &proof["importWeight"];
+            let weight = receipt["weight"].as_u64().filter(|value| (1..=100).contains(value))
+                .filter(|_| receipt["timezone"] == "Asia/Shanghai" && receipt["ordinal"].as_u64().is_some_and(|n| n>0))
+                .ok_or_else(|| fault("ProLite 每日权重回执无效，账号保持暂停"))?;
+            Ok((100, weight))
+        },
+        "pro" => Ok((10, 1)),
+        _ => Err(fault("导入套餐不适用 Pro 策略")),
     }
 }
 
@@ -107,17 +107,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daily_weight_receipt_must_be_valid_and_legacy_remains_100() {
-        assert_eq!(import_weight(&json!({})).unwrap(), 100);
-        assert_eq!(
-            import_weight(
-                &json!({"importWeight":{"weight":99,"ordinal":2,"timezone":"Asia/Shanghai"}})
-            )
-            .unwrap(),
-            99
-        );
-        for weight in [json!(0), json!(101), json!(-1), json!("99"), Value::Null] {
-            assert!(import_weight(&json!({"importWeight":{"weight":weight,"ordinal":2,"timezone":"Asia/Shanghai"}})).is_err());
+    fn exact_plan_controls_fixed_scheduling() {
+        assert_eq!(scheduling(&json!({"planType":"ProLite"}), &json!({"importWeight":{"weight":99,"ordinal":2,"timezone":"Asia/Shanghai"}})).unwrap(), (100,99));
+        assert_eq!(scheduling(&json!({"planType":" PRO "}), &json!({})).unwrap(), (10,1));
+        assert!(scheduling(&json!({"planType":"promax"}), &json!({})).is_err());
+        assert!(scheduling(&json!({"planType":"prolite"}), &json!({})).is_err());
+        for weight in [json!(0), json!(101), json!("99"), Value::Null] {
+            assert!(scheduling(&json!({"planType":"prolite"}),
+                &json!({"importWeight":{"weight":weight,"ordinal":2,"timezone":"Asia/Shanghai"}})).is_err());
         }
     }
 

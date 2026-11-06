@@ -103,11 +103,10 @@ class Application:
         if after.get('capacity', {}).get('usedSlots') != 0:
             raise ValueError('account_busy')
         proof = {'accountId': account_id, 'credentialRevision': revision, 'independentIPv6': True}
-        if self.daily_weights is not None:
-            from native_task_finalization import saved_identity
-            plan = saved_identity(after, accounts[0])
-            if plan in ('pro', 'prolite'):
-                proof['importWeight'] = self.daily_weights.reserve(account_id, entry['port'])
+        if str(before.get('planType', '')).strip().lower() == 'prolite':
+            if self.daily_weights is None:
+                raise ValueError('prolite_daily_weight_unavailable')
+            proof['importWeight'] = self.daily_weights.reserve(account_id, entry['port'])
         return 200, {'code': 200, 'data': proof}
 
 

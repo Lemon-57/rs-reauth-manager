@@ -100,7 +100,7 @@ def fixture():
         PolicyError=Rejected, MUTATION=threading.RLock(), candidates=lambda data: data.get('accounts', [data]),
         oauth_candidate=lambda row: True,
         atomic=lambda path, value: path.write_text(json.dumps(value)))
-    install(service)
+    install(service, types.SimpleNamespace(reserve=lambda *args: {"weight":100}))
     return service
 
 
@@ -203,7 +203,7 @@ class Tests(unittest.TestCase):
                 service.NativePolicy(backend, allocator).finish(['fixture-account'], [
                     (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100) if plan == 'prolite' else (10, 1))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_at_only_does_not_require_or_invent_refresh_or_id_tokens(self):
@@ -276,7 +276,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(prepared['settings']['notes'], 'fixture-notes')
         policy.finish(['fixture-account'], allocations)
         self.assertTrue(backend.account['enabled'])
-        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100))
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10, 1))
         self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_known_older_refresh_version_cannot_overwrite_current_credentials(self):

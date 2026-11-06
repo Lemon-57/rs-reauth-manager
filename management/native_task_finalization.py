@@ -179,14 +179,17 @@ def install(service, daily_weights=None):
                             break
                     if len(groups) != 1:
                         raise Error('需要唯一启用的 GPT Pro 分组，账号保持暂停', 409)
-                    weight = (daily_weights.reserve(account_id, entry['port'])['weight']
-                              if daily_weights is not None else 100)
-                    fields.update(concurrencyLimit=100, weight=weight,
+                    concurrency, weight = (10, 1)
+                    if plan == 'prolite':
+                        if daily_weights is None:
+                            raise Error('ProLite daily weight ledger unavailable; account remains paused', 503)
+                        concurrency, weight = 100, daily_weights.reserve(account_id, entry['port'])['weight']
+                    fields.update(concurrencyLimit=concurrency, weight=weight,
                                   groupIds=[groups[0]['id']])
                     # 启用前先保存并回读配置，不能把一次写入成功当作验收
                     self.backend('/api/admin/accounts/batch-update', {**fields, 'enabled': False})
                     configured = self.detail(account_id)
-                    if (configured['enabled'] or configured['concurrencyLimit'] != 100
+                    if (configured['enabled'] or configured['concurrencyLimit'] != concurrency
                             or configured['weight'] != weight
                             or [g['id'] for g in configured['groups']] != fields['groupIds']):
                         raise Error('Pro 账号配置读回不一致，账号保持暂停', 502)

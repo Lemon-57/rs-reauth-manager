@@ -12,6 +12,18 @@ from test_native_task_finalization import fixture, Backend, Allocator
 
 
 class Tests(unittest.TestCase):
+    def test_prolite_cannot_enable_without_daily_ledger(self):
+        service = fixture()
+        service.NativePolicy = service.NativePolicy.__bases__[0]
+        service.Application = service.Application.__bases__[0]
+        install(service, None)
+        backend, allocator = Backend('prolite'), Allocator()
+        with self.assertRaises(Exception) as caught:
+            service.NativePolicy(backend, allocator).finish([backend.account['id']], [
+                (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
+        self.assertEqual(caught.exception.status, 503)
+        self.assertFalse(backend.account['enabled'])
+
     def test_beijing_midnight_and_recovery_keep_original_assignment(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'weights.sqlite3'
@@ -55,7 +67,7 @@ class Tests(unittest.TestCase):
     def test_native_finalization_shares_sequence_only_for_pro_plans(self):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
-            for index, (plan, expected) in enumerate([('pro', 100), ('free', 1), ('prolite', 99), ('promax', 1)]):
+            for index, (plan, expected) in enumerate([('pro', 1), ('free', 1), ('prolite', 100), ('promax', 1)]):
                 service = fixture()
                 # Apply to the original base, avoiding nested finalization wrappers.
                 service.NativePolicy = service.NativePolicy.__bases__[0]
@@ -68,7 +80,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(backend.account['weight'], expected)
                 self.assertTrue(backend.account['enabled'])
             # Retry after a write failed must use the already allocated value.
-            self.assertEqual(weights.reserve('account-2', 24001)['weight'], 99)
+            self.assertEqual(weights.reserve('account-2', 24001)['weight'], 100)
 
     def test_plugin_exit_proof_and_native_finish_reuse_the_same_assignment(self):
         from prolite_policy_service import Application, IPV6_CHECK

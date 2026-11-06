@@ -129,7 +129,8 @@ fn invalid_rt_reason(status: u16, result: &Value) -> Option<&str> {
     diagnostic["reason"].as_str().filter(|reason| matches!(*reason,
         "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token"
         | "refresh_token_expired" | "token_expired" | "refresh_token_reused"
-        | "token_revoked" | "refresh_token_revoked" | "token_invalidated"))
+        | "token_revoked" | "refresh_token_revoked" | "token_invalidated"
+        | "invalid_client" | "unauthorized_client"))
 }
 
 async fn request_inner(
@@ -528,11 +529,12 @@ async fn execute(
                     "refresh_token_expired" | "token_expired" => "expired",
                     "refresh_token_reused" => "reused",
                     "token_revoked" | "refresh_token_revoked" | "token_invalidated" => "revoked",
+                    "invalid_client" | "unauthorized_client" => "client_rejected",
                     _ => "invalid",
                 }.into());
                 info.native_start_id = Some(data.nonce.clone());
                 job.step = "rt_fallback".into();
-                job.message = "提供的 RT 已被上游明确判定失效，正在使用三字段进行一次 RS 原生 OAuth 授权".into();
+                job.message = "提供的 RT 已被上游明确拒绝，正在使用三字段进行一次 RS 原生 OAuth 授权".into();
                 crate::host::save(host, &queue, version).await?;
                 return start_native(manager, host, transport, data, input, request_id, config).await;
             }
@@ -687,12 +689,12 @@ mod tests {
     fn only_definitive_token_rejection_allows_native_fallback() {
         for reason in ["refresh_token_expired", "refresh_token_reused", "token_revoked",
             "invalid_token", "refresh_token_invalid", "invalid_refresh_token", "token_expired",
-            "refresh_token_revoked", "token_invalidated"] {
+            "refresh_token_revoked", "token_invalidated", "invalid_client", "unauthorized_client"] {
             let result = json!({"diagnostic":{"code":"rt_rejected","upstreamStatus":400,"reason":reason}});
             assert_eq!(invalid_rt_reason(422, &result), Some(reason));
             assert_eq!(invalid_rt_reason(502, &result), None);
         }
-        for reason in ["invalid_grant", "account_deactivated", "access_denied", "invalid_client",
+        for reason in ["invalid_grant", "account_deactivated", "access_denied",
             "rate_limit_exceeded", "invalid_request_error", "unknown"] {
             assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
                 "code":"rt_rejected","upstreamStatus":400,"reason":reason}})), None);
