@@ -53,6 +53,12 @@ function render() {
   $('empty').hidden = rows.length > 0
 }
 function updateCount() { $('line-count').textContent = `${$('accounts').value.split(/\r?\n/).filter(s => s.trim()).length} 个账号` }
+function validSecret(value) {
+  const raw = value.trim().replaceAll(' ', '')
+  if (!/^[A-Za-z2-7=]+$/.test(raw)) return false
+  const secret = raw.toUpperCase(), core = secret.replace(/=+$/, '')
+  return core.length >= 16 && [0, 2, 4, 5, 7].includes(core.length % 8) && /^[A-Z2-7]+$/.test(core) && (!secret.includes('=') || secret.length % 8 === 0)
+}
 function validate(value) {
   if (new TextEncoder().encode(value).length > 500 * 1024) throw new Error('本批内容过长，请拆分提交')
   const lines = value.split(/\r?\n/).map((line, index) => ({ line: line.trim(), number: index + 1 })).filter(x => x.line)
@@ -60,7 +66,7 @@ function validate(value) {
   const seen = new Set()
   for (const { line, number } of lines) {
     const fields = line.split('----')
-    if (![3, 4].includes(fields.length) || fields.some(f => !f) || /[\x00-\x1f\x7f]/.test(line) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fields[0]) || !/^[A-Z2-7]+=*$/i.test(fields[2]) || fields[3] && /\s/.test(fields[3])) throw new Error(`第 ${number} 行格式无效，请核对 邮箱----密码----2FA`)
+    if (![3, 4].includes(fields.length) || fields.some(f => !f) || /[\x00-\x1f\x7f]/.test(line) || new TextEncoder().encode(fields[0].trim()).length > 254 || /\s/.test(fields[0].trim()) || fields[0].split('@').length !== 2 || !fields[0].split('@')[1].includes('.') || new TextEncoder().encode(fields.slice(0, 3).join('----')).length > 2000 || !validSecret(fields[2]) || fields.length === 4 && (new TextEncoder().encode(fields[3]).length > 32768 || /\s/.test(fields[3]))) throw new Error(`第 ${number} 行格式无效，请核对 邮箱----密码----2FA 或 邮箱----密码----2FA----RT；2FA 需为有效 Base32 密钥`)
     const email = fields[0].toLowerCase()
     if (seen.has(email)) throw new Error(`第 ${number} 行邮箱重复，本批未提交`)
     seen.add(email)

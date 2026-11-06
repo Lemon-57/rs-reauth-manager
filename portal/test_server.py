@@ -190,6 +190,20 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(import_payload(value), value)
         self.assertEqual(set(import_payload(value)), {'line', 'requestId'})
 
+    def test_four_fields_follow_plugin_secret_rules_before_submission(self):
+        value = self.payload()
+        value['line'] = 'sample@example.com----test-only----jbsw y3dp ehpk 3pxp----test-refresh-token'
+        self.assertEqual(self.call('POST', '/api/import', value, admin=True)[0], 200)
+        self.assertEqual(Upstream.imports, 1)
+        for line in ('sample@example.com----test-only----bad_secret----test-refresh-token',
+                     'sample@example.com----test-only----JBSWY3DPEHPK3PXP----',
+                     'sample@example.com----test-only----JBSWY3DPEHPK3PXP----test refresh token'):
+            value['line'] = line
+            status, _, raw = self.call('POST', '/api/import', value, admin=True)
+            self.assertEqual(status, 400)
+            self.assertIn('邮箱----密码----2FA----RT', raw.decode())
+        self.assertEqual(Upstream.imports, 1)
+
     def test_security_headers_and_no_directory_listing(self):
         status, headers, raw = self.call('GET', '/')
         self.assertEqual(status, 200)

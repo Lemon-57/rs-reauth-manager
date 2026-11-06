@@ -55,16 +55,31 @@ def import_payload(value):
         fields = line.split("----")
         if (len(fields) not in (3, 4) or any(not f for f in fields)
                 or any(ord(c) < 32 or ord(c) == 127 for c in line)
-                or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", fields[0])
-                or not re.fullmatch(r"[A-Z2-7]+=*", fields[2], re.I)
-                or len(fields) == 4 and re.search(r"\s", fields[3])):
-            raise Rejected(400, f"第 {number} 行格式无效，请核对邮箱、密码及 2FA")
+                or len(fields[0].strip().encode()) > 254
+                or re.search(r"\s", fields[0].strip())
+                or fields[0].count("@") != 1
+                or "." not in fields[0].split("@", 1)[1]
+                or len("----".join(fields[:3]).encode()) > 2000
+                or not valid_secret(fields[2])
+                or len(fields) == 4 and (len(fields[3].encode()) > 32768 or re.search(r"\s", fields[3]))):
+            raise Rejected(400, f"第 {number} 行格式无效，请核对 邮箱----密码----2FA 或 邮箱----密码----2FA----RT；2FA 需为有效 Base32 密钥")
         email = fields[0].casefold()
         if email in seen:
             raise Rejected(400, f"第 {number} 行邮箱重复，本批未提交")
         seen.add(email)
     # The plugin owns subscription policy, deduplication, proxy allocation and OAuth.
     return {"line": text, "requestId": value["requestId"]}
+
+
+def valid_secret(value):
+    secret = value.strip().replace(" ", "")
+    if re.fullmatch(r"[A-Za-z2-7=]+", secret) is None:
+        return False
+    secret = secret.upper()
+    core = secret.rstrip("=")
+    return (len(core) >= 16 and len(core) % 8 in (0, 2, 4, 5, 7)
+            and re.fullmatch(r"[A-Z2-7]+", core) is not None
+            and ("=" not in secret or len(secret) % 8 == 0))
 
 
 def public_jobs(value):
