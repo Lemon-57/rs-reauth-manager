@@ -107,6 +107,8 @@ def fresh_policy(service, receipt_root=None):
             self.importing = True
             try:
                 return super().import_item(body, reservation_prefix)
+            except SlotError as error:
+                raise service.PolicyError(str(error), error.status) from None
             finally:
                 self.importing = False
                 self.allocator = allocator

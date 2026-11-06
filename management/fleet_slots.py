@@ -227,6 +227,7 @@ class RemoteAllocator:
         # control service never receives account tokens; only the assigned,
         # authenticated proxy carries the encrypted upstream HTTPS connection.
         import urllib.request
+        import urllib.error
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({'https': self.url(entry)}))
         body = urllib.parse.urlencode({'grant_type': 'refresh_token', 'refresh_token': token,
             'client_id': self.configuration.get('oauthClientId', 'app_EMoamEEZ73f0CkXaXp7hrann')}).encode()
@@ -238,8 +239,14 @@ class RemoteAllocator:
             if not result.get('access_token') or not result.get('refresh_token'):
                 raise ValueError('Incomplete native refresh result')
             return result
+        except urllib.error.HTTPError as error:
+            # Never expose the response body: upstream errors may echo tokens.
+            raise SlotError('RT exchange rejected (HTTP ' + str(error.code) +
+                '); private diagnostics withheld', 422) from None
+        except (TimeoutError, urllib.error.URLError):
+            raise SlotError('RT exchange transport unconfirmed; do not replay', 502) from None
         except Exception:
-            raise SlotError('RT exchange failed; private diagnostics withheld', 422) from None
+            raise SlotError('RT exchange result unconfirmed; do not replay', 502) from None
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -77,6 +77,26 @@ class Authority:
 
 
 class Tests(unittest.TestCase):
+    def test_refresh_failures_never_echo_upstream_body_or_retry(self):
+        import urllib.error
+        client = RemoteAllocator({})
+        entry = {'host': 'proxy.example.invalid', 'port': 25001,
+                 'username': 'fixture', 'password': 'fixture-password'}
+        for error, status in [
+            (urllib.error.HTTPError('https://auth.openai.com/oauth/token', 401,
+                'fixture-secret', {}, io.BytesIO(b'fixture-secret')), 422),
+            (urllib.error.URLError('fixture-secret'), 502),
+            (TimeoutError('fixture-secret'), 502),
+            (ValueError('fixture-secret'), 502),
+        ]:
+            with patch('urllib.request.build_opener') as build:
+                build.return_value.open.side_effect = error
+                with self.assertRaises(SlotError) as caught:
+                    client.exchange_refresh(entry, 'fixture-secret')
+                self.assertEqual(caught.exception.status, status)
+                self.assertNotIn('fixture-secret', str(caught.exception))
+                self.assertEqual(build.return_value.open.call_count, 1)
+
     def test_supplied_refresh_validation_runs_locally_through_its_fixed_proxy(self):
         client = RemoteAllocator({'host': 'pool.example.invalid', 'port': 19720})
         entry = {'host': 'proxy.example.invalid', 'port': 25001,

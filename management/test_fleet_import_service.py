@@ -10,7 +10,7 @@ import unittest
 import urllib.parse
 
 from fleet_import_service import load_service
-from fleet_slots import RemoteAllocator
+from fleet_slots import RemoteAllocator, SlotError
 
 
 def jwt(plan, user='fixture-user'):
@@ -128,6 +128,24 @@ class Backend:
 
 
 class Tests(unittest.TestCase):
+    def test_rt_failure_preserves_safe_status_without_persisting_or_replaying(self):
+        from legacy_policy import PolicyError
+        for status in (409, 422, 502):
+            policy, backend, allocator = self.policy()
+            attempts = []
+            def fail(entry, refresh):
+                attempts.append(entry['port'])
+                raise SlotError('Safe RT failure', status)
+            allocator.exchange_refresh = fail
+            with self.assertRaises(PolicyError) as caught:
+                policy.import_sync({'provider': 'openai', 'data': {
+                    'email': 'fixture@example.invalid', 'refreshToken': 'fixture-rt'},
+                    'settings': {'enabled': False}})
+            self.assertEqual(caught.exception.status, status)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(len(allocator.entries), 1)
+            self.assertFalse(backend.accounts)
+
     def test_legacy_management_edits_keep_original_proxy_and_controls(self):
         policy, backend, allocator = self.policy()
         created = policy.import_sync({'provider': 'openai', 'data': {'email': 'fixture@example.invalid',
