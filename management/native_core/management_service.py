@@ -5,6 +5,7 @@ from pathlib import Path
 from legacy_policy import PolicyError,candidates
 from management_policy import NativePolicy
 from fleet_slots import RemoteAllocator as NativeAllocator, atomic
+from import_diagnostics import from_error
 
 ROOT=Path('/var/lib/rs-native-import')
 REGISTRY_SOURCES={'127.0.0.1'}
@@ -158,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             status=202 if self.command=='POST' and path.endswith('/import-tasks') else 201 if self.command=='POST' and (path.endswith('/import') or '/oauth/' in path) else 200
             self.reply(status,{'code':200,'message':'OK','data':result})
         except UpstreamError as e:status=e.status;self.reply(status,e.raw,raw=True)
-        except PolicyError as e:status=e.status;self.reply(status,{'code':status*100+1,'message':str(e),'data':None})
+        except PolicyError as e:status=e.status;self.reply(status,{'code':status*100+1,'message':str(e),'data':None,'diagnostic':from_error(e)})
         except (ValueError,KeyError,TypeError):status=400;self.reply(status,{'code':40001,'message':'Management request invalid','data':None})
         except Exception:status=503;self.reply(status,{'code':50301,'message':'Management verification failed; credentials and diagnostics withheld','data':None})
         finally:

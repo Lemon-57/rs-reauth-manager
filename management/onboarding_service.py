@@ -14,6 +14,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from import_diagnostics import sanitize
 
 ALLOWED = {'/api/admin/accounts/import', '/api/admin/accounts/oauth/complete', '/api/admin/accounts/batch-update'}
 AUTH_HEADERS = {'cookie', 'x-api-key', 'authorization', 'origin', 'x-csrf-token'}
@@ -191,7 +192,8 @@ class Adapter:
             if status not in (200, 201) or result.get('code') != 200:
                 self.remember(key, {**record, 'phase': 'failed_start', 'finishedAt': time.time(),
                                     'httpStatus': status, 'businessCode': result.get('code')})
-                return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502}
+                return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502,
+                    'diagnostic': sanitize(result.get('diagnostic'))}
             record = {**record, 'phase': 'native_ready', 'result': result}
             self.remember(key, record)
             return self.finish_start(key, record)

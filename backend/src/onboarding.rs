@@ -152,20 +152,56 @@ pub async fn request(
     let result: Value = serde_json::from_slice(&raw)
         .map_err(|_| fault("导入回执格式未确认，请核对账号，勿重复提交"))?;
     if !(200..300).contains(&status) || result["code"] != 200 {
-        if status == 422 && result["message"] == "RT exchange failed; private diagnostics withheld"
-        {
-            return Err(fault(
-                "提供的 RT 未能通过受保护接口换取授权，未确认入库；请核对账号目录，不会自动重试或改用账密登录",
-            ));
-        }
-        return Err(fault(&format!(
-            "受保护导入未确认（HTTP {status}），请核对账号与任务，未自动重试"
-        )));
+        return Err(fault(&import_error(status, &result)));
     }
     result
         .get("data")
         .cloned()
         .ok_or_else(|| fault("导入回执缺少结果"))
+}
+
+fn import_error(status: u16, result: &Value) -> String {
+    // Only finite, structured diagnostics become UI text. Raw upstream messages
+    // may include passwords, tokens or proxy credentials and must never appear.
+    let diagnostic = &result["diagnostic"];
+    let code = diagnostic["code"].as_str().unwrap_or_default();
+    let reason = match diagnostic["reason"].as_str().unwrap_or_default() {
+        "invalid_grant" => "上游返回 invalid_grant，所提供的授权凭据不可接受；未明确说明是否过期或撤销",
+        "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token" => "上游明确返回令牌无效",
+        "refresh_token_expired" | "token_expired" => "上游明确返回令牌已过期",
+        "refresh_token_reused" => "上游明确返回刷新令牌已被使用，请提供最新 RT",
+        "token_revoked" | "refresh_token_revoked" | "token_invalidated" => "上游明确返回令牌已撤销或失效",
+        "account_deactivated" | "user_deactivated" => "上游明确返回账号已停用",
+        "invalid_client" | "unauthorized_client" => "上游返回 OAuth 客户端不匹配或未获授权",
+        "access_denied" => "上游明确拒绝访问",
+        "invalid_request_error" => "上游返回请求无效，未明确给出令牌失效原因",
+        "rate_limit_exceeded" | "too_many_requests" => "上游请求限流",
+        _ => "上游未提供可安全展示的具体错误码，不能据此断言 RT 已过期",
+    };
+    let explanation = match code {
+        "rt_rejected" => {
+            let upstream = diagnostic["upstreamStatus"].as_u64()
+                .filter(|value| (400..=599).contains(value))
+                .map(|value| format!("（上游 HTTP {value}）"))
+                .unwrap_or_default();
+            format!("RT 验证被上游拒绝{upstream}：{reason}")
+        }
+        "rt_transport_unconfirmed" => "RT 验证网络连接失败或超时，交换结果未确认".into(),
+        "rt_result_unconfirmed" => "RT 验证响应缺失必要令牌或格式异常，交换结果未确认".into(),
+        "identity_mismatch" => "RT 返回的邮箱、用户或工作区与待导入账号不一致，已阻止保存".into(),
+        "identity_invalid" => "RT 返回的身份令牌无法解析，已阻止保存".into(),
+        "account_conflict" => "目录存在冲突或重复账号，需要先核对原记录".into(),
+        "account_busy" => "已有账号仍启用或存在在途请求，请先暂停并等待请求完成".into(),
+        "proxy_unavailable" => "固定代理预留、归属或独立出口校验未通过".into(),
+        "flow_conflict" => "已有授权流程尚未完成或结果未确认，请先核对该流程".into(),
+        _ => match status {
+            401 | 403 => "导入管理身份验证或访问保护未通过".into(),
+            409 => "导入保护校验冲突，可能存在未完成流程或账号状态冲突".into(),
+            429 => "导入服务当前限流".into(),
+            _ => "导入服务未提供可安全展示的具体原因".into(),
+        },
+    };
+    format!("{explanation}（管理接口 HTTP {status}）；请核对账号与任务，未自动重试或改用账密登录")
 }
 
 pub struct Pending {
@@ -569,6 +605,26 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_error_reports_only_safe_structured_causes() {
+        let value = json!({"message":"secret-rt", "diagnostic":{
+            "code":"rt_rejected", "upstreamStatus":400, "reason":"refresh_token_reused",
+            "description":"secret-password"}});
+        let text = import_error(422, &value);
+        assert!(text.contains("上游 HTTP 400") && text.contains("已被使用"));
+        assert!(text.contains("管理接口 HTTP 422"));
+        assert!(!text.contains("secret"));
+        let unknown = import_error(422, &json!({"message":"secret", "diagnostic":{
+            "code":"rt_rejected", "reason":"secret-rt", "upstreamStatus":"secret"}}));
+        assert!(unknown.contains("不能据此断言"));
+        assert!(!unknown.contains("secret"));
+        for code in ["rt_transport_unconfirmed", "rt_result_unconfirmed", "identity_mismatch",
+            "identity_invalid", "account_conflict", "account_busy", "proxy_unavailable", "flow_conflict"] {
+            let text = import_error(409, &json!({"diagnostic":{"code":code}}));
+            assert!(!text.contains("未提供可安全展示"));
+        }
+    }
 
     #[test]
     fn resumes_only_latest_unconsumed_native_start() {

@@ -13,13 +13,14 @@ import time
 import urllib.parse
 
 from fleet_slots import RemoteAllocator, SlotError, atomic
+from import_diagnostics import from_error
 from native_task_finalization import install as install_finalization
 from onboarding_service import Adapter as OAuthAdapter
 from prolite_policy_service import Application as ExitCheck
 from daily_import_weight import DailyImportWeight
 
 LOADED_SOURCE_HASHES = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-    for name in ['fleet_import_service.py', 'fleet_slots.py', 'native_task_finalization.py',
+    for name in ['import_diagnostics.py', 'fleet_import_service.py', 'fleet_slots.py', 'native_task_finalization.py',
                  'onboarding_service.py', 'prolite_policy_service.py', 'daily_import_weight.py']}
 
 
@@ -108,7 +109,9 @@ def fresh_policy(service, receipt_root=None):
             try:
                 return super().import_item(body, reservation_prefix)
             except SlotError as error:
-                raise service.PolicyError(str(error), error.status) from None
+                mapped = service.PolicyError(str(error), error.status)
+                mapped.diagnostic = from_error(error)
+                raise mapped from None
             finally:
                 self.importing = False
                 self.allocator = allocator
@@ -145,7 +148,9 @@ def fresh_policy(service, receipt_root=None):
             try:
                 return super().start_oauth(body)
             except SlotError as error:
-                raise service.PolicyError(str(error), error.status) from None
+                mapped = service.PolicyError(str(error), error.status)
+                mapped.diagnostic = from_error(error)
+                raise mapped from None
 
     service.NativePolicy = Policy
 
@@ -247,7 +252,7 @@ def main():
             except service.UpstreamError as error:
                 self.reply(error.status, error.raw, raw=True)
             except (service.PolicyError, SlotError) as error:
-                self.reply(error.status, {'code': error.status, 'message': str(error)})
+                self.reply(error.status, {'code': error.status, 'message': str(error), 'diagnostic': from_error(error)})
             except Exception:
                 self.reply(503, {'code': 503, 'message': 'Protected import verification failed'})
 

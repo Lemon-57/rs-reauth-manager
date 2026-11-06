@@ -41,9 +41,10 @@ def atomic(path, value):
 
 
 class SlotError(Exception):
-    def __init__(self, message, status=409):
+    def __init__(self, message, status=409, diagnostic=None):
         super().__init__(message)
         self.status = status
+        self.diagnostic = diagnostic
 
 
 class Broker:
@@ -240,13 +241,15 @@ class RemoteAllocator:
                 raise ValueError('Incomplete native refresh result')
             return result
         except urllib.error.HTTPError as error:
-            # Never expose the response body: upstream errors may echo tokens.
+            from import_diagnostics import rejected
             raise SlotError('RT exchange rejected (HTTP ' + str(error.code) +
-                '); private diagnostics withheld', 422) from None
+                '); private diagnostics withheld', 422, rejected(error)) from None
         except (TimeoutError, urllib.error.URLError):
-            raise SlotError('RT exchange transport unconfirmed; do not replay', 502) from None
+            raise SlotError('RT exchange transport unconfirmed; do not replay', 502,
+                {'code': 'rt_transport_unconfirmed'}) from None
         except Exception:
-            raise SlotError('RT exchange result unconfirmed; do not replay', 502) from None
+            raise SlotError('RT exchange result unconfirmed; do not replay', 502,
+                {'code': 'rt_result_unconfirmed'}) from None
 
 
 class Handler(BaseHTTPRequestHandler):
