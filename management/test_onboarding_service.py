@@ -83,14 +83,18 @@ class Tests(unittest.TestCase):
             self.assertEqual(self.start(),original)
             self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
 
-    def test_uncertain_native_start_is_not_replayed_after_restart(self):
+    def test_failed_start_can_be_retried_after_restart_without_losing_history(self):
         with tempfile.TemporaryDirectory() as directory:
             self.native_status=503
             self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
             self.assertEqual(self.start()[0],503)
+            prior = json.loads(self.adapter.receipt('fixture@example.com').read_text())
+            self.assertEqual(prior['phase'], 'failed_start')
             self.adapter=service.Adapter(Allocator(),18135,18118,state_dir=directory)
-            self.assertEqual(self.start()[0],409)
-            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),1)
+            self.native_status = 201
+            self.assertEqual(self.start()[0],200)
+            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls),2)
+            self.assertEqual(json.loads(self.adapter.receipt('fixture@example.com').read_text())['recoveryHistory'], [prior])
 
     def recovery_fixture(self, directory, phase='unconfirmed'):
         self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory,
@@ -137,13 +141,55 @@ class Tests(unittest.TestCase):
     def test_recovery_uncertain_result_does_not_replay_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path, prior, _ = self.recovery_fixture(directory)
-            self.native_status = 503
-            self.assertEqual(self.start()[0], 503)
+            original_send = self.send
+            def uncertain(port, path, headers, body=None, host='127.0.0.1'):
+                if path.endswith('oauth/start'):
+                    self.calls.append((port, path, body))
+                    raise TimeoutError('fixture transport timeout')
+                return original_send(port, path, headers, body, host)
+            self.send = uncertain
+            with self.assertRaises(TimeoutError):
+                self.start()
             self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory,
                                            recovery_permits=Path(directory) / 'permits.fixture')
             self.assertEqual(self.start()[0], 409)
             self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls), 1)
             self.assertEqual(json.loads(path.read_text())['recoveryHistory'], [prior])
+
+    def test_legacy_unconfirmed_start_recovers_after_settling_but_never_if_imported(self):
+        for imported in (False, True):
+            with self.subTest(imported=imported), tempfile.TemporaryDirectory() as directory:
+                self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory)
+                prior = {'requestId': 'old-request', 'phase': 'unconfirmed', 'createdAt': time.time() - 1200}
+                self.adapter.remember('fixture@example.com', prior)
+                self.rows = [{'id': 'existing', 'provider': 'openai', 'email': 'FIXTURE@example.com'}] if imported else []
+                self.assertEqual(self.start()[0], 409 if imported else 200)
+
+    def test_recent_unknown_start_remains_protected(self):
+        self.adapter.pending['fixture@example.com'] = {
+            'requestId': 'old', 'phase': 'unconfirmed', 'createdAt': time.time()}
+        self.assertEqual(self.start()[0], 409)
+        self.assertFalse(any(c[1].endswith('oauth/start') for c in self.calls))
+
+    def test_native_result_survives_proxy_readback_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory)
+            with patch.object(self.adapter.allocator, 'get_flow', side_effect=RuntimeError('fixture readback')):
+                with self.assertRaises(RuntimeError):
+                    self.start()
+            record = json.loads(self.adapter.receipt('fixture@example.com').read_text())
+            self.assertEqual(record['phase'], 'native_ready')
+            self.adapter = service.Adapter(Allocator(), 18135, 18118, state_dir=directory)
+            self.assertEqual(self.start()[0], 200)
+            self.assertEqual(sum(c[1].endswith('oauth/start') for c in self.calls), 1)
+
+    def test_expired_delivered_flow_can_be_replaced_but_live_flow_cannot(self):
+        for age, expected in ((-600, 409), (600, 200)):
+            expiry = service.datetime.datetime.fromtimestamp(time.time() - age, service.datetime.timezone.utc).isoformat()
+            self.adapter = service.Adapter(Allocator(), 18135, 18118)
+            self.adapter.pending['fixture@example.com'] = {'requestId': 'previous', 'phase': 'ready',
+                'result': {'data': {'flowId': 'expired-native-flow', 'expiresAt': expiry}}}
+            self.assertEqual(self.start()[0], expected)
 
     def test_transport_success_does_not_hide_business_failure_or_bad_envelope(self):
         for status,body in [(201,{'code':403,'data':{}}),(200,{'code':200}),(202,{'code':200,'data':{}}),(503,{'code':200,'data':{}})]:

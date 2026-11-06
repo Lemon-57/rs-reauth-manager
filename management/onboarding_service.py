@@ -1,5 +1,6 @@
 """Authenticated loopback adapter to the effective protected manager, never a second allocator."""
 import argparse
+import datetime
 import http.client
 import hashlib
 import importlib
@@ -90,6 +91,41 @@ class Adapter:
                 and permit.get('allowNewNativeReservation') is True
                 and now < permit.get('expiresAt', 0) <= now + 900)
 
+    def retryable_start(self, prior):
+        """A start-only failure has never released a login URL to the caller.
+
+        Account absence is checked by the complete directory scan in call().
+        Unknown transport outcomes get a bounded settling period; a previously
+        delivered flow must expire before another request can replace it.
+        Old reservations and receipts are retained, never recycled.
+        """
+        phase = prior.get('phase')
+        if phase == 'failed_start':
+            return True
+        if phase in {'unconfirmed', 'start_uncertain'}:
+            created = prior.get('finishedAt', prior.get('createdAt'))
+            return (isinstance(created, (int, float))
+                    and time.time() >= created + 600 and not prior.get('result'))
+        if phase in {'ready', 'native_ready'}:
+            expiry = (prior.get('result') or {}).get('data', {}).get('expiresAt')
+            try:
+                end = datetime.datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                return end.tzinfo is not None and time.time() >= end.timestamp() + 90
+            except (AttributeError, TypeError, ValueError):
+                return False
+        return False
+
+    def finish_start(self, key, record):
+        # Persist the native result before pool readback. A readback failure can
+        # then resume the exact same flow instead of orphaning it forever.
+        data = record['result']['data']
+        entry, account_id = self.allocator.get_flow(data['flowId'])
+        if account_id or self.allocator.owner(entry):
+            return 409, {'code': 409}
+        result = {'code': 200, 'data': {**data, 'outboundProxyUrl': self.allocator.url(entry)}}
+        self.remember(key, {**record, 'phase': 'ready', 'result': result})
+        return 200, result
+
     def call(self, path, headers, body):
         # Validate the original administrator authentication before reading input or reserving a slot.
         status, verified = send(self.gateway_port, '/api/admin/accounts?page=1&pageSize=1', headers)
@@ -131,9 +167,12 @@ class Adapter:
             history = []
             if prior is not None:
                 # A matching request may recover its saved response, never create another flow.
-                if prior.get('requestId') == request_id and prior.get('phase') == 'ready':
+                retryable = self.retryable_start(prior)
+                if prior.get('requestId') == request_id and prior.get('phase') == 'ready' and not retryable:
                     return 200, prior['result']
-                if not self.approved_recovery(receipt, prior, request_id):
+                if prior.get('requestId') == request_id and prior.get('phase') == 'native_ready' and not retryable:
+                    return self.finish_start(key, prior)
+                if not retryable and not self.approved_recovery(receipt, prior, request_id):
                     return 409, {'code': 409}
                 history = [prior]
             if len(self.pending) >= 1000:
@@ -144,17 +183,18 @@ class Adapter:
                 # 原回执和永久 IPv6 归属完整保留，失败或未知结果不自动重放
                 record.update({'recoveryHistory': history, 'recoveryApproved': True})
             self.remember(key, record)
-            status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': email}, host=self.manager_host)
+            try:
+                status, result = send(self.manager_port, '/api/admin/accounts/oauth/start', headers, {'provider': 'openai', 'name': email}, host=self.manager_host)
+            except Exception:
+                self.remember(key, {**record, 'phase': 'start_uncertain', 'finishedAt': time.time()})
+                raise
             if status not in (200, 201) or result.get('code') != 200:
+                self.remember(key, {**record, 'phase': 'failed_start', 'finishedAt': time.time(),
+                                    'httpStatus': status, 'businessCode': result.get('code')})
                 return status if status not in (200, 201) else 502, {'code': status if status not in (200, 201) else 502}
-            data = result['data']
-            entry, account_id = self.allocator.get_flow(data['flowId'])
-            if account_id or self.allocator.owner(entry):
-                return 409, {'code': 409}
-            # The manager already verified the slot, actual exit, credentials and registered its native flow.
-            result = {'code': 200, 'data': {**data, 'outboundProxyUrl': self.allocator.url(entry)}}
-            self.remember(key, {**record, 'phase': 'ready', 'result': result})
-            return 200, result
+            record = {**record, 'phase': 'native_ready', 'result': result}
+            self.remember(key, record)
+            return self.finish_start(key, record)
 
 
 class Handler(BaseHTTPRequestHandler):

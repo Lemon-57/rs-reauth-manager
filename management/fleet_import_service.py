@@ -141,6 +141,12 @@ def fresh_policy(service, receipt_root=None):
                 self.finish([account['id']], [(entry, identity, desired)])
             return result
 
+        def start_oauth(self, body):
+            try:
+                return super().start_oauth(body)
+            except SlotError as error:
+                raise service.PolicyError(str(error), error.status) from None
+
     service.NativePolicy = Policy
 
 
