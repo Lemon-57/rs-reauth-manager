@@ -16,10 +16,11 @@ from fleet_slots import RemoteAllocator, SlotError, atomic
 from native_task_finalization import install as install_finalization
 from onboarding_service import Adapter as OAuthAdapter
 from prolite_policy_service import Application as ExitCheck
+from daily_import_weight import DailyImportWeight
 
 LOADED_SOURCE_HASHES = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
     for name in ['fleet_import_service.py', 'fleet_slots.py', 'native_task_finalization.py',
-                 'onboarding_service.py', 'prolite_policy_service.py']}
+                 'onboarding_service.py', 'prolite_policy_service.py', 'daily_import_weight.py']}
 
 
 class ScopedAllocator:
@@ -141,13 +142,13 @@ def fresh_policy(service, receipt_root=None):
     service.NativePolicy = Policy
 
 
-def load_service(core, receipt_root=None):
+def load_service(core, receipt_root=None, daily_weights=None):
     core = Path(core).resolve(strict=True)
     sys.path.insert(0, str(core))
     spec = importlib.util.spec_from_file_location('fleet_native_core', core / 'management_service.py')
     service = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(service)
-    install_finalization(service)
+    install_finalization(service, daily_weights)
     fresh_policy(service, receipt_root)
     return service
 
@@ -161,7 +162,8 @@ def main():
     onboarding_service.PUBLIC_ORIGIN = config['origin']
     root = Path(config['stateRoot'])
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    service = load_service(Path(__file__).with_name('native_core'), root / 'oauth-starts')
+    daily_weights = DailyImportWeight(config['dailyImportWeightLedger']) if config.get('dailyImportWeightLedger') else None
+    service = load_service(Path(__file__).with_name('native_core'), root / 'oauth-starts', daily_weights)
     for path in Path(__file__).with_name('native_core').glob('*.py'):
         LOADED_SOURCE_HASHES['native_core/' + path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     service.PUBLIC_ORIGIN = config['origin']
@@ -193,14 +195,14 @@ def main():
 
     port = config['port']
     adapter = OAuthAdapter(allocator, port, config['gatewayPort'], state_dir=root / 'oauth-starts')
-    checker = ExitCheck(port, config['gatewayPort'], config['origin'], allocator)
+    checker = ExitCheck(port, config['gatewayPort'], config['origin'], allocator, daily_weights)
     application = service.Application(allocator, root / 'tasks', backend=backend)
     Original = service.Handler
     source_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
     class Handler(Original):
         def end_headers(self):
-            self.send_header('X-RS-Import-Policy', 'fresh-ipv6-gpt-pro-0.1.68')
+            self.send_header('X-RS-Import-Policy', 'daily-pro-weight-0.1.69' if daily_weights else 'fresh-ipv6-gpt-pro-0.1.68')
             return super().end_headers()
 
         def dispatch(self):
@@ -208,7 +210,9 @@ def main():
             if path in {'/healthz', '/health'} and self.command == 'GET':
                 health = {'status': 'ok', 'sourceSha256': source_sha,
                     'freshIndependentIPv6': True, 'proImportGroup': 'GPT Pro',
-                    'independentIPv6Pool': True, 'loadedSourceSha256': LOADED_SOURCE_HASHES}
+                    'independentIPv6Pool': True, 'loadedSourceSha256': LOADED_SOURCE_HASHES,
+                    'dailyImportWeight': {'enabled': daily_weights is not None, 'timezone': 'Asia/Shanghai',
+                                         'start': 100, 'step': 1, 'minimum': 1, 'plans': ['pro', 'prolite']}}
                 self.reply(200, {'code': 200, 'data': health} if path == '/health' else health)
                 return
             if path not in {'/_management/onboarding/start', '/_management/onboarding/ipv6-check',

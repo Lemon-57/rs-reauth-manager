@@ -1,4 +1,4 @@
-//! 新增导入且已核验为 Pro/ProLite 的账号采用 100/100 调度策略。
+//! Pro/ProLite 导入并发 100，权重采用受保护管理层的持久化分配回执。
 use crate::{detail, host::fault, onboarding, recovery, require_idle, settings};
 use gateway_plugin_sdk::{PluginFault, client::HostClient};
 use serde_json::{Value, json};
@@ -51,19 +51,21 @@ pub async fn apply(
     if !supported(expected) {
         return Ok(expected.clone());
     }
+    let weight = import_weight(&proof)?;
     let group = crate::grouping::destination(host, "GPT Pro").await?;
     let guard = detail(host, id).await?;
     require_idle(&guard)?;
     if settings(&guard) != *expected || guard["_credentialRevision"].as_u64() != Some(revision) {
         return Err(fault("Pro/ProLite 策略写入前配置或凭据变化，账号保持暂停"));
     }
-    let update = json!({"accountIds":[id],"concurrencyLimit":100,"weight":100,"groupIds":[group]});
+    let update =
+        json!({"accountIds":[id],"concurrencyLimit":100,"weight":weight,"groupIds":[group]});
     onboarding::request(host, transport, "/api/admin/accounts/batch-update", update).await?;
     let after = detail(host, id).await?;
     let saved = recovery::credential(host, id).await?;
     let mut wanted = expected.clone();
     wanted["concurrencyLimit"] = json!(100);
-    wanted["weight"] = json!(100);
+    wanted["weight"] = json!(weight);
     let groups = after["groups"].as_array();
     if !groups.is_some_and(|groups| {
         groups.len() == 1
@@ -86,9 +88,38 @@ pub async fn apply(
     Ok(wanted)
 }
 
+fn import_weight(proof: &Value) -> Result<u64, PluginFault> {
+    match proof.get("importWeight") {
+        None => Ok(100), // 未启用每日策略的实例保持固定权重
+        Some(receipt) => receipt["weight"]
+            .as_u64()
+            .filter(|weight| (1..=100).contains(weight))
+            .filter(|_| {
+                receipt["timezone"] == "Asia/Shanghai"
+                    && receipt["ordinal"].as_u64().is_some_and(|n| n > 0)
+            })
+            .ok_or_else(|| fault("Pro/ProLite 导入权重回执无效，账号保持暂停")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_weight_receipt_must_be_valid_and_legacy_remains_100() {
+        assert_eq!(import_weight(&json!({})).unwrap(), 100);
+        assert_eq!(
+            import_weight(
+                &json!({"importWeight":{"weight":99,"ordinal":2,"timezone":"Asia/Shanghai"}})
+            )
+            .unwrap(),
+            99
+        );
+        for weight in [json!(0), json!(101), json!(-1), json!("99"), Value::Null] {
+            assert!(import_weight(&json!({"importWeight":{"weight":weight,"ordinal":2,"timezone":"Asia/Shanghai"}})).is_err());
+        }
+    }
 
     #[test]
     fn only_exact_pro_and_prolite_subscriptions_use_import_profile() {

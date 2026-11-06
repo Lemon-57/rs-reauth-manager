@@ -37,9 +37,10 @@ def unique_entry(allocator, proxy_url, account_id):
 
 
 class Application:
-    def __init__(self, forward_port, gateway_port, origin, allocator=None):
+    def __init__(self, forward_port, gateway_port, origin, allocator=None, daily_weights=None):
         self.forward_port, self.gateway_port, self.origin = forward_port, gateway_port, origin
         self.allocator = allocator
+        self.daily_weights = daily_weights
 
     def send(self, port, path, headers, body=None):
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=150)
@@ -101,8 +102,13 @@ class Application:
                 raise ValueError('account_changed')
         if after.get('capacity', {}).get('usedSlots') != 0:
             raise ValueError('account_busy')
-        return 200, {'code': 200, 'data': {'accountId': account_id, 'credentialRevision': revision,
-                                          'independentIPv6': True}}
+        proof = {'accountId': account_id, 'credentialRevision': revision, 'independentIPv6': True}
+        if self.daily_weights is not None:
+            from native_task_finalization import saved_identity
+            plan = saved_identity(after, accounts[0])
+            if plan in ('pro', 'prolite'):
+                proof['importWeight'] = self.daily_weights.reserve(account_id, entry['port'])
+        return 200, {'code': 200, 'data': proof}
 
 
 class Handler(BaseHTTPRequestHandler):

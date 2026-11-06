@@ -53,7 +53,7 @@ def saved_identity(account, document):
     return facts[0][2]
 
 
-def install(service):
+def install(service, daily_weights=None):
     """在校验过摘要的现行管理实现上复用分配、鉴权和原生 API"""
     OriginalPolicy = service.NativePolicy
     OriginalApplication = service.Application
@@ -179,13 +179,15 @@ def install(service):
                             break
                     if len(groups) != 1:
                         raise Error('需要唯一启用的 GPT Pro 分组，账号保持暂停', 409)
-                    fields.update(concurrencyLimit=100, weight=100,
+                    weight = (daily_weights.reserve(account_id, entry['port'])['weight']
+                              if daily_weights is not None else 100)
+                    fields.update(concurrencyLimit=100, weight=weight,
                                   groupIds=[groups[0]['id']])
                     # 启用前先保存并回读配置，不能把一次写入成功当作验收
                     self.backend('/api/admin/accounts/batch-update', {**fields, 'enabled': False})
                     configured = self.detail(account_id)
                     if (configured['enabled'] or configured['concurrencyLimit'] != 100
-                            or configured['weight'] != 100
+                            or configured['weight'] != weight
                             or [g['id'] for g in configured['groups']] != fields['groupIds']):
                         raise Error('Pro 账号配置读回不一致，账号保持暂停', 502)
                 self.backend('/api/admin/accounts/batch-update', fields)
