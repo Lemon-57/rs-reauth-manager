@@ -237,6 +237,7 @@ impl Runtime {
                             Some("session_restart") => "session_restart",
                             Some("login") => "login",
                             Some("mfa") => "mfa",
+                            Some("phone_resume") => "phone_resume",
                             Some("verify_refresh") => "verify_refresh",
                             _ => "running",
                         }

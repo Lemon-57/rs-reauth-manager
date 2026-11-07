@@ -92,6 +92,69 @@ def response_mfa_error(response):
     return None
 
 
+def mfa_shape(response):
+    """Only fixed field-presence flags and booleans; never response values."""
+    try:
+        body = response.json()
+    except Exception:
+        return 0
+    fields = ('page', 'type', 'payload', 'data', 'continue_url', 'redirect_url',
+              'error', 'errors', 'message', 'success', 'verified', 'status',
+              'challenge', 'challenge_id', 'factor_id', 'id', 'is_verified',
+              'mfa_verified', 'next', 'url', 'action', 'result', 'validation_error')
+    flags = 0
+    pending = [(body, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if not isinstance(item, dict) or depth > 4:
+            continue
+        for index, name in enumerate(fields):
+            if name in item:
+                flags |= 1 << index
+        target = item.get('continue_url')
+        if isinstance(target, str):
+            try:
+                if 'mfa-challenge' in urlsplit(target).path.lower():
+                    flags |= 1 << 23
+            except ValueError:
+                pass
+        for name in ('success', 'verified', 'is_verified', 'mfa_verified'):
+            if item.get(name) is True:
+                flags |= 1 << 24
+            if item.get(name) is False:
+                flags |= 1 << 25
+        if item.get('type') in ('mfa_challenge', 'mfa-challenge'):
+            flags |= 1 << 26
+        if item.get('type') in ('consent', 'codex_consent', 'workspace', 'organization'):
+            flags |= 1 << 27
+        for child in item.values():
+            if isinstance(child, dict):
+                pending.append((child, depth + 1))
+    return flags
+
+
+def mfa_page(response):
+    try:
+        body = response.json()
+        page = body.get('page', {})
+        value = page.get('type', '') if isinstance(page, dict) else ''
+        if not value:
+            value = body.get('type', '')
+        if isinstance(value, str):
+            value = value.lower()
+        # A bounded machine page enum only; never URLs, messages, IDs or payloads.
+        if isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', value):
+            return value
+        if not isinstance(page, dict):
+            return 'page_not_object'
+        if not isinstance(value, str):
+            return 'page_type_not_string'
+        return 'page_type_unrecognized'
+    except Exception:
+        pass
+    return 'unknown'
+
+
 def retry_action(failure):
     diagnostic = failure.get('diagnostic', {}) if isinstance(failure, dict) else {}
     stage, reason = diagnostic.get('stage'), diagnostic.get('reason')
@@ -245,6 +308,9 @@ def describe_failure(result=None, *, attempt=None, exception=None):
         if status == 429:
             code, detail = 'limited', 'rate_limited'
     diagnostic = {'stage': stage, 'reason': detail, 'httpStatus': status}
+    if stage == 'mfa_verify' and type(attempt.get('mfaShape')) is int:
+        diagnostic['mfaShape'] = attempt['mfaShape']
+        diagnostic['mfaPage'] = attempt.get('mfaPage', 'unknown')
     if reason in MFA_ERRORS and stage in {'mfa_verify', 'mfa_issue'} or login_state_invalid:
         diagnostic['upstreamCode'] = reason
     return {'code': code, 'diagnostic': diagnostic}

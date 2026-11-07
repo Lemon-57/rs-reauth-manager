@@ -131,6 +131,13 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         _ => "未取得可公开的具体错误，未保存上游原始响应",
     };
     let mut message = format!("{stage}：{reason}");
+    if let Some(shape) = diagnostic["mfaShape"].as_u64().filter(|v| *v < (1 << 28)) {
+        message.push_str(&format!(" [验证响应结构 {shape}]"));
+        if let Some(page) = diagnostic["mfaPage"].as_str().filter(|v| v.len() <= 64
+            && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')) {
+            message.push_str(&format!(" [验证页面 {page}]"));
+        }
+    }
     if let Some(status) = diagnostic["httpStatus"]
         .as_u64()
         .filter(|v| !local_generation && (100..=599).contains(v))

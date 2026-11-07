@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-from diagnostics import describe_failure, mfa_generation_failure, response_mfa_error, retry_action, stage_for_url, transport_reason
+from diagnostics import describe_failure, mfa_generation_failure, mfa_shape, mfa_page, response_mfa_error, retry_action, stage_for_url, transport_reason
 from tracing import ObservedSession
 from workspace_pages import workspace_page
 
@@ -133,6 +133,34 @@ def _run_once(data, used_codes):
         session_evidence = None
         session_lookup_failure = None
         unresolved_workspace = None
+        phone_resume_attempted = False
+
+        def _phone_required(self):
+            self.last_attempt = {'stage': 'phone', 'httpStatus': None}
+            self.failed_authorization = describe_failure({'error': 'phone_required'}, attempt=self.last_attempt)
+            self.last_oauth_error = 'phone_required'
+
+        def _oauth_drive_external_login_for_continue(self, **kwargs):
+            if self.phone_resume_attempted:
+                self._phone_required()
+                return ''
+            return super()._oauth_drive_external_login_for_continue(**kwargs)
+
+        def _oauth_complete_totp_mfa_for_continue(self, **kwargs):
+            if self.phone_resume_attempted:
+                self._phone_required()
+                return ''
+            return super()._oauth_complete_totp_mfa_for_continue(**kwargs)
+
+        def _oauth_complete_add_phone_for_continue(self, email, device_id, user_agent, impersonate, sms_client, current_url):
+            # Resume exactly the RS-owned URL with the authenticated session.
+            # The upstream still decides whether phone verification is mandatory.
+            if not self.phone_resume_attempted:
+                self.phone_resume_attempted = True
+                emit('step', step='phone_resume')
+                return authorize_url
+            self._phone_required()
+            raise ValueError('phone_required')
 
         def _oauth_request(self, method, url, **kwargs):
             self.last_attempt = {'stage': stage_for_url(url), 'httpStatus': None}
@@ -151,6 +179,9 @@ def _run_once(data, used_codes):
             if self.last_attempt['stage'] in {'mfa_verify', 'mfa_issue'}:
                 self.last_attempt['mfaError'] = response_mfa_error(response)
             if self.last_attempt['stage'] == 'mfa_verify':
+                if self.last_attempt['httpStatus'] == 200:
+                    self.last_attempt['mfaShape'] = mfa_shape(response)
+                    self.last_attempt['mfaPage'] = mfa_page(response)
                 self.last_mfa_verification = describe_failure(attempt=self.last_attempt)
             if self.last_attempt['stage'] in {'workspace', 'organization'}:
                 status = self.last_attempt['httpStatus']

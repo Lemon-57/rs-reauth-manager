@@ -1,4 +1,4 @@
-"""Exercise the unmodified upstream OAuth implementation with an offline HTTP transport."""
+"""Exercise the upstream OAuth flow and maintained path fix with an offline transport."""
 import json
 import socket
 import sys
@@ -270,7 +270,7 @@ class VendorContractTests(unittest.TestCase):
                 self.assertFalse(any(m['event'] == 'complete' for m in messages))
                 self.assertNotIn('private-', json.dumps(messages))
 
-    def mfa_failure(self, issue_status, verify_status=200, error_code='unknown-upstream-code', codes=None, workspace_after_restart=False):
+    def mfa_failure(self, issue_status, verify_status=200, error_code='unknown-upstream-code', codes=None, workspace_after_restart=False, phone_resume=None):
         messages = []
         self.mfa_requests = []
         self.mfa_sessions, self.authorization_requests = [], []
@@ -290,7 +290,15 @@ class VendorContractTests(unittest.TestCase):
             def request(self, method, url, **kwargs):
                 if method == 'GET' and url == URL:
                     testcase.authorization_requests.append((self, url))
-                    return types.SimpleNamespace(status_code=302, url=url, headers={'Location':'https://auth.openai.com/mfa-challenge/fixture-factor'}, text='')
+                    location = 'https://auth.openai.com/mfa-challenge/fixture-factor'
+                    if phone_resume is not None and len(testcase.authorization_requests) > 1:
+                        location = {
+                            True: 'http://127.0.0.1:1455/auth/callback?state=fixture&code=fixture-code',
+                            False: 'https://auth.openai.com/add-phone?return_to=/mfa-challenge/fixture-factor',
+                            'login': 'https://auth.openai.com/log-in',
+                            'mfa': 'https://auth.openai.com/mfa-challenge/fixture-factor',
+                        }[phone_resume]
+                    return types.SimpleNamespace(status_code=302, url=url, headers={'Location': location}, text='')
                 assert method == 'POST'
                 assert url in {'https://auth.openai.com/api/accounts/mfa/issue_challenge', 'https://auth.openai.com/api/accounts/mfa/verify'}
                 requests.append(url.rsplit('/', 1)[-1])
@@ -300,6 +308,8 @@ class VendorContractTests(unittest.TestCase):
                 body = {} if status == 200 else {'error': {'code': code, 'message': 'private-body fixture-password'}}
                 if url.endswith('/verify') and status == 200:
                     body = {'continue_url': 'http://127.0.0.1:1455/auth/callback?state=fixture&code=fixture-code'}
+                    if phone_resume is not None:
+                        body = {'page': {'type': 'add_phone'}, 'continue_url': 'https://auth.openai.com/add-phone?return_to=/mfa-challenge/fixture-factor'}
                 return types.SimpleNamespace(status_code=status, url=url, headers={}, text=json.dumps(body), json=lambda:body)
         generator = {'return_value': '123456'} if codes is None else {'side_effect': codes}
         testcase = self
@@ -309,6 +319,40 @@ class VendorContractTests(unittest.TestCase):
         self.mfa_timeouts = [call.kwargs.get('timeout') for call in get_code.call_args_list]
         self.mfa_exclusions = [set(call.kwargs.get('exclude_codes', ())) for call in get_code.call_args_list]
         return messages
+
+    def test_mfa_route_detection_uses_path_not_return_url_query(self):
+        client = oauth_client.OAuthClient
+        target = 'https://auth.openai.com/add-phone?return_to=/mfa-challenge/fixture-factor'
+        self.assertFalse(client._is_mfa_challenge(data={'page': {'type': 'add_phone'}}, continue_url=target))
+        self.assertEqual(client._infer_external_page_type(target), 'add-phone')
+        self.assertTrue(client._is_mfa_challenge(continue_url='https://auth.openai.com/mfa-challenge/fixture-factor?next=/add-phone'))
+        self.assertTrue(client._is_mfa_challenge(data={'page': {'type': 'mfa_challenge'}}))
+
+    def test_mfa_success_resumes_exact_native_url_once_with_same_session(self):
+        messages = self.mfa_failure(200, phone_resume=True)
+        self.assertEqual(messages[-1]['event'], 'complete')
+        self.assertEqual(self.mfa_requests, ['issue_challenge', 'verify'])
+        self.assertEqual(self.mfa_generation_count, 1)
+        self.assertEqual(len(self.authorization_requests), 2)
+        self.assertIs(self.authorization_requests[0][0], self.authorization_requests[1][0])
+        self.assertEqual([url for _, url in self.authorization_requests], [URL, URL])
+
+    def test_mandatory_phone_stops_after_one_native_resume_without_second_totp(self):
+        messages = self.mfa_failure(200, phone_resume=False)
+        self.assertEqual(messages[-1]['diagnostic'], {'stage': 'phone', 'reason': 'phone_required', 'httpStatus': None})
+        self.assertEqual(messages[-1]['code'], 'human')
+        self.assertEqual(self.mfa_generation_count, 1)
+        self.assertEqual(self.mfa_requests, ['issue_challenge', 'verify'])
+        self.assertEqual(len(self.authorization_requests), 2)
+
+    def test_phone_resume_never_replays_login_or_totp(self):
+        for next_page in ['login', 'mfa']:
+            with self.subTest(next_page=next_page):
+                messages = self.mfa_failure(200, phone_resume=next_page)
+                self.assertEqual(messages[-1]['diagnostic']['reason'], 'phone_required')
+                self.assertEqual(self.mfa_generation_count, 1)
+                self.assertEqual(self.mfa_requests, ['issue_challenge', 'verify'])
+                self.assertEqual(len(self.authorization_requests), 2)
 
     def test_real_mfa_issue_failure_retains_stage_and_status_without_raw_body(self):
         messages = self.mfa_failure(403)

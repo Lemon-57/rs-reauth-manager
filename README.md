@@ -142,12 +142,13 @@ Free、Plus、Pro、Team、Business 等全部套餐的 OAuth 账号均可列出�
 
 协议模块来自 [boji1334/reauth-web](https://github.com/boji1334/reauth-web)，固定提交 `db8251817fd1baefc83c14c851135fb6078bc001`
 仅保留登录必需的五个 `vendor/lib` 模块与 RFC 6238 TOTP 实现，不依赖重登站，不包含兑换、支付、账号注册或其 Web 服务
-`vendor/lib` 原模块保持不变，适配代码在 `protocol/runner.py`，本地 TOTP 生成与等待逻辑在 `protocol/totp.py`，原始 MIT 许可位于 `protocol/LICENSE.reauth-web`
+`vendor/lib/oauth_client.py` 保留一项页面路由修复：按 URL 路径识别登录、MFA、手机及工作区页面，避免把继续地址查询参数中的旧页面名称当成当前步骤。其余适配代码在 `protocol/runner.py`，本地 TOTP 生成与等待逻辑在 `protocol/totp.py`，原始 MIT 许可位于 `protocol/LICENSE.reauth-web`
 会话读取失败时继续使用授权页的有界 JSON/hydration 工作区证据，相关解析位于 `protocol/workspace_pages.py`；不执行页面脚本，不按 ID 子串或默认首项匹配。令牌交换禁止自动跟随重定向。适配修复、保留差异及仍需处理的宿主身份校验边界见 [协议适配差异审查](docs/UPSTREAM-PARITY.md)
 适配层接受 RS 返回的官方桌面授权外层链接，仅拆出并校验 `authorize_url` 后交给上游协议；常规路径不重新生成或替换 RS 的 state、PKCE、client_id 和回调地址，也支持直接 OAuth 链接
 新登录会话的首个原生授权页 GET 遇到明确的 Cloudflare 403 挑战时，等待两秒后仅重取一次，沿用原代理、TLS 身份、会话、请求头及原生 OAuth 参数。上游要求等待更长、持续挑战或其他拒绝时停止并显示真实错误；不自动处理人工挑战，不重放密码、2FA、工作区选择或令牌交换。
 
 同一挑战的 2FA 校验最多提交三次不同动态码，仅对明确的验证码无效或过期换码；重试等待预算为 TOTP 刷新周期加五秒余量。登录身份、密码或 MFA 步骤明确返回 HTTP 400/409 的 `invalid_state` 时，放弃旧挑战和 Cookie，使用原代理最多重建一次登录会话；所有授权均保留 RS 的 state、PKCE 和待完成流程。已提交的动态码在同一任务内不重复使用
+2FA HTTP 200 后的 `add_phone` 页面不再误报验证码失败。该步骤最多使用同一已认证会话、同一固定代理重新访问完全相同的 RS 原生授权 URL 一次；不生成新授权参数或自行交换令牌。若上游仍要求手机验证，报告人工手机验证需求并停止，不再提交 2FA 或重建登录会话。诊断只保留有界机器页面枚举和固定结构位，不记录响应正文、继续 URL 或凭据。
 429、封禁、付款、密码错误、人工验证、无具体错误码的 409、传输异常、授权回调校验失败和令牌交换失败均不自动重登或猜测换码。新会话仍失败时同时显示两次原因，不重放凭据写回，任务失败后不自动重新排队；单号 420 秒总时限不因恢复而延长
 所有授权复用 RS 已生成的 state、PKCE、client_id 与回调地址，以及账号固定代理和现有登录协议。插件不得生成另一套 PKCE、调用上游 token 接口交换授权码，或用 SDK 写入自行换取的 RT。新增账号使用受保护的 `api/import` 入口，仍由 RS 原生 complete 保存 RT、备注和分组；以后新增账号也必须沿用这一原生链路，项目 AGENTS.md 已将其设为持久规则
 

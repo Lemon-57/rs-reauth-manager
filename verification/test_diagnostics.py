@@ -5,10 +5,29 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'protocol'))
-from diagnostics import describe_failure, retry_action, stage_for_url, transport_reason
+from diagnostics import describe_failure, retry_action, stage_for_url, transport_reason, mfa_shape, mfa_page
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_mfa_diagnostics_project_structure_without_response_values(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+            def json(self):
+                return self.body
+        response = Response({'page': {'type': 'mfa_challenge_totp'}, 'continue_url': 'https://example.invalid/private-code'})
+        self.assertEqual(mfa_shape(response), 19)
+        self.assertEqual(mfa_shape(Response({'continue_url': '/mfa-challenge/opaque-factor'})), (1 << 4) | (1 << 23))
+        self.assertEqual(mfa_shape(Response({'continue_url': '/consent?previous=/mfa-challenge/opaque-factor'})), (1 << 4))
+        self.assertEqual(mfa_page(response), 'mfa_challenge_totp')
+        self.assertEqual(mfa_page(Response({'page': {'type': 'ext_mfa_challenge'}})), 'ext_mfa_challenge')
+        self.assertEqual(mfa_page(Response({'type': 'MFA_CHALLENGE_TOTP', 'page': None})), 'mfa_challenge_totp')
+        self.assertEqual(mfa_page(Response({'page': {'type': 'mfa_challenge_v2'}})), 'mfa_challenge_v2')
+        self.assertEqual(mfa_page(Response({'page': {'type': 'email@example.invalid'}})), 'page_type_unrecognized')
+        self.assertEqual(mfa_page(Response({'page': {'type': 'https://example.invalid/?token=private'}})), 'page_type_unrecognized')
+        self.assertEqual(mfa_page(Response({'page': None})), 'page_not_object')
+        self.assertEqual(mfa_shape(Response({'verified': False, 'message': 'private-message'})), (1 << 10) | (1 << 8) | (1 << 25))
+
     def test_retry_policy_requires_explicit_step_and_error_not_http_alone(self):
         for stage in ['login', 'password', 'mfa_issue', 'mfa_verify']:
             failure = describe_failure({'error': 'invalid_state'}, attempt={'stage': stage, 'httpStatus': 409})
