@@ -169,7 +169,7 @@ def install(service, daily_weights=None):
                     'userId', 'accountId', 'name', 'email', 'notes', 'modelAccess', 'outboundProxyEndpoint')}
                 fields = {'accountIds': [account_id], 'enabled': desired[
                     (account['userId'], account['accountId'])]}
-                if plan in ('pro', 'prolite'):
+                if plan in ('pro', 'prolite', 'self_serve_business_prolite'):
                     groups = []
                     for page in range(1, 1001):
                         batch = self.backend('/api/admin/account-groups/options?page=' + str(page)
@@ -180,6 +180,8 @@ def install(service, daily_weights=None):
                     if len(groups) != 1:
                         raise Error('需要唯一启用的 GPT Pro 分组，账号保持暂停', 409)
                     concurrency, weight = (10, 1)
+                    if plan == 'self_serve_business_prolite':
+                        concurrency, weight = 10, 10
                     if plan == 'prolite':
                         if daily_weights is None:
                             raise Error('ProLite daily weight ledger unavailable; account remains paused', 503)

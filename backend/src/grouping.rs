@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 pub fn team(settings: &Value) -> bool {
     settings["planType"]
         .as_str()
-        .is_some_and(|p| matches!(p.trim().to_ascii_lowercase().as_str(), "team" | "business"))
+        .is_some_and(crate::plans::team)
 }
 
 pub fn free_in_pro(settings: &Value) -> bool {
@@ -140,7 +140,15 @@ pub async fn assign(
     let mut wanted_ids = group_ids.clone();
     current_ids.sort();
     wanted_ids.sort();
-    if current_ids == wanted_ids {
+    let mut wanted = expected.clone();
+    let mut update = json!({"accountIds":[id],"groupIds":group_ids});
+    if let Some((concurrency, weight)) = expected["planType"].as_str().and_then(crate::plans::fixed_scheduling) {
+        wanted["concurrencyLimit"] = json!(concurrency);
+        wanted["weight"] = json!(weight);
+        update["concurrencyLimit"] = json!(concurrency);
+        update["weight"] = json!(weight);
+    }
+    if current_ids == wanted_ids && wanted == *expected {
         return Ok(expected.clone());
     }
     // 目标目录读取期间可能发生其他管理操作，写入前再次核对空闲与精确版本。
@@ -149,12 +157,12 @@ pub async fn assign(
     if settings(&guard) != *expected || guard["_credentialRevision"].as_u64() != Some(revision) {
         return Err(fault("归组前账号配置或凭据变化，未修改分组"));
     }
-    // 分组是本次明确授权的唯一设置变更，不重复登录、不刷新或替换凭据
+    // Only the verified subscription's group and explicit scheduling policy may change.
     admin(
         host,
         "POST",
         "/api/admin/accounts/batch-update",
-        Some(json!({"accountIds":[id],"groupIds":group_ids})),
+        Some(update),
     )
     .await
     .map_err(|_| {
@@ -178,7 +186,7 @@ pub async fn assign(
         || !groups
             .iter()
             .any(|g| g["id"] == group_id && g["name"] == name && g["enabled"] == true)
-        || actual != *expected
+        || actual != wanted
         || after["_credentialRevision"].as_u64() != Some(revision)
         || renewed.credential_revision != revision
         || renewed.facts.material != credential.facts.material
@@ -187,7 +195,7 @@ pub async fn assign(
             "{name} 分组或账号配置、凭据读回未确认，请人工核对"
         )));
     }
-    let mut result = expected.clone();
+    let mut result = wanted;
     result["groups"] = after["groups"].clone();
     Ok(result)
 }
@@ -197,6 +205,7 @@ mod tests {
     use super::*;
     #[test]
     fn only_free_in_pro_moves_to_wait() {
+        assert_eq!(target(&json!({"planType":"self_serve_business_prolite","groups":[]})), Some("GPT Pro"));
         for plan in ["free", " Free ", "FREE"] {
             assert_eq!(
                 target(&json!({"planType":plan,"groups":[{"id":"p","name":"GPT Pro"}]})),

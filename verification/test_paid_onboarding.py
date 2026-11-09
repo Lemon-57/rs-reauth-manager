@@ -8,10 +8,20 @@ from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'protocol'))
-from fallback import free_workspace_candidate,new_account_workspace_candidate
+from fallback import free_workspace_candidate,new_account_workspace_candidate,team_candidate
 
 
 class PaidOnboardingTests(unittest.TestCase):
+    def test_business_prolite_is_a_team_candidate_and_never_personal(self):
+        for kind in [{}, {'kind': 'organization'}]:
+            evidence = {'workspaces': [{'id': 'business-team', 'plan_type': 'self_serve_business_prolite', **kind}]}
+            self.assertEqual(team_candidate(evidence, ''), 'business-team')
+            with self.assertRaisesRegex(ValueError, 'free_workspace_missing'):
+                new_account_workspace_candidate(evidence, '')
+        with self.assertRaisesRegex(ValueError, '^workspace$'):
+            team_candidate({'workspaces': [{'id': 'one', 'plan_type': 'self_serve_business_prolite'},
+                                          {'id': 'two', 'plan_type': 'team'}]}, '')
+
     def test_native_start_uses_exact_email_for_each_protected_adapter(self):
         root = Path(__file__).resolve().parents[1]
         for filename in ['fixed_pool_onboarding.py', 'onboarding_service.py']:

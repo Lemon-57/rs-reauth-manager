@@ -583,7 +583,7 @@ async fn execute(
             .to_ascii_lowercase()
             .as_str()
         {
-            "team" | "business" | "plus" | "pro" | "prolite" | "promax" | "go" => {
+            "team" | "business" | "self_serve_business_prolite" | "plus" | "pro" | "prolite" | "promax" | "go" => {
                 recovery::validate(
                     &json!({"event":"same_workspace","workspaceId":a["accountId"],"originalWorkspaceId":a["accountId"],"tokens":recovery::tokens(&credential)}),
                     &settings(&a),

@@ -177,20 +177,14 @@ fn validate_with_expiry(
                     && ((same
                         && original["planType"]
                             .as_str()
-                            .is_some_and(|old| p.trim().eq_ignore_ascii_case(old.trim())))
+                            .is_some_and(|old| crate::plans::same_family(p, old)))
                         || (!same
                             && (forced
                                 || (upgraded
-                                    && matches!(
-                                        p.to_ascii_lowercase().as_str(),
-                                        "team" | "business"
-                                    ))
+                                    && crate::plans::team(p))
                                 || (recovered
                                     && if output["selectedPlan"] == "team" {
-                                        matches!(
-                                            p.to_ascii_lowercase().as_str(),
-                                            "team" | "business"
-                                        )
+                                        crate::plans::team(p)
                                     } else {
                                         p.eq_ignore_ascii_case("free")
                                     })
@@ -306,6 +300,36 @@ fn subject_with_workspace_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn business_prolite_uses_team_family_without_weakening_token_identity() {
+        let sku = crate::plans::BUSINESS_PROLITE;
+        let make = |plan: &str, user: &str, workspace: &str| {
+            let value = json!({"email":"fixture@example.com","sub":"subject","exp":now()/1000+3600,
+                AUTH:{"user_id":user,"chatgpt_account_id":workspace,"chatgpt_plan_type":plan}});
+            format!("fixture.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap()))
+        };
+        let token = make(sku, "user", "workspace");
+        let tokens = json!({"id_token":token,"access_token":token,"refresh_token":"fixture-rt"});
+        let original = json!({"email":"fixture@example.com","userId":"user","accountId":"workspace","planType":"team"});
+        let output = json!({"event":"same_workspace","workspaceId":"workspace","originalWorkspaceId":"workspace","tokens":tokens});
+        assert!(validate(&output, &original).is_ok());
+        let mut personal = original.clone();
+        personal["planType"] = json!("prolite");
+        assert!(validate(&output, &personal).is_err());
+        for (plan, user, workspace) in [("team", "user", "workspace"), (sku, "other", "workspace"), (sku, "user", "other")] {
+            let mut wrong = output.clone();
+            wrong["tokens"]["access_token"] = json!(make(plan, user, workspace));
+            assert!(validate(&wrong, &original).is_err());
+        }
+        let mut upgrade = output.clone();
+        upgrade["event"] = json!("team_upgrade");
+        upgrade["uniqueTeamConfirmed"] = json!(true);
+        let mut free = original.clone();
+        free["planType"] = json!("free");
+        assert!(validate(&upgrade, &free).is_ok());
+        upgrade["uniqueTeamConfirmed"] = json!(false);
+        assert!(validate(&upgrade, &free).is_err());
+    }
     fn expired_token(user: &str, subject: &str, email: &str) -> String {
         let value = json!({"email":email,"sub":subject,"exp":1,AUTH:{"user_id":user}});
         format!(

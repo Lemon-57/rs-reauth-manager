@@ -28,7 +28,7 @@ fn final_status_confirmed(status: &Value) -> bool {
 fn paid_import_plan(plan: &str) -> bool {
     matches!(
         plan.trim().to_ascii_lowercase().as_str(),
-        "team" | "business" | "plus" | "pro" | "prolite" | "promax" | "go"
+        "team" | "business" | "self_serve_business_prolite" | "plus" | "pro" | "prolite" | "promax" | "go"
     )
 }
 
@@ -63,7 +63,7 @@ pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), Pl
     let auth = &identity["https://api.openai.com/auth"];
     let workspace = auth["chatgpt_account_id"].as_str().unwrap_or_default();
     let plan = auth["chatgpt_plan_type"].as_str().unwrap_or_default();
-    if !matches!(plan, "team" | "business")
+    if !crate::plans::team(plan)
         || workspace.is_empty()
         || (original["accountId"] == workspace
             && original["planType"] == plan
@@ -558,6 +558,7 @@ mod tests {
         for plan in [
             "team",
             "business",
+            "self_serve_business_prolite",
             "plus",
             "pro",
             "prolite",

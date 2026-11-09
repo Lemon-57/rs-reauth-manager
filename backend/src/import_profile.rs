@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 pub fn supported(expected: &Value) -> bool {
     expected["planType"]
         .as_str()
-        .is_some_and(|plan| matches!(plan.trim().to_ascii_lowercase().as_str(), "pro" | "prolite"))
+        .is_some_and(|plan| matches!(plan.trim().to_ascii_lowercase().as_str(), "pro" | "prolite" | "self_serve_business_prolite"))
 }
 
 pub async fn apply(
@@ -98,6 +98,7 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
             Ok((100, weight))
         },
         "pro" => Ok((10, 1)),
+        crate::plans::BUSINESS_PROLITE => Ok((10, 10)),
         _ => Err(fault("导入套餐不适用 Pro 策略")),
     }
 }
@@ -110,6 +111,7 @@ mod tests {
     fn exact_plan_controls_fixed_scheduling() {
         assert_eq!(scheduling(&json!({"planType":"ProLite"}), &json!({"importWeight":{"weight":99,"ordinal":2,"timezone":"Asia/Shanghai"}})).unwrap(), (100,99));
         assert_eq!(scheduling(&json!({"planType":" PRO "}), &json!({})).unwrap(), (10,1));
+        assert_eq!(scheduling(&json!({"planType":"self_serve_business_prolite"}), &json!({})).unwrap(), (10,10));
         assert!(scheduling(&json!({"planType":"promax"}), &json!({})).is_err());
         assert!(scheduling(&json!({"planType":"prolite"}), &json!({})).is_err());
         for weight in [json!(0), json!(101), json!("99"), Value::Null] {
@@ -120,7 +122,7 @@ mod tests {
 
     #[test]
     fn only_exact_pro_and_prolite_subscriptions_use_import_profile() {
-        for plan in ["pro", "Pro", " PRO ", "prolite", "ProLite", " ProLite "] {
+        for plan in ["pro", "Pro", " PRO ", "prolite", "ProLite", " ProLite ", "self_serve_business_prolite"] {
             assert!(supported(&json!({"planType":plan})));
         }
         for plan in [

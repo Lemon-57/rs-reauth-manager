@@ -8,6 +8,7 @@ mod executor;
 mod grouping;
 mod host;
 mod import_profile;
+mod plans;
 mod native;
 mod onboarding;
 mod recovery;

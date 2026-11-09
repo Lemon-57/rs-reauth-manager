@@ -184,7 +184,7 @@ class Tests(unittest.TestCase):
         return service.NativePolicy(backend, allocator), backend, allocator
 
     def test_all_native_token_formats_reserve_new_unique_ipv6_before_persistence(self):
-        for plan in ['pro', 'prolite', 'free', 'team', 'business', 'plus', 'promax', 'go']:
+        for plan in ['pro', 'prolite', 'self_serve_business_prolite', 'free', 'team', 'business', 'plus', 'promax', 'go']:
             for kind in ['at', 'rt', 'json']:
                 with self.subTest(plan=plan, kind=kind):
                     policy, backend, allocator = self.policy(plan)
@@ -203,9 +203,9 @@ class Tests(unittest.TestCase):
                     self.assertEqual(len(allocator.entries), 1)
                     self.assertGreaterEqual(allocator.verifications, 2)
                     self.assertEqual(allocator.refreshes, int(kind == 'rt'))
-                    self.assertEqual(account['concurrencyLimit'], 100 if plan == 'prolite' else 10 if plan == 'pro' else 3)
-                    if plan in ['pro', 'prolite']:
-                        self.assertEqual(account['weight'], 100 if plan == 'prolite' else 1)
+                    self.assertEqual(account['concurrencyLimit'], 100 if plan == 'prolite' else 10 if plan in ['pro', 'self_serve_business_prolite'] else 3)
+                    if plan in ['pro', 'prolite', 'self_serve_business_prolite']:
+                        self.assertEqual(account['weight'], 100 if plan == 'prolite' else 10 if plan == 'self_serve_business_prolite' else 1)
                         self.assertEqual(account['groups'], [{'id': 'gpt-pro', 'name': 'GPT Pro', 'enabled': True}])
 
     def test_plugin_rt_import_remains_paused_until_plugin_completion(self):

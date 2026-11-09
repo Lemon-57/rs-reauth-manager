@@ -83,6 +83,7 @@ async function callback(meta,payload) {
    } else {
    const a=add(id);Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:[],planType:(id.startsWith('up_')||id.startsWith('unbound_'))?'free':id.startsWith('rt_business')?'business':'team'})
    if(id.includes('prolite'))a.planType='prolite'
+   if(id.includes('business_sku'))a.planType='self_serve_business_prolite'
    if(/^(rt|new|legacy)_profile_pro(?:_|$)/.test(id))a.planType='pro'
    if(id==='rt_profile_plus')a.planType='plus'
    a.concurrencyLimit=data.settings.concurrencyLimit;a.weight=data.settings.weight
@@ -100,7 +101,7 @@ async function callback(meta,payload) {
    if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='prolite'?100:10);assert.equal(data.weight,a.planType==='prolite'?(a.id.includes('daily_weight')?99:100):1);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='prolite'?100:10);assert.equal(data.weight,a.planType==='prolite'?(a.id.includes('daily_weight')?99:100):a.planType==='self_serve_business_prolite'?10:1);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
    else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
    reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
@@ -108,6 +109,7 @@ async function callback(meta,payload) {
    Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:data.settings.groupIds.map(id=>({id,name:'Team',enabled:true})),concurrencyLimit:data.settings.concurrencyLimit,weight:1,modelAccess:data.settings.modelAccess})
    if(id==='new_import_free_ui'||id==='legacy_free_auto')a.planType='free'
    if(id.includes('prolite'))a.planType='prolite'
+   if(id.includes('business_sku'))a.planType='self_serve_business_prolite'
    if(/^(rt|new|legacy)_profile_pro(?:_|$)/.test(id))a.planType='pro'
    credentials.set(a.id,credential(a));if(id==='new_wrong_user'){const c=credentials.get(a.id),p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'));p[AUTH].chatgpt_user_id='wrong-user';c.facts.material.access_token=jwt(p)};if(id==='new_missing_rt')credentials.get(a.id).facts.material.refresh_token='';completes.push({protected:true,flowId:data.flowId});reply={accountId:id}
   } else throw Error('Unexpected protected route '+url.pathname)
@@ -155,8 +157,9 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/api/admin/accounts/oauth/start') {
    assert.deepEqual(Object.keys(data).sort(),['accountId','name','provider']);starts.push(structuredClone(data));dataReply={flowId:`flow_${data.accountId}`,authorizationUrl:nativeAuthorization};status=201
   } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.groupIds) {
-   assert.deepEqual(Object.keys(data).sort(),['accountIds','groupIds']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
+   assert.deepEqual(Object.keys(data).sort(),data.concurrencyLimit===undefined?['accountIds','groupIds']:['accountIds','concurrencyLimit','groupIds','weight']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
+   if(data.concurrencyLimit!==undefined){assert.equal(a.planType,'self_serve_business_prolite');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,10);a.concurrencyLimit=10;a.weight=10}
    a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':id==='free-wait'?'Free Wait':'Custom',enabled:true}));groupMoves.push(a.id);dataReply={}
    if(a.id==='group_lost'||a.id==='fb_wait_lost'){status=503;code=50301}
    if(a.id==='group_revision_race'||a.id==='fb_wait_revision_race')revisions.set(a.id,revisions.get(a.id)+1)
@@ -177,6 +180,7 @@ async function callback(meta,payload) {
     if(a.id.startsWith('up_')||a.id.startsWith('auto_up_')){workspace='team-workspace';plan='team'}
     if(a.id.startsWith('unbound_')){workspace=a.id.includes('personal')?'personal-workspace':'team-workspace';plan=a.id.includes('personal')?'free':'team'}
     if(a.id.startsWith('force_')){workspace='alternate-workspace';plan='plus'}
+    if(a.id.includes('business_sku')&&!a.id.startsWith('fb_'))plan='self_serve_business_prolite'
     const c=credential(a,workspace,plan);c.facts.material.principal=credentials.get(a.id).facts.material.principal;const p=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'))
     if(a.id.includes('wrong_user'))p[AUTH].chatgpt_user_id='wrong-user'
     if(a.id.includes('wrong_workspace'))p[AUTH].chatgpt_account_id='other-workspace'
@@ -438,7 +442,7 @@ try {
   if(fallback)accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check('RT fallback '+reason+': exact one native login only for definite token rejection, no repeated RT exchange')
  }
- for(const id of ['rt_prolite_daily_weight','new_profile_pro_daily_weight','rt_prolite_profile','new_prolite_profile','rt_prolite_shared','rt_prolite_proof_unavailable','rt_prolite_write_lost','rt_profile_pro','new_profile_pro','rt_profile_pro_write_lost','new_profile_pro_write_lost','rt_profile_pro_readback_wrong','rt_profile_pro_group_readback_wrong','new_profile_pro_group_readback_wrong','rt_profile_pro_group_disabled_readback','rt_profile_pro_group_missing','new_profile_pro_group_disabled','rt_profile_pro_group_duplicate','rt_profile_plus']) {
+ for(const id of ['new_business_sku','rt_business_sku','rt_business_sku_group_missing','new_business_sku_group_disabled','rt_prolite_daily_weight','new_profile_pro_daily_weight','rt_prolite_profile','new_prolite_profile','rt_prolite_shared','rt_prolite_proof_unavailable','rt_prolite_write_lost','rt_profile_pro','new_profile_pro','rt_profile_pro_write_lost','new_profile_pro_write_lost','rt_profile_pro_readback_wrong','rt_profile_pro_group_readback_wrong','new_profile_pro_group_readback_wrong','rt_profile_pro_group_disabled_readback','rt_profile_pro_group_missing','new_profile_pro_group_disabled','rt_profile_pro_group_duplicate','rt_profile_plus']) {
   const requestId=randomUUID(),hasRT=id.startsWith('rt_'),n=starts.length,c=completes.length
   groupMode=id.endsWith('group_missing')?'missing':id.endsWith('group_disabled')?'disabled':id.endsWith('group_duplicate')?'duplicate':'normal'
   const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(hasRT?'----fixture-provided-rt':''),groupIds:[],concurrencyLimit:7,weight:4}
@@ -449,6 +453,7 @@ try {
   assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
   if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,10);assert.equal(a.weight,1);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
+  if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[10,10]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
   assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
@@ -576,6 +581,19 @@ try {
   check(id+': missing old workspace continues through the same bound native OAuth and validates new identity before grouping or enabling')
  }
  await verifyExpiredExistingBindings()
+
+ for(const id of ['business_sku_enabled','business_sku_paused','up_business_sku','fb_business_sku']) {
+  const a=add(id);a.planType=id.startsWith('up_')?'free':'self_serve_business_prolite';a.enabled=!id.endsWith('paused');a.concurrencyLimit=7;a.weight=9;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];credentials.set(id,credential(a))
+  const before=structuredClone(a),n=completes.length,r=refreshes.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message)
+  assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
+  assert.equal(a.enabled,id.startsWith('fb_')?false:before.enabled)
+  assert.deepEqual([a.concurrencyLimit,a.weight],id.startsWith('fb_')?[7,9]:[10,10])
+  assert.equal(a.planType,id.startsWith('fb_')?'free':'self_serve_business_prolite')
+  assert.deepEqual(a.groups.map(g=>g.id),[id.startsWith('fb_')?'free-wait':'gpt-pro'])
+  for(const key of ['notes','name','userId','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[key],before[key])
+  check(id+': Team flow preserves identity, proxy and pause policy, applies exact SKU 10/10 without a daily weight')
+ }
  for(const id of ['good','disabled','free','legacy_principal','business']) {
   const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'||id==='business'){a.planType=id;credentials.set(id,credential(a))}
   const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length
@@ -714,15 +732,16 @@ try {
   check(`${id}: automatic authorization uses the same start/callback/complete/refresh protocol as manual authorization`)
  }
 
- for(const [id,plan,enabled] of [['auto_up_enabled','free',true],['auto_up_paused','free',false],['auto_fb_team','team',true]]) {
+ for(const [id,plan,enabled] of [['auto_up_business_sku','free',true],['auto_up_business_sku_paused','free',false],['auto_business_sku','self_serve_business_prolite',true],['auto_business_sku_paused','self_serve_business_prolite',false],['auto_up_enabled','free',true],['auto_up_paused','free',false],['auto_fb_team','team',true]]) {
   const a=add(id);Object.assign(a,{planType:plan,enabled,status:'error',errorReason:'credential_invalid',runtimeCredentialState:'invalid'});credentials.set(id,credential(a))
   if(id==='auto_fb_team')a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
   const n=completes.length,r=refreshes.length
   await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
   assert.equal(job(id).automatic,true)
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
-  assert.equal(a.planType,id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id==='auto_up_enabled');if(a.planType==='team')assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
+  assert.equal(a.planType,id.includes('business_sku')?'self_serve_business_prolite':id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id.includes('business_sku')?enabled:id==='auto_up_enabled');if(a.planType==='team'||id.includes('business_sku'))assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
   if(id==='auto_fb_team')assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])
+  if(id.includes('business_sku'))assert.deepEqual([a.concurrencyLimit,a.weight],[10,10])
   assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted??false,false);assert.equal(done.logoutOthers??false,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')

@@ -5,6 +5,8 @@ import re
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
+TEAM_PLANS = {'team', 'business', 'self_serve_business_prolite'}
+
 
 class WorkspaceUnavailable(ValueError):
     def __init__(self, personal_id):
@@ -37,7 +39,7 @@ def team_candidate(session, original, *, allow_original=False):
         # Current consent pages identify team memberships as kind=organization.
         # This is only a candidate: recover_team still requires both exchanged
         # tokens to prove the same user, workspace and actual Team/Business plan.
-        if (kinds & {'team', 'business', 'organization'} or plan in {'team', 'business'}) and not (workspace.get('is_personal') is True or kinds & {'personal', 'individual'} or plan not in {'', 'team', 'business'}):
+        if (kinds & {'team', 'business', 'organization'} or plan in TEAM_PLANS) and not (workspace.get('is_personal') is True or kinds & {'personal', 'individual'} or (plan and plan not in TEAM_PLANS)):
             candidates.append(workspace['id'])
     if len(candidates) > 1:
         raise ValueError('workspace')
