@@ -140,14 +140,8 @@ pub async fn assign(
     let mut wanted_ids = group_ids.clone();
     current_ids.sort();
     wanted_ids.sort();
-    let mut wanted = expected.clone();
-    let mut update = json!({"accountIds":[id],"groupIds":group_ids});
-    if let Some((concurrency, weight)) = expected["planType"].as_str().and_then(crate::plans::fixed_scheduling) {
-        wanted["concurrencyLimit"] = json!(concurrency);
-        wanted["weight"] = json!(weight);
-        update["concurrencyLimit"] = json!(concurrency);
-        update["weight"] = json!(weight);
-    }
+    let wanted = expected.clone();
+    let update = json!({"accountIds":[id],"groupIds":group_ids});
     if current_ids == wanted_ids && wanted == *expected {
         return Ok(expected.clone());
     }
@@ -157,7 +151,7 @@ pub async fn assign(
     if settings(&guard) != *expected || guard["_credentialRevision"].as_u64() != Some(revision) {
         return Err(fault("归组前账号配置或凭据变化，未修改分组"));
     }
-    // Only the verified subscription's group and explicit scheduling policy may change.
+    // Ordinary reauthorization changes only grouping; import scheduling is applied separately.
     admin(
         host,
         "POST",

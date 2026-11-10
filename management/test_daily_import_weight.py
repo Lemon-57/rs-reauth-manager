@@ -12,17 +12,19 @@ from test_native_task_finalization import fixture, Backend, Allocator
 
 
 class Tests(unittest.TestCase):
-    def test_prolite_cannot_enable_without_daily_ledger(self):
-        service = fixture()
-        service.NativePolicy = service.NativePolicy.__bases__[0]
-        service.Application = service.Application.__bases__[0]
-        install(service, None)
-        backend, allocator = Backend('prolite'), Allocator()
-        with self.assertRaises(Exception) as caught:
-            service.NativePolicy(backend, allocator).finish([backend.account['id']], [
-                (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
-        self.assertEqual(caught.exception.status, 503)
-        self.assertFalse(backend.account['enabled'])
+    def test_all_three_plans_cannot_enable_without_daily_ledger(self):
+        for plan in ['pro', 'prolite', 'self_serve_business_prolite']:
+            with self.subTest(plan=plan):
+                service = fixture()
+                service.NativePolicy = service.NativePolicy.__bases__[0]
+                service.Application = service.Application.__bases__[0]
+                install(service, None)
+                backend, allocator = Backend(plan), Allocator()
+                with self.assertRaises(Exception) as caught:
+                    service.NativePolicy(backend, allocator).finish([backend.account['id']], [
+                        (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
+                self.assertEqual(caught.exception.status, 503)
+                self.assertFalse(backend.account['enabled'])
 
     def test_beijing_midnight_and_recovery_keep_original_assignment(self):
         with tempfile.TemporaryDirectory() as root:
@@ -67,7 +69,7 @@ class Tests(unittest.TestCase):
     def test_native_finalization_shares_sequence_only_for_pro_plans(self):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
-            for index, (plan, expected) in enumerate([('pro', 1), ('free', 1), ('prolite', 100), ('promax', 1)]):
+            for index, (plan, expected) in enumerate([('pro', 100), ('free', 1), ('prolite', 99), ('self_serve_business_prolite', 98), ('promax', 1), ('pro', 97)]):
                 service = fixture()
                 # Apply to the original base, avoiding nested finalization wrappers.
                 service.NativePolicy = service.NativePolicy.__bases__[0]
@@ -78,9 +80,11 @@ class Tests(unittest.TestCase):
                 policy = service.NativePolicy(backend, allocator)
                 policy.finish([backend.account['id']], [(allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertEqual(backend.account['weight'], expected)
+                if plan in ['pro','prolite','self_serve_business_prolite']:
+                    self.assertEqual(backend.account['concurrencyLimit'], 50)
                 self.assertTrue(backend.account['enabled'])
             # Retry after a write failed must use the already allocated value.
-            self.assertEqual(weights.reserve('account-2', 24001)['weight'], 100)
+            self.assertEqual(weights.reserve('account-2', 24001)['weight'], 99)
 
     def test_plugin_exit_proof_and_native_finish_reuse_the_same_assignment(self):
         from prolite_policy_service import Application, IPV6_CHECK
@@ -88,20 +92,27 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
             weights.reserve('prior-import', 20000)
-            allocator = FleetAllocator('prolite')
-            backend = FleetBackend(allocator)
-            entry = allocator.allocate('fixture-flow')
-            account_id = backend.create({'refreshToken': 'fixture'}, {'enabled': False,
-                'concurrencyLimit': 3, 'weight': 1}, allocator.url(entry))
-            allocator.bind(entry, account_id)
-            checker = Application(1, 2, 'https://fixture.invalid', allocator, weights)
-            checker.send = lambda port, path, headers, body=None: (200, {'code': 200, 'data': backend(path, body)})
-            for _ in range(2):
-                status, result = checker.call(IPV6_CHECK, {}, {'accountId': account_id, 'credentialRevision': 1})
-                self.assertEqual(status, 200)
-                self.assertEqual(result['data']['importWeight']['weight'], 99)
-            self.assertFalse(backend.accounts[account_id]['enabled'])
-            self.assertEqual(backend.accounts[account_id]['weight'], 1) # Proof does not mutate the account.
+            for plan, expected in [('pro',99),('self_serve_business_prolite',98),('prolite',97)]:
+                allocator = FleetAllocator(plan)
+                backend = FleetBackend(allocator)
+                entry = allocator.allocate('fixture-flow')
+                account_id = backend.create({'refreshToken': 'fixture'}, {'enabled': False,
+                    'concurrencyLimit': 3, 'weight': 1}, allocator.url(entry))
+                unique_id = 'proof-' + plan
+                backend.accounts[unique_id] = backend.accounts.pop(account_id)
+                backend.accounts[unique_id]['id'] = unique_id
+                backend.documents[unique_id] = backend.documents.pop(account_id)
+                backend.documents[unique_id]['id'] = unique_id
+                account_id = unique_id
+                allocator.bind(entry, account_id)
+                checker = Application(1, 2, 'https://fixture.invalid', allocator, weights)
+                checker.send = lambda port, path, headers, body=None: (200, {'code': 200, 'data': backend(path, body)})
+                for _ in range(2):
+                    status, result = checker.call(IPV6_CHECK, {}, {'accountId': account_id, 'credentialRevision': 1})
+                    self.assertEqual(status, 200)
+                    self.assertEqual(result['data']['importWeight']['weight'], expected)
+                self.assertFalse(backend.accounts[account_id]['enabled'])
+                self.assertEqual(backend.accounts[account_id]['weight'], 1) # Proof does not mutate the account.
 
 
 if __name__ == '__main__':

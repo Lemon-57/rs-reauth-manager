@@ -157,7 +157,7 @@ class Tests(unittest.TestCase):
                 path.write_text(json.dumps(record))
                 app.finish_task(path, record, backend, policy)
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
                 self.assertEqual(allocator.owner(allocator.entry), 'fixture-account')
                 before = len(backend.writes)
@@ -203,7 +203,7 @@ class Tests(unittest.TestCase):
                 service.NativePolicy(backend, allocator).finish(['fixture-account'], [
                     (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (100, 100) if plan == 'prolite' else (10, 10) if plan == 'self_serve_business_prolite' else (10, 1))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_at_only_does_not_require_or_invent_refresh_or_id_tokens(self):
@@ -276,7 +276,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(prepared['settings']['notes'], 'fixture-notes')
         policy.finish(['fixture-account'], allocations)
         self.assertTrue(backend.account['enabled'])
-        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10, 1))
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100))
         self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_known_older_refresh_version_cannot_overwrite_current_credentials(self):

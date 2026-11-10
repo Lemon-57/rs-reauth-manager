@@ -103,9 +103,9 @@ class Application:
         if after.get('capacity', {}).get('usedSlots') != 0:
             raise ValueError('account_busy')
         proof = {'accountId': account_id, 'credentialRevision': revision, 'independentIPv6': True}
-        if str(before.get('planType', '')).strip().lower() == 'prolite':
+        if str(before.get('planType', '')).strip().lower() in ('pro', 'prolite', 'self_serve_business_prolite'):
             if self.daily_weights is None:
-                raise ValueError('prolite_daily_weight_unavailable')
+                raise ValueError('shared_daily_weight_unavailable')
             proof['importWeight'] = self.daily_weights.reserve(account_id, entry['port'])
         return 200, {'code': 200, 'data': proof}
 

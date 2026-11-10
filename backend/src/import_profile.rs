@@ -1,4 +1,4 @@
-//! ProLite 并发 100、每日递减权重；Pro 固定 10/1。
+//! Three verified import subscriptions share daily weight receipts and concurrency 50.
 use crate::{detail, host::fault, onboarding, recovery, require_idle, settings};
 use gateway_plugin_sdk::{PluginFault, client::HostClient};
 use serde_json::{Value, json};
@@ -89,18 +89,16 @@ pub async fn apply(
 }
 
 fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault> {
-    match expected["planType"].as_str().unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-        "prolite" => {
-            let receipt = &proof["importWeight"];
-            let weight = receipt["weight"].as_u64().filter(|value| (1..=100).contains(value))
-                .filter(|_| receipt["timezone"] == "Asia/Shanghai" && receipt["ordinal"].as_u64().is_some_and(|n| n>0))
-                .ok_or_else(|| fault("ProLite 每日权重回执无效，账号保持暂停"))?;
-            Ok((100, weight))
-        },
-        "pro" => Ok((10, 1)),
-        crate::plans::BUSINESS_PROLITE => Ok((10, 10)),
-        _ => Err(fault("导入套餐不适用 Pro 策略")),
+    if !supported(expected) {
+        return Err(fault("导入套餐不适用共享权重策略"));
     }
+    let receipt = &proof["importWeight"];
+    let ordinal = receipt["ordinal"].as_u64().filter(|n| *n > 0);
+    let weight = receipt["weight"].as_u64().filter(|w| (1..=100).contains(w))
+        .filter(|w| receipt["timezone"] == "Asia/Shanghai"
+            && ordinal.is_some_and(|n| *w == 101u64.saturating_sub(n).max(1)))
+        .ok_or_else(|| fault("每日共享权重回执无效，账号保持暂停"))?;
+    Ok((50, weight))
 }
 
 #[cfg(test)]
@@ -108,16 +106,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_plan_controls_fixed_scheduling() {
-        assert_eq!(scheduling(&json!({"planType":"ProLite"}), &json!({"importWeight":{"weight":99,"ordinal":2,"timezone":"Asia/Shanghai"}})).unwrap(), (100,99));
-        assert_eq!(scheduling(&json!({"planType":" PRO "}), &json!({})).unwrap(), (10,1));
-        assert_eq!(scheduling(&json!({"planType":"self_serve_business_prolite"}), &json!({})).unwrap(), (10,10));
-        assert!(scheduling(&json!({"planType":"promax"}), &json!({})).is_err());
-        assert!(scheduling(&json!({"planType":"prolite"}), &json!({})).is_err());
-        for weight in [json!(0), json!(101), json!("99"), Value::Null] {
-            assert!(scheduling(&json!({"planType":"prolite"}),
-                &json!({"importWeight":{"weight":weight,"ordinal":2,"timezone":"Asia/Shanghai"}})).is_err());
+    fn three_import_plans_require_the_same_valid_daily_receipt() {
+        for plan in ["pro", "prolite", "self_serve_business_prolite"] {
+            let expected = json!({"planType":plan});
+            for (ordinal, weight) in [(1,100), (2,99), (100,1), (105,1)] {
+                assert_eq!(scheduling(&expected, &json!({"importWeight":{"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai"}})).unwrap(), (50,weight));
+            }
+            assert!(scheduling(&expected, &json!({})).is_err());
+            for proof in [json!({"weight":0,"ordinal":1,"timezone":"Asia/Shanghai"}),
+                json!({"weight":100,"ordinal":2,"timezone":"Asia/Shanghai"}),
+                json!({"weight":99,"ordinal":2,"timezone":"UTC"}),
+                json!({"weight":100,"ordinal":0,"timezone":"Asia/Shanghai"}),
+                json!({"weight":"99","ordinal":2,"timezone":"Asia/Shanghai"})] {
+                assert!(scheduling(&expected, &json!({"importWeight":proof})).is_err());
+            }
         }
+        assert!(scheduling(&json!({"planType":"team"}), &json!({"importWeight":{"weight":100,"ordinal":1,"timezone":"Asia/Shanghai"}})).is_err());
     }
 
     #[test]
