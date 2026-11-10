@@ -426,7 +426,11 @@ pub async fn submit(
     let nonces: Vec<_> = entries
         .iter()
         .map(|(_, input)| {
-            recover_start_id(&queue, input).unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            let recovered = recover_start_id(&queue, input);
+            let started = recovered.as_ref().and_then(|id| queue.jobs.iter().rev().find(|job|
+                job.import_info.as_ref().and_then(|info| info.native_start_id.as_ref()) == Some(id))
+                .and_then(|job| job.started_at));
+            (recovered.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()), started)
         })
         .collect();
     // 整批校验通过后一次持久化非敏感意图，敏感输入仅留在当前进程内存
@@ -438,13 +442,14 @@ pub async fn submit(
     let history_to_keep = 200usize.saturating_sub(entries.len());
     let remove = queue.jobs.len().saturating_sub(history_to_keep);
     queue.jobs.drain(..remove);
-    for ((line, input), nonce) in entries.into_iter().zip(nonces) {
+    for ((line, input), (nonce, started)) in entries.into_iter().zip(nonces) {
         let request_id = if single {
             prefix.clone()
         } else {
             format!("{prefix}:{line}")
         };
         let mut queued = job(request_id.clone(), line, &input.email);
+        queued.started_at = started;
         if input.refresh_token.is_none() {
             queued.import_info.as_mut().unwrap().native_start_id = Some(nonce.clone());
         }
@@ -493,7 +498,7 @@ pub async fn advance(manager: &mut Manager, host: &HostClient) -> Result<bool, P
     job.status = "running".into();
     job.step = "preparing".into();
     job.message = "正在检查运行环境、固定代理与原生 OAuth 流程".into();
-    job.started_at = Some(now());
+    job.started_at.get_or_insert_with(now);
     job.implementation_version = Some(env!("CARGO_PKG_VERSION").into());
     crate::host::save(host, &queue, version).await?;
     // 每行只执行一次，结果不确定时只标记本行核对，其他账号沿各自身份继续串行处理

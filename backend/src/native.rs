@@ -405,6 +405,10 @@ pub async fn complete(
     let expected =
         crate::grouping::assign(host, &job.account_id, &expected, saved.credential_revision)
             .await?;
+    let expected = if job.import_info.is_some() {
+        crate::import_profile::apply_details(host, &Value::Null, &job.account_id, &expected,
+            saved.credential_revision, job.started_at.ok_or_else(|| fault("导入开始时间缺失，账号保持暂停"))?).await?
+    } else { expected };
     let recovered_team = recovered && crate::grouping::team(&expected);
     let free = free || (recovered && !recovered_team);
     let resume = (team || recovered_team || (!free && !forced && original["enabled"] == true))

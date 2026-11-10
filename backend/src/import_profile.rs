@@ -103,7 +103,7 @@ fn import_dates(started_at: u64) -> Result<(String, String), PluginFault> {
     Ok((start.to_rfc3339(), end.to_rfc3339()))
 }
 
-async fn apply_details(
+pub(crate) async fn apply_details(
     host: &HostClient,
     transport: &Value,
     id: &str,
@@ -134,18 +134,17 @@ async fn apply_details(
         .iter()
         .map(|g| g["id"].clone())
         .collect();
-    onboarding::request(
-        host,
-        transport,
-        "/api/admin/accounts/update",
-        json!({
+    let update = json!({
             "accountId":id,"name":wanted["name"],"notes":expected["notes"],"enabled":false,
             "concurrencyLimit":expected["concurrencyLimit"],"weight":expected["weight"],
             "groupIds":group_ids,"modelAccess":expected["modelAccess"],
             "supplier":wanted["supplier"],"manualStartsAt":start,"manualExpiresAt":end
-        }),
-    )
-    .await?;
+        });
+    if transport.is_object() {
+        onboarding::request(host, transport, "/api/admin/accounts/update", update).await?;
+    } else {
+        crate::host::admin(host, "POST", "/api/admin/accounts/update", Some(update)).await?;
+    }
     let after = detail(host, id).await?;
     let actual = settings(&after);
     // HTTP 时间统一为 UTC，按时间点比较以接受等价 RFC 3339 表示

@@ -14,6 +14,17 @@ const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
 let groupMode='normal'
+function updateImportDetails(data) {
+   const a=accounts.find(a=>a.id===data.accountId)
+   assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
+   assert.equal(data.name,a.email)
+   assert.equal(Date.parse(data.manualExpiresAt)-Date.parse(data.manualStartsAt),30*86400000)
+   assert.ok(Number.isFinite(Date.parse(data.manualStartsAt)))
+   if(['team','business','self_serve_business_prolite'].includes(a.planType))assert.equal(data.supplier,a.supplier||'AI_change_future')
+   assert.deepEqual(data.groupIds,a.groups.map(g=>g.id))
+   for(const key of ['name','notes','enabled','concurrencyLimit','weight','modelAccess','supplier','manualStartsAt','manualExpiresAt'])if(data[key]!==undefined&&data[key]!==null)a[key]=data[key]
+   return {accountId:a.id,configRevision:1}
+}
 const importFlows=new Map(), providedImports=[], startReceipts=new Map(), startRequests=[]
 let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null,protectedGate=null
 const AUTH='https://api.openai.com/auth'
@@ -100,15 +111,7 @@ async function callback(meta,payload) {
    if(['pro','prolite','self_serve_business_prolite'].includes(a.planType))reply.importWeight={weight:a.id.includes('daily_weight')?99:100,ordinal:a.id.includes('daily_weight')?2:1,timezone:'Asia/Shanghai'}
    if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/update') {
-   const a=accounts.find(a=>a.id===data.accountId)
-   assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
-   assert.equal(data.name,a.email)
-   assert.equal(Date.parse(data.manualExpiresAt)-Date.parse(data.manualStartsAt),30*86400000)
-   assert.ok(Number.isFinite(Date.parse(data.manualStartsAt)))
-   if(['team','business','self_serve_business_prolite'].includes(a.planType))assert.equal(data.supplier,a.supplier||'AI_change_future')
-   assert.deepEqual(data.groupIds,a.groups.map(g=>g.id))
-   for(const key of ['name','notes','enabled','concurrencyLimit','weight','modelAccess','supplier','manualStartsAt','manualExpiresAt'])if(data[key]!==undefined&&data[key]!==null)a[key]=data[key]
-   reply={accountId:a.id,configRevision:1}
+   reply=updateImportDetails(data)
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
    if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,50);assert.equal(data.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
@@ -166,6 +169,8 @@ async function callback(meta,payload) {
    dataReply={documents:[{provider:'openai',document:{accounts:[{id,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'+(id.startsWith('new_')?'/':'')}]}}]}
   } else if(url.pathname==='/api/admin/accounts/oauth/start') {
    assert.deepEqual(Object.keys(data).sort(),['accountId','name','provider']);starts.push(structuredClone(data));dataReply={flowId:`flow_${data.accountId}`,authorizationUrl:nativeAuthorization};status=201
+  } else if(url.pathname==='/api/admin/accounts/update') {
+   dataReply=updateImportDetails(data)
   } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.groupIds) {
    assert.deepEqual(Object.keys(data).sort(),data.concurrencyLimit===undefined?['accountIds','groupIds']:['accountIds','concurrencyLimit','groupIds','weight']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
@@ -488,7 +493,7 @@ try {
   assert.equal(accounts.find(a=>a.id===id).enabled,id!=='new_import_free_ui');if(id!=='new_import_free_ui')assert.deepEqual(accounts.find(a=>a.id===id).groups.map(g=>g.id),['gpt-pro'])
   if(id.startsWith('rt_')){assert.equal(starts.length,n);assert.equal(completes.length,c);assert.equal(done.cleanupStarted??false,false)}
   else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(done.cleanupStarted??false,false)}
-  if(id==='up_import_ui'){assert.equal(accounts.find(a=>a.id===id).planType,'team');assert.equal(accounts.filter(a=>a.email===id+'@example.com').length,1)}
+  if(id==='up_import_ui'){assert.equal(accounts.find(a=>a.id===id).supplier,'AI_change_future');assert.equal(Date.parse(accounts.find(a=>a.id===id).manualStartsAt),done.startedAt);assert.equal(accounts.find(a=>a.id===id).planType,'team');assert.equal(accounts.filter(a=>a.email===id+'@example.com').length,1)}
   const before=[starts.length,completes.length,accounts.length]
   assert.equal((await request('import-line',body)).status,200);assert.deepEqual([starts.length,completes.length,accounts.length],before)
   assert.equal((await request('import-line',{...body,requestId:randomUUID(),line:body.line.toUpperCase()})).status,400)

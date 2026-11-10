@@ -770,7 +770,11 @@ impl Manager {
             let starting_request_id = job.request_id.clone();
             job.status = "running".into();
             job.step = "preparing".into();
-            job.started_at = Some(now());
+            if job.import_info.is_none() {
+                job.started_at = Some(now());
+            } else {
+                job.started_at.get_or_insert_with(now);
+            }
             job.implementation_version = Some(env!("CARGO_PKG_VERSION").into());
             // 凭据发送前先持久化意图，中断任务不自动恢复
             host::save(host, &queue, version).await?;
