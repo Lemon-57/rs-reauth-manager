@@ -56,6 +56,8 @@ class OriginalPolicy:
     def __init__(self, backend, allocator):
         self.backend, self.allocator = backend, allocator
         self.imports = 0
+        self.import_controls = {('fixture-user', 'fixture-workspace'): {
+            'importStartedAt': '2026-01-31T12:34:56+00:00'}}
 
     def detail(self, account_id):
         return self.backend('/api/admin/accounts/detail?accountId=' + account_id)['account']
@@ -125,9 +127,9 @@ class Backend:
             return {'documents': [{'document': {'accounts': [copy.deepcopy(self.document)]}}]}
         if path.startswith('/api/admin/account-groups/options?'):
             return {'items': [{'id': 'fixture-pro-group', 'name': 'GPT Pro', 'enabled': True}]}
-        if path == '/api/admin/accounts/batch-update':
+        if path in ('/api/admin/accounts/batch-update', '/api/admin/accounts/update'):
             self.writes.append(copy.deepcopy(body))
-            self.account.update({k: v for k, v in body.items() if k not in ['accountIds', 'groupIds']})
+            self.account.update({k: v for k, v in body.items() if k not in ['accountId', 'accountIds', 'groupIds']})
             if 'groupIds' in body:
                 self.account['groups'] = [{'id': ident} for ident in body['groupIds']]
             return {}
@@ -150,7 +152,8 @@ class Tests(unittest.TestCase):
                 index = native_index - 1 if version is None else native_index
                 record = {'result': {'taskId': 'fixture-task'}, 'finished': [], 'bindings': [
                     {'index': index, 'port': 24001, 'identity': ['fixture-user', 'fixture-workspace'],
-                     'desired': True, 'notesHash': digest(None)}]}
+                     'desired': True, 'notesHash': digest(None),
+                     'importStartedAt': '2026-01-31T12:34:56+00:00'}]}
                 if version:
                     record['version'] = version
                 path = Path(root) / 'receipt.json'
@@ -160,6 +163,9 @@ class Tests(unittest.TestCase):
                 self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
                 self.assertEqual(allocator.owner(allocator.entry), 'fixture-account')
+                self.assertEqual(backend.account['name'], backend.account['email'])
+                self.assertEqual(backend.account['manualStartsAt'], '2026-01-31T12:34:56+00:00')
+                self.assertEqual(backend.account['manualExpiresAt'], '2026-03-02T12:34:56+00:00')
                 before = len(backend.writes)
                 app.finish_task(path, record, backend, policy)
                 self.assertEqual(len(backend.writes), before)
@@ -175,6 +181,16 @@ class Tests(unittest.TestCase):
                 self.assertFalse(backend.account['enabled'])
                 self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (7, 9))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-group'}])
+                self.assertEqual(backend.account.get('supplier'),
+                    'AI_change_future' if plan in ('team', 'business') else None)
+
+    def test_explicit_supplier_is_preserved(self):
+        service = fixture()
+        allocator, backend = Allocator(), Backend('self_serve_business_prolite')
+        backend.account['supplier'] = 'Existing supplier'
+        policy = service.NativePolicy(backend, allocator)
+        policy.finish(['fixture-account'], [(allocator.entry, ('fixture-user', 'fixture-workspace'), False)])
+        self.assertEqual(backend.account['supplier'], 'Existing supplier')
 
     def test_invalid_tokens_and_unique_exit_failure_cannot_enable(self):
         for error in ['identity', 'plan', 'shared', 'exit']:

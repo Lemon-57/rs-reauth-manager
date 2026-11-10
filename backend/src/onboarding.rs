@@ -122,15 +122,28 @@ enum ImportReply {
 
 fn invalid_rt_reason(status: u16, result: &Value) -> Option<&str> {
     let diagnostic = &result["diagnostic"];
-    if status != 422 || diagnostic["code"] != "rt_rejected"
-        || !matches!(diagnostic["upstreamStatus"].as_u64(), Some(400 | 401)) {
+    if status != 422
+        || diagnostic["code"] != "rt_rejected"
+        || !matches!(diagnostic["upstreamStatus"].as_u64(), Some(400 | 401))
+    {
         return None;
     }
-    diagnostic["reason"].as_str().filter(|reason| matches!(*reason,
-        "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token"
-        | "refresh_token_expired" | "token_expired" | "refresh_token_reused"
-        | "token_revoked" | "refresh_token_revoked" | "token_invalidated"
-        | "invalid_client" | "unauthorized_client"))
+    diagnostic["reason"].as_str().filter(|reason| {
+        matches!(
+            *reason,
+            "invalid_token"
+                | "refresh_token_invalid"
+                | "invalid_refresh_token"
+                | "refresh_token_expired"
+                | "token_expired"
+                | "refresh_token_reused"
+                | "token_revoked"
+                | "refresh_token_revoked"
+                | "token_invalidated"
+                | "invalid_client"
+                | "unauthorized_client"
+        )
+    })
 }
 
 async fn request_inner(
@@ -150,6 +163,7 @@ async fn request_inner(
             | "/api/admin/accounts/import"
             | "/api/admin/accounts/oauth/complete"
             | "/api/admin/accounts/batch-update"
+            | "/api/admin/accounts/update"
     ) {
         return Err(fault("导入管理路径无效"));
     }
@@ -203,11 +217,17 @@ fn import_error(status: u16, result: &Value) -> String {
     let diagnostic = &result["diagnostic"];
     let code = diagnostic["code"].as_str().unwrap_or_default();
     let reason = match diagnostic["reason"].as_str().unwrap_or_default() {
-        "invalid_grant" => "上游返回 invalid_grant，所提供的授权凭据不可接受；未明确说明是否过期或撤销",
-        "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token" => "上游明确返回令牌无效",
+        "invalid_grant" => {
+            "上游返回 invalid_grant，所提供的授权凭据不可接受；未明确说明是否过期或撤销"
+        }
+        "invalid_token" | "refresh_token_invalid" | "invalid_refresh_token" => {
+            "上游明确返回令牌无效"
+        }
         "refresh_token_expired" | "token_expired" => "上游明确返回令牌已过期",
         "refresh_token_reused" => "上游明确返回刷新令牌已被使用，请提供最新 RT",
-        "token_revoked" | "refresh_token_revoked" | "token_invalidated" => "上游明确返回令牌已撤销或失效",
+        "token_revoked" | "refresh_token_revoked" | "token_invalidated" => {
+            "上游明确返回令牌已撤销或失效"
+        }
         "account_deactivated" | "user_deactivated" => "上游明确返回账号已停用",
         "invalid_client" | "unauthorized_client" => "上游返回 OAuth 客户端不匹配或未获授权",
         "access_denied" => "上游明确拒绝访问",
@@ -217,7 +237,8 @@ fn import_error(status: u16, result: &Value) -> String {
     };
     let explanation = match code {
         "rt_rejected" => {
-            let upstream = diagnostic["upstreamStatus"].as_u64()
+            let upstream = diagnostic["upstreamStatus"]
+                .as_u64()
                 .filter(|value| (400..=599).contains(value))
                 .map(|value| format!("（上游 HTTP {value}）"))
                 .unwrap_or_default();
@@ -507,7 +528,7 @@ async fn execute(
     input: &Input,
     request_id: &str,
 ) -> Result<(), PluginFault> {
-    let config = json!({"enabled":false,"concurrencyLimit":data.concurrency_limit,"weight":data.weight,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
+    let config = json!({"name":input.email,"enabled":false,"concurrencyLimit":data.concurrency_limit,"weight":data.weight,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
     if let Some(rt) = &input.refresh_token {
         let result = match request_inner(host, transport, "/api/admin/accounts/import", json!({"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config}), true).await? {
             ImportReply::Success(result) => result,
@@ -554,6 +575,9 @@ async fn execute(
             .find(|j| j.request_id == request_id)
             .ok_or_else(|| fault("导入任务缺失"))?;
         job.account_id = id.into();
+        let import_started_at = job
+            .started_at
+            .ok_or_else(|| fault("导入开始时间缺失，账号保持暂停"))?;
         crate::host::save(host, &queue, version).await?;
         if !a["email"]
             .as_str()
@@ -575,6 +599,7 @@ async fn execute(
             id,
             &settings(&a),
             credential.credential_revision,
+            import_started_at,
         )
         .await?;
         match a["planType"]
@@ -583,7 +608,14 @@ async fn execute(
             .to_ascii_lowercase()
             .as_str()
         {
-            "team" | "business" | "self_serve_business_prolite" | "plus" | "pro" | "prolite" | "promax" | "go" => {
+            "team"
+            | "business"
+            | "self_serve_business_prolite"
+            | "plus"
+            | "pro"
+            | "prolite"
+            | "promax"
+            | "go" => {
                 recovery::validate(
                     &json!({"event":"same_workspace","workspaceId":a["accountId"],"originalWorkspaceId":a["accountId"],"tokens":recovery::tokens(&credential)}),
                     &settings(&a),
@@ -663,15 +695,18 @@ async fn start_native(
         ));
     }
     let (mut queue, version) = crate::host::load(host).await?;
-    queue
+    let job = queue
         .jobs
         .iter_mut()
         .find(|j| j.request_id == request_id)
-        .ok_or_else(|| fault("导入任务缺失"))?
-        .new_account = true;
+        .ok_or_else(|| fault("导入任务缺失"))?;
+    job.new_account = true;
+    let import_started_at = job
+        .started_at
+        .ok_or_else(|| fault("导入开始时间缺失，未启动登录"))?;
     crate::host::save(host, &queue, version).await?;
     let worker_input = json!({"notes":input.notes,"email":input.email,"proxy":proxy,"authorizationUrl":start["authorizationUrl"],"accountId":"","userId":"","planType":"team","automatic":false,"newAccount":true,"allowFreeNew":true});
-    let snapshot = json!({"newAccount":true,"flowId":flow,"proxy":proxy,"email":input.email,"settings":config,"protectedTransport":transport,"allowFreeNew":true});
+    let snapshot = json!({"newAccount":true,"flowId":flow,"proxy":proxy,"email":input.email,"settings":config,"protectedTransport":transport,"allowFreeNew":true,"importStartedAt":import_started_at});
     manager.worker = Some(
         manager
             .runtime
@@ -687,24 +722,63 @@ mod tests {
 
     #[test]
     fn only_definitive_token_rejection_allows_native_fallback() {
-        for reason in ["refresh_token_expired", "refresh_token_reused", "token_revoked",
-            "invalid_token", "refresh_token_invalid", "invalid_refresh_token", "token_expired",
-            "refresh_token_revoked", "token_invalidated", "invalid_client", "unauthorized_client"] {
-            let result = json!({"diagnostic":{"code":"rt_rejected","upstreamStatus":400,"reason":reason}});
+        for reason in [
+            "refresh_token_expired",
+            "refresh_token_reused",
+            "token_revoked",
+            "invalid_token",
+            "refresh_token_invalid",
+            "invalid_refresh_token",
+            "token_expired",
+            "refresh_token_revoked",
+            "token_invalidated",
+            "invalid_client",
+            "unauthorized_client",
+        ] {
+            let result =
+                json!({"diagnostic":{"code":"rt_rejected","upstreamStatus":400,"reason":reason}});
             assert_eq!(invalid_rt_reason(422, &result), Some(reason));
             assert_eq!(invalid_rt_reason(502, &result), None);
         }
-        for reason in ["invalid_grant", "account_deactivated", "access_denied",
-            "rate_limit_exceeded", "invalid_request_error", "unknown"] {
-            assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
-                "code":"rt_rejected","upstreamStatus":400,"reason":reason}})), None);
+        for reason in [
+            "invalid_grant",
+            "account_deactivated",
+            "access_denied",
+            "rate_limit_exceeded",
+            "invalid_request_error",
+            "unknown",
+        ] {
+            assert_eq!(
+                invalid_rt_reason(
+                    422,
+                    &json!({"diagnostic":{
+                "code":"rt_rejected","upstreamStatus":400,"reason":reason}})
+                ),
+                None
+            );
         }
-        for code in ["identity_mismatch", "rt_transport_unconfirmed", "rt_result_unconfirmed"] {
-            assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
-                "code":code,"upstreamStatus":400,"reason":"token_expired"}})), None);
+        for code in [
+            "identity_mismatch",
+            "rt_transport_unconfirmed",
+            "rt_result_unconfirmed",
+        ] {
+            assert_eq!(
+                invalid_rt_reason(
+                    422,
+                    &json!({"diagnostic":{
+                "code":code,"upstreamStatus":400,"reason":"token_expired"}})
+                ),
+                None
+            );
         }
-        assert_eq!(invalid_rt_reason(422, &json!({"diagnostic":{
-            "code":"rt_rejected","upstreamStatus":429,"reason":"token_expired"}})), None);
+        assert_eq!(
+            invalid_rt_reason(
+                422,
+                &json!({"diagnostic":{
+            "code":"rt_rejected","upstreamStatus":429,"reason":"token_expired"}})
+            ),
+            None
+        );
     }
 
     #[test]
@@ -716,12 +790,23 @@ mod tests {
         assert!(text.contains("上游 HTTP 400") && text.contains("已被使用"));
         assert!(text.contains("管理接口 HTTP 422"));
         assert!(!text.contains("secret"));
-        let unknown = import_error(422, &json!({"message":"secret", "diagnostic":{
-            "code":"rt_rejected", "reason":"secret-rt", "upstreamStatus":"secret"}}));
+        let unknown = import_error(
+            422,
+            &json!({"message":"secret", "diagnostic":{
+            "code":"rt_rejected", "reason":"secret-rt", "upstreamStatus":"secret"}}),
+        );
         assert!(unknown.contains("不能据此断言"));
         assert!(!unknown.contains("secret"));
-        for code in ["rt_transport_unconfirmed", "rt_result_unconfirmed", "identity_mismatch",
-            "identity_invalid", "account_conflict", "account_busy", "proxy_unavailable", "flow_conflict"] {
+        for code in [
+            "rt_transport_unconfirmed",
+            "rt_result_unconfirmed",
+            "identity_mismatch",
+            "identity_invalid",
+            "account_conflict",
+            "account_busy",
+            "proxy_unavailable",
+            "flow_conflict",
+        ] {
             let text = import_error(409, &json!({"diagnostic":{"code":code}}));
             assert!(!text.contains("未提供可安全展示"));
         }

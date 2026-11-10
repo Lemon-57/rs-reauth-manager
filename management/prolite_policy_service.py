@@ -16,7 +16,7 @@ from pathlib import Path
 CHECK = '/_management/onboarding/prolite-check'
 IPV6_CHECK = '/_management/onboarding/ipv6-check'
 FORWARD = {'/_management/onboarding/start', '/api/admin/accounts/import',
-           '/api/admin/accounts/oauth/complete', '/api/admin/accounts/batch-update'}
+           '/api/admin/accounts/oauth/complete', '/api/admin/accounts/batch-update', '/api/admin/accounts/update'}
 AUTH = {'cookie', 'authorization', 'x-api-key', 'origin', 'x-csrf-token'}
 
 

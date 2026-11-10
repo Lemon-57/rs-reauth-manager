@@ -99,6 +99,16 @@ async function callback(meta,payload) {
    reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
    if(['pro','prolite','self_serve_business_prolite'].includes(a.planType))reply.importWeight={weight:a.id.includes('daily_weight')?99:100,ordinal:a.id.includes('daily_weight')?2:1,timezone:'Asia/Shanghai'}
    if(a.id.includes('proof_unavailable'))protectedStatus=409
+  } else if(url.pathname==='/api/admin/accounts/update') {
+   const a=accounts.find(a=>a.id===data.accountId)
+   assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
+   assert.equal(data.name,a.email)
+   assert.equal(Date.parse(data.manualExpiresAt)-Date.parse(data.manualStartsAt),30*86400000)
+   assert.ok(Number.isFinite(Date.parse(data.manualStartsAt)))
+   if(['team','business','self_serve_business_prolite'].includes(a.planType))assert.equal(data.supplier,a.supplier||'AI_change_future')
+   assert.deepEqual(data.groupIds,a.groups.map(g=>g.id))
+   for(const key of ['name','notes','enabled','concurrencyLimit','weight','modelAccess','supplier','manualStartsAt','manualExpiresAt'])if(data[key]!==undefined&&data[key]!==null)a[key]=data[key]
+   reply={accountId:a.id,configRevision:1}
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
    if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,50);assert.equal(data.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
@@ -456,6 +466,7 @@ try {
   if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[50,a.id.includes('daily_weight')?99:100]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
+  if(!failed){assert.equal(a.name,a.email);assert.equal(Date.parse(a.manualExpiresAt)-Date.parse(a.manualStartsAt),30*86400000);assert.equal(Date.parse(a.manualStartsAt),done.startedAt)}
   assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
   const counts=[starts.length,completes.length,refreshes.length];await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
   accounts.splice(accounts.findIndex(x=>x.id===id),1)

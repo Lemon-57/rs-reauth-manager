@@ -1,6 +1,7 @@
 """补齐原生导入任务与固定 IPv6 归属的收尾，不重放令牌交换"""
 import base64
 import copy
+import datetime
 import hashlib
 import json
 import threading
@@ -13,6 +14,21 @@ from prolite_policy_service import unique_entry
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def import_details(account, started_at):
+    """导入时间来自原流程回执，恢复不能重新起算有效期"""
+    start = datetime.datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+    if start.tzinfo is None:
+        raise ValueError('import_start_timezone')
+    fields = {key: account[key] for key in ('notes', 'enabled', 'concurrencyLimit', 'weight', 'modelAccess')}
+    fields.update(accountId=account['id'], name=account['email'], enabled=False,
+                  groupIds=[g['id'] for g in account['groups']],
+                  manualStartsAt=start.isoformat(),
+                  manualExpiresAt=(start + datetime.timedelta(days=30)).isoformat())
+    if account['planType'].strip().lower() in ('team', 'business', 'self_serve_business_prolite') and not (account.get('supplier') or '').strip():
+        fields['supplier'] = 'AI_change_future'
+    return fields
 
 
 def token_fields(value):
@@ -127,6 +143,7 @@ def install(service, daily_weights=None):
             for _, identity, _ in allocations:
                 self.new_identities[identity] = match is None
                 self.import_controls[identity] = {
+                    'importStartedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     'notesHash': digest(transformed['settings'].get('notes')),
                     'expectsRT': bool(token_fields(transformed['data']).get('refreshToken'))}
             return transformed, [(entry, identity, requested_enable if match else desired)
@@ -165,6 +182,23 @@ def install(service, daily_weights=None):
                     self.allocator.verify(entry)
                 except Exception:
                     raise Error('独立固定 IPv6 验证失败，账号保持暂停', 409) from None
+                if controls.get('importStartedAt'):
+                    try:
+                        details = import_details(account, controls['importStartedAt'])
+                    except (KeyError, ValueError, TypeError, OverflowError):
+                        raise Error('导入开始时间未确认，账号保持暂停', 409) from None
+                    self.backend('/api/admin/accounts/update', details)
+                    configured = self.detail(account_id)
+                    for key, value in details.items():
+                        if key in ('accountId', 'groupIds'):
+                            continue
+                        actual = configured.get(key)
+                        if key in ('manualStartsAt', 'manualExpiresAt'):
+                            actual = datetime.datetime.fromisoformat((actual or '').replace('Z', '+00:00'))
+                            value = datetime.datetime.fromisoformat(value)
+                        if actual != value:
+                            raise Error('导入邮箱、供应商或起止时间读回不一致，账号保持暂停', 502)
+                    account = configured
                 preserved = {key: account.get(key) for key in (
                     'userId', 'accountId', 'name', 'email', 'notes', 'modelAccess', 'outboundProxyEndpoint')}
                 fields = {'accountIds': [account_id], 'enabled': desired[
@@ -233,7 +267,7 @@ def install(service, daily_weights=None):
                     if not hasattr(policy, 'import_controls'):
                         policy.import_controls = {}
                     policy.import_controls[tuple(binding['identity'])] = {
-                        key: binding[key] for key in ('notesHash', 'expectsRT') if key in binding}
+                        key: binding[key] for key in ('notesHash', 'expectsRT', 'importStartedAt') if key in binding}
                 if not bindings:
                     raise Error('导入条目没有对应的原代理预留，账号保持暂停', 502)
                 policy.finish(item['accountIds'], bindings)
@@ -279,6 +313,7 @@ def install(service, daily_weights=None):
                         record['bindings'].append({'index': index, 'port': entry['port'],
                             'identity': list(identity), 'desired': desired,
                             'newAccount': getattr(policy, 'new_identities', {}).get(identity, True),
+                            'importStartedAt': policy.import_controls[identity]['importStartedAt'],
                             'expectsRT': bool(token_fields(transformed['data']).get('refreshToken')),
                             'notesHash': digest(transformed['settings'].get('notes'))})
                     prepared['items'].append(transformed)

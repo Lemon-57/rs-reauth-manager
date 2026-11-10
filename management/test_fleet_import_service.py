@@ -105,10 +105,10 @@ class Backend:
             data = body['data'].get('accounts', [body['data']])[0]
             account_id = self.create(data, body['settings'], data['outboundProxyUrl'])
             return {'accountIds': [account_id], 'importedCount': 1, 'configRevision': 1}
-        if url.path == '/api/admin/accounts/batch-update':
+        if url.path in ('/api/admin/accounts/batch-update', '/api/admin/accounts/update'):
             self.writes.append(copy.deepcopy(body))
-            account = self.accounts[body['accountIds'][0]]
-            account.update({key: value for key, value in body.items() if key not in {'accountIds', 'groupIds'}})
+            account = self.accounts[body['accountIds'][0] if 'accountIds' in body else body['accountId']]
+            account.update({key: value for key, value in body.items() if key not in {'accountId', 'accountIds', 'groupIds'}})
             if 'groupIds' in body:
                 account['groups'] = [{'id': group, 'name': 'GPT Pro', 'enabled': True} for group in body['groupIds']]
             return {'configRevision': 1}

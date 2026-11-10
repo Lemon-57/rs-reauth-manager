@@ -8,9 +8,9 @@ mod executor;
 mod grouping;
 mod host;
 mod import_profile;
-mod plans;
 mod native;
 mod onboarding;
+mod plans;
 mod recovery;
 mod verification;
 mod worker;
@@ -375,7 +375,7 @@ fn import_proxy_valid(proxy: &str) -> bool {
         && url.fragment().is_none()
 }
 fn settings(a: &Value) -> Value {
-    json!({"id":a["id"],"email":a["email"],"name":a["name"],"enabled":a["enabled"],"notes":a["notes"],"groups":a["groups"],"proxy":a["outboundProxyEndpoint"],"weight":a["weight"],"concurrencyLimit":a["concurrencyLimit"],"modelAccess":a["modelAccess"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"]})
+    json!({"id":a["id"],"email":a["email"],"name":a["name"],"enabled":a["enabled"],"notes":a["notes"],"groups":a["groups"],"proxy":a["outboundProxyEndpoint"],"weight":a["weight"],"concurrencyLimit":a["concurrencyLimit"],"modelAccess":a["modelAccess"],"accountId":a["accountId"],"userId":a["userId"],"planType":a["planType"],"supplier":a["supplier"],"manualStartsAt":a["manualStartsAt"],"manualExpiresAt":a["manualExpiresAt"]})
 }
 fn require_idle(a: &Value) -> Result<(), PluginFault> {
     if a["capacity"]["usedSlots"].as_u64() != Some(0) {
@@ -952,12 +952,14 @@ async fn handle(
         });
         let snapshot = json!({
             "newAccount":true,
+            "importStartedAt":queue.jobs.last().and_then(|job| job.started_at),
             "allowFreeNew":true,
             "flowId":flow,
             "proxy":proxy,
             "email":request.email.trim(),
             "protectedTransport":transport,
             "settings":{
+                "name":request.email.trim(),
                 "enabled":false,
                 "concurrencyLimit":3,
                 "weight":1,

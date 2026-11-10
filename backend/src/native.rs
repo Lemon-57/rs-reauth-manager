@@ -28,7 +28,14 @@ fn final_status_confirmed(status: &Value) -> bool {
 fn paid_import_plan(plan: &str) -> bool {
     matches!(
         plan.trim().to_ascii_lowercase().as_str(),
-        "team" | "business" | "self_serve_business_prolite" | "plus" | "pro" | "prolite" | "promax" | "go"
+        "team"
+            | "business"
+            | "self_serve_business_prolite"
+            | "plus"
+            | "pro"
+            | "prolite"
+            | "promax"
+            | "go"
     )
 }
 
@@ -532,6 +539,9 @@ async fn complete_new_account(
         id,
         &verified_settings,
         credential.credential_revision,
+        snapshot["importStartedAt"]
+            .as_u64()
+            .ok_or_else(|| fault("导入开始时间缺失，账号保持暂停"))?,
     )
     .await?;
     snapshot["postAuthorizationSettings"] = verified_settings;
