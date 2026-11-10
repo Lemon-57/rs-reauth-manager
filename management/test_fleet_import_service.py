@@ -175,7 +175,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(allocator.entries), 1)
 
     def policy(self, plan='pro', receipt_root=None):
-        service = load_service(Path(__file__).with_name('native_core'), receipt_root, __import__('types').SimpleNamespace(reserve=lambda *args: {'weight':100}))
+        service = load_service(Path(__file__).with_name('native_core'), receipt_root, __import__('types').SimpleNamespace(reserve=lambda *args: {'weight':100 if args[2]=='prolite' else 50}))
         # Proxy-budget logic is independently inherited; these cases test import
         # identity, pool reservation, native persistence and scheduling completion.
         service.NativePolicy.ensure_new_proxy_budget = lambda *_: None
@@ -205,7 +205,7 @@ class Tests(unittest.TestCase):
                     self.assertEqual(allocator.refreshes, int(kind == 'rt'))
                     self.assertEqual(account['concurrencyLimit'], 50 if plan in ['pro', 'prolite', 'self_serve_business_prolite'] else 3)
                     if plan in ['pro', 'prolite', 'self_serve_business_prolite']:
-                        self.assertEqual(account['weight'], 100)
+                        self.assertEqual(account['weight'], 100 if plan=='prolite' else 50)
                         self.assertEqual(account['groups'], [{'id': 'gpt-pro', 'name': 'GPT Pro', 'enabled': True}])
 
     def test_plugin_rt_import_remains_paused_until_plugin_completion(self):
@@ -223,7 +223,7 @@ class Tests(unittest.TestCase):
         account = backend.accounts[result['accountId']]
         self.assertTrue(account['enabled'])
         self.assertEqual(account['groups'][0]['name'], 'GPT Pro')
-        self.assertEqual((account['concurrencyLimit'], account['weight']), (50, 100))
+        self.assertEqual((account['concurrencyLimit'], account['weight']), (50, 50))
 
     def test_distinct_submissions_never_reuse_a_failed_reservation(self):
         policy, backend, allocator = self.policy()

@@ -31,14 +31,14 @@ class Tests(unittest.TestCase):
             path = Path(root) / 'weights.sqlite3'
             weights = DailyImportWeight.initialize(path)
             weights.clock = lambda: datetime(2026, 11, 6, 15, 59, 59, tzinfo=timezone.utc)
-            self.assertEqual(weights.reserve('first', 1)['weight'], 100)
-            self.assertEqual(weights.reserve('second', 2)['weight'], 99)
+            self.assertEqual(weights.reserve('first', 1)['weight'], 50)
+            self.assertEqual(weights.reserve('second', 2)['weight'], 49)
             weights.clock = lambda: datetime(2026, 11, 6, 16, 0, tzinfo=timezone.utc)
             third = weights.reserve('third', 3)
-            self.assertEqual((third['weight'], third['day']), (100, '2026-11-07'))
-            self.assertEqual(weights.reserve('second', 2)['weight'], 99)
+            self.assertEqual((third['weight'], third['day']), (50, '2026-11-07'))
+            self.assertEqual(weights.reserve('second', 2)['weight'], 49)
             self.assertEqual(DailyImportWeight(path).reserve('third', 3), third)
-            self.assertEqual(weights.reserve('first', 4)['weight'], 99) # explicit new slot
+            self.assertEqual(weights.reserve('first', 4)['weight'], 49) # explicit new slot
 
     def test_concurrent_process_connections_and_floor(self):
         with tempfile.TemporaryDirectory() as root:
@@ -49,10 +49,26 @@ class Tests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=12) as pool:
                 receipts = list(pool.map(reserve, range(105)))
             self.assertEqual(sorted(r['ordinal'] for r in receipts), list(range(1, 106)))
-            self.assertEqual(sorted(r['weight'] for r in receipts), [1] * 6 + list(range(2, 101)))
+            self.assertEqual(sorted(r['weight'] for r in receipts), [1] * 56 + list(range(2, 51)))
             with ThreadPoolExecutor(max_workers=12) as pool:
                 repeated = list(pool.map(lambda _: reserve(200), range(20)))
             self.assertTrue(all(r == repeated[0] for r in repeated))
+
+    def test_legacy_receipts_are_immutable_and_new_sequences_start_independently(self):
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/'weights.sqlite3'
+            weights=DailyImportWeight.initialize(path)
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO assignments VALUES ('old',1,'2026-11-06',2,99)")
+            self.assertEqual(weights.reserve('old',1,'prolite')['weight'],99)
+            self.assertEqual(weights.reserve('old',1,'pro')['sequence'],'legacy')
+            self.assertEqual(weights.reserve('a',2,'pro')['weight'],50)
+            self.assertEqual(weights.reserve('b',3,'prolite')['weight'],100)
+            self.assertEqual(weights.reserve('c',4,'self_serve_business_prolite')['weight'],49)
+            with self.assertRaisesRegex(ValueError,'sequence_changed'):
+                weights.reserve('a',2,'prolite')
+            with closing(sqlite3.connect(path)) as db:
+                self.assertEqual(db.execute('SELECT * FROM assignments').fetchall(),[('old',1,'2026-11-06',2,99)])
 
     def test_missing_corrupt_or_unknown_schema_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -69,7 +85,7 @@ class Tests(unittest.TestCase):
     def test_native_finalization_shares_sequence_only_for_pro_plans(self):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
-            for index, (plan, expected) in enumerate([('pro', 100), ('free', 1), ('prolite', 99), ('self_serve_business_prolite', 98), ('promax', 1), ('pro', 97)]):
+            for index, (plan, expected) in enumerate([('pro', 50), ('free', 1), ('prolite', 100), ('self_serve_business_prolite', 49), ('promax', 1), ('pro', 48), ('prolite',99)]):
                 service = fixture()
                 # Apply to the original base, avoiding nested finalization wrappers.
                 service.NativePolicy = service.NativePolicy.__bases__[0]
@@ -84,7 +100,7 @@ class Tests(unittest.TestCase):
                     self.assertEqual(backend.account['concurrencyLimit'], 50)
                 self.assertTrue(backend.account['enabled'])
             # Retry after a write failed must use the already allocated value.
-            self.assertEqual(weights.reserve('account-2', 24001)['weight'], 99)
+            self.assertEqual(weights.reserve('account-2', 24001,'prolite')['weight'], 100)
 
     def test_plugin_exit_proof_and_native_finish_reuse_the_same_assignment(self):
         from prolite_policy_service import Application, IPV6_CHECK
@@ -92,7 +108,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
             weights.reserve('prior-import', 20000)
-            for plan, expected in [('pro',99),('self_serve_business_prolite',98),('prolite',97)]:
+            for plan, expected in [('pro',49),('self_serve_business_prolite',48),('prolite',100)]:
                 allocator = FleetAllocator(plan)
                 backend = FleetBackend(allocator)
                 entry = allocator.allocate('fixture-flow')

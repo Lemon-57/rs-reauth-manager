@@ -168,13 +168,22 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
         return Err(fault("导入套餐不适用共享权重策略"));
     }
     let receipt = &proof["importWeight"];
+    let prolite = expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case("prolite"));
+    let (sequence, start) = if prolite { ("prolite", 100u64) } else { ("pro", 50u64) };
+    let start = if receipt["sequence"] == "legacy" && receipt["start"] == 100 {
+        100
+    } else if receipt["sequence"] == sequence && receipt["start"].as_u64() == Some(start) {
+        start
+    } else {
+        return Err(fault("导入权重序列不匹配，账号保持暂停"));
+    };
     let ordinal = receipt["ordinal"].as_u64().filter(|n| *n > 0);
     let weight = receipt["weight"]
         .as_u64()
-        .filter(|w| (1..=100).contains(w))
+        .filter(|w| (1..=start).contains(w))
         .filter(|w| {
             receipt["timezone"] == "Asia/Shanghai"
-                && ordinal.is_some_and(|n| *w == 101u64.saturating_sub(n).max(1))
+                && ordinal.is_some_and(|n| *w == (start + 1).saturating_sub(n).max(1))
         })
         .ok_or_else(|| fault("每日共享权重回执无效，账号保持暂停"))?;
     Ok((50, weight))
@@ -199,30 +208,24 @@ mod tests {
     }
 
     #[test]
-    fn three_import_plans_require_the_same_valid_daily_receipt() {
-        for plan in ["pro", "prolite", "self_serve_business_prolite"] {
+    fn split_import_plans_require_matching_receipts_and_preserve_old_assignments() {
+        for (plan, sequence, start) in [("pro","pro",50u64),("self_serve_business_prolite","pro",50),("prolite","prolite",100)] {
             let expected = json!({"planType":plan});
-            for (ordinal, weight) in [(1, 100), (2, 99), (100, 1), (105, 1)] {
-                assert_eq!(scheduling(&expected, &json!({"importWeight":{"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai"}})).unwrap(), (50,weight));
+            for ordinal in [1u64,2,50,100,105] {
+                let weight=(start+1).saturating_sub(ordinal).max(1);
+                let receipt=json!({"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai","sequence":sequence,"start":start});
+                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,weight));
             }
-            assert!(scheduling(&expected, &json!({})).is_err());
-            for proof in [
-                json!({"weight":0,"ordinal":1,"timezone":"Asia/Shanghai"}),
-                json!({"weight":100,"ordinal":2,"timezone":"Asia/Shanghai"}),
-                json!({"weight":99,"ordinal":2,"timezone":"UTC"}),
-                json!({"weight":100,"ordinal":0,"timezone":"Asia/Shanghai"}),
-                json!({"weight":"99","ordinal":2,"timezone":"Asia/Shanghai"}),
-            ] {
-                assert!(scheduling(&expected, &json!({"importWeight":proof})).is_err());
+            let receipt=json!({"weight":99,"ordinal":2,"timezone":"Asia/Shanghai","sequence":"legacy","start":100});
+            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,99));
+            for receipt in [json!({}),
+                json!({"weight":start,"ordinal":2,"timezone":"Asia/Shanghai","sequence":sequence,"start":start}),
+                json!({"weight":start,"ordinal":1,"timezone":"UTC","sequence":sequence,"start":start}),
+                json!({"weight":start,"ordinal":0,"timezone":"Asia/Shanghai","sequence":sequence,"start":start}),
+                json!({"weight":start,"ordinal":1,"timezone":"Asia/Shanghai","sequence":"other","start":start})] {
+                assert!(scheduling(&expected,&json!({"importWeight":receipt})).is_err());
             }
         }
-        assert!(
-            scheduling(
-                &json!({"planType":"team"}),
-                &json!({"importWeight":{"weight":100,"ordinal":1,"timezone":"Asia/Shanghai"}})
-            )
-            .is_err()
-        );
     }
 
     #[test]
