@@ -116,7 +116,11 @@ pub(crate) async fn apply_details(
     wanted["name"] = expected["email"].clone();
     wanted["manualStartsAt"] = json!(start);
     wanted["manualExpiresAt"] = json!(end);
-    if crate::plans::team(expected["planType"].as_str().unwrap_or_default())
+    let business = expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE));
+    if business {
+        wanted["supplier"] = json!("shannian");
+        wanted["concurrencyLimit"] = json!(10);
+    } else if crate::plans::team(expected["planType"].as_str().unwrap_or_default())
         && expected["supplier"]
             .as_str()
             .is_none_or(|v| v.trim().is_empty())
@@ -136,7 +140,7 @@ pub(crate) async fn apply_details(
         .collect();
     let update = json!({
             "accountId":id,"name":wanted["name"],"notes":expected["notes"],"enabled":false,
-            "concurrencyLimit":expected["concurrencyLimit"],"weight":expected["weight"],
+            "concurrencyLimit":wanted["concurrencyLimit"],"weight":expected["weight"],
             "groupIds":group_ids,"modelAccess":expected["modelAccess"],
             "supplier":wanted["supplier"],"manualStartsAt":start,"manualExpiresAt":end
         });
@@ -186,7 +190,8 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
                 && ordinal.is_some_and(|n| *w == (start + 1).saturating_sub(n).max(1))
         })
         .ok_or_else(|| fault("每日共享权重回执无效，账号保持暂停"))?;
-    Ok((50, weight))
+    let concurrency = if expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE)) { 10 } else { 50 };
+    Ok((concurrency, weight))
 }
 
 #[cfg(test)]
@@ -214,10 +219,10 @@ mod tests {
             for ordinal in [1u64,2,50,100,105] {
                 let weight=(start+1).saturating_sub(ordinal).max(1);
                 let receipt=json!({"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai","sequence":sequence,"start":start});
-                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,weight));
+                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(if plan==crate::plans::BUSINESS_PROLITE {10} else {50},weight));
             }
             let receipt=json!({"weight":99,"ordinal":2,"timezone":"Asia/Shanghai","sequence":"legacy","start":100});
-            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,99));
+            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(if plan==crate::plans::BUSINESS_PROLITE {10} else {50},99));
             for receipt in [json!({}),
                 json!({"weight":start,"ordinal":2,"timezone":"Asia/Shanghai","sequence":sequence,"start":start}),
                 json!({"weight":start,"ordinal":1,"timezone":"UTC","sequence":sequence,"start":start}),

@@ -203,9 +203,10 @@ class Tests(unittest.TestCase):
                     self.assertEqual(len(allocator.entries), 1)
                     self.assertGreaterEqual(allocator.verifications, 2)
                     self.assertEqual(allocator.refreshes, int(kind == 'rt'))
-                    self.assertEqual(account['concurrencyLimit'], 50 if plan in ['pro', 'prolite', 'self_serve_business_prolite'] else 3)
+                    self.assertEqual(account['concurrencyLimit'], 10 if plan=='self_serve_business_prolite' else 50 if plan in ['pro', 'prolite'] else 3)
                     if plan in ['pro', 'prolite', 'self_serve_business_prolite']:
                         self.assertEqual(account['weight'], 100 if plan=='prolite' else 50)
+                        if plan=='self_serve_business_prolite':self.assertEqual(account['supplier'],'shannian')
                         self.assertEqual(account['groups'], [{'id': 'gpt-pro', 'name': 'GPT Pro', 'enabled': True}])
 
     def test_plugin_rt_import_remains_paused_until_plugin_completion(self):

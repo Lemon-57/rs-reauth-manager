@@ -160,7 +160,7 @@ class Tests(unittest.TestCase):
                 path.write_text(json.dumps(record))
                 app.finish_task(path, record, backend, policy)
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100 if backend.account['planType']=='prolite' else 50))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 100 if backend.account['planType']=='prolite' else 50))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
                 self.assertEqual(allocator.owner(allocator.entry), 'fixture-account')
                 self.assertEqual(backend.account['name'], backend.account['email'])
@@ -184,13 +184,29 @@ class Tests(unittest.TestCase):
                 self.assertEqual(backend.account.get('supplier'),
                     'AI_change_future' if plan in ('team', 'business') else None)
 
-    def test_explicit_supplier_is_preserved(self):
-        service = fixture()
-        allocator, backend = Allocator(), Backend('self_serve_business_prolite')
-        backend.account['supplier'] = 'Existing supplier'
-        policy = service.NativePolicy(backend, allocator)
-        policy.finish(['fixture-account'], [(allocator.entry, ('fixture-user', 'fixture-workspace'), False)])
-        self.assertEqual(backend.account['supplier'], 'Existing supplier')
+    def test_exact_business_subscription_overrides_supplier_and_concurrency_only(self):
+        for plan in ['self_serve_business_prolite','team','business','pro','prolite']:
+            for supplier in [None,'Existing supplier','shannian']:
+                with self.subTest(plan=plan,supplier=supplier):
+                    service=fixture();allocator,backend=Allocator(),Backend(plan)
+                    backend.account.update(supplier=supplier,name='fixture-name',manualStartsAt=None,manualExpiresAt=None)
+                    policy=service.NativePolicy(backend,allocator)
+                    policy.finish(['fixture-account'],[(allocator.entry,('fixture-user','fixture-workspace'),False)])
+                    self.assertFalse(backend.account['enabled'])
+                    expected_supplier = 'shannian' if plan=='self_serve_business_prolite' else 'AI_change_future' if plan in ['team','business'] and not supplier else supplier
+                    self.assertEqual(backend.account.get('supplier'),expected_supplier)
+                    self.assertEqual(backend.account['concurrencyLimit'],10 if plan=='self_serve_business_prolite' else 50 if plan in ['pro','prolite'] else 3)
+                    self.assertEqual(backend.account.get('manualStartsAt'),'2026-01-31T12:34:56+00:00')
+
+    def test_business_receipt_without_start_time_preserves_metadata(self):
+        service=fixture();allocator,backend=Allocator(),Backend('self_serve_business_prolite')
+        backend.account.update(name='existing name',supplier='old',manualStartsAt=None,manualExpiresAt=None)
+        policy=service.NativePolicy(backend,allocator);policy.import_controls={}
+        policy.finish(['fixture-account'],[(allocator.entry,('fixture-user','fixture-workspace'),False)])
+        self.assertEqual((backend.account['concurrencyLimit'],backend.account['supplier']),(10,'shannian'))
+        self.assertEqual(backend.account['name'],'existing name')
+        self.assertIsNone(backend.account['manualStartsAt'])
+        self.assertIsNone(backend.account['manualExpiresAt'])
 
     def test_invalid_tokens_and_unique_exit_failure_cannot_enable(self):
         for error in ['identity', 'plan', 'shared', 'exit']:
@@ -219,7 +235,7 @@ class Tests(unittest.TestCase):
                 service.NativePolicy(backend, allocator).finish(['fixture-account'], [
                     (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100 if backend.account['planType']=='prolite' else 50))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 100 if backend.account['planType']=='prolite' else 50))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_at_only_does_not_require_or_invent_refresh_or_id_tokens(self):
@@ -292,7 +308,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(prepared['settings']['notes'], 'fixture-notes')
         policy.finish(['fixture-account'], allocations)
         self.assertTrue(backend.account['enabled'])
-        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (50, 100 if backend.account['planType']=='prolite' else 50))
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 100 if backend.account['planType']=='prolite' else 50))
         self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_known_older_refresh_version_cannot_overwrite_current_credentials(self):

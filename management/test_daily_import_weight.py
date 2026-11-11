@@ -97,7 +97,7 @@ class Tests(unittest.TestCase):
                 policy.finish([backend.account['id']], [(allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertEqual(backend.account['weight'], expected)
                 if plan in ['pro','prolite','self_serve_business_prolite']:
-                    self.assertEqual(backend.account['concurrencyLimit'], 50)
+                    self.assertEqual(backend.account['concurrencyLimit'], 10 if plan=='self_serve_business_prolite' else 50)
                 self.assertTrue(backend.account['enabled'])
             # Retry after a write failed must use the already allocated value.
             self.assertEqual(weights.reserve('account-2', 24001,'prolite')['weight'], 100)

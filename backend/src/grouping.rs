@@ -140,8 +140,21 @@ pub async fn assign(
     let mut wanted_ids = group_ids.clone();
     current_ids.sort();
     wanted_ids.sort();
-    let wanted = expected.clone();
-    let update = json!({"accountIds":[id],"groupIds":group_ids});
+    let mut wanted = expected.clone();
+    let business = expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE));
+    if business && before["enabled"] != false {
+        return Err(fault("团队子类型配置写入前账号未暂停，未修改设置"));
+    }
+    let update = if business {
+        wanted["concurrencyLimit"] = json!(10);
+        wanted["supplier"] = json!("shannian");
+        json!({"accountId":id,"name":expected["name"],"notes":expected["notes"],"enabled":false,
+            "concurrencyLimit":10,"weight":expected["weight"],"groupIds":group_ids,
+            "modelAccess":expected["modelAccess"],"supplier":"shannian",
+            "manualStartsAt":expected["manualStartsAt"],"manualExpiresAt":expected["manualExpiresAt"]})
+    } else {
+        json!({"accountIds":[id],"groupIds":group_ids})
+    };
     if current_ids == wanted_ids && wanted == *expected {
         return Ok(expected.clone());
     }
@@ -151,11 +164,11 @@ pub async fn assign(
     if settings(&guard) != *expected || guard["_credentialRevision"].as_u64() != Some(revision) {
         return Err(fault("归组前账号配置或凭据变化，未修改分组"));
     }
-    // Ordinary reauthorization changes only grouping; import scheduling is applied separately.
+    // 已核验的团队子类型使用指定并发和供应商，原权重与凭据保持
     admin(
         host,
         "POST",
-        "/api/admin/accounts/batch-update",
+        if business { "/api/admin/accounts/update" } else { "/api/admin/accounts/batch-update" },
         Some(update),
     )
     .await
