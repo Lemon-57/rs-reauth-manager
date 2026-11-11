@@ -12,8 +12,8 @@ from test_native_task_finalization import fixture, Backend, Allocator
 
 
 class Tests(unittest.TestCase):
-    def test_all_three_plans_cannot_enable_without_daily_ledger(self):
-        for plan in ['pro', 'prolite', 'self_serve_business_prolite']:
+    def test_daily_plans_cannot_enable_without_daily_ledger(self):
+        for plan in ['pro', 'prolite']:
             with self.subTest(plan=plan):
                 service = fixture()
                 service.NativePolicy = service.NativePolicy.__bases__[0]
@@ -25,6 +25,17 @@ class Tests(unittest.TestCase):
                         (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertEqual(caught.exception.status, 503)
                 self.assertFalse(backend.account['enabled'])
+
+    def test_business_fixed_weight_needs_no_daily_ledger(self):
+        service = fixture()
+        service.NativePolicy = service.NativePolicy.__bases__[0]
+        service.Application = service.Application.__bases__[0]
+        install(service, None)
+        backend, allocator = Backend('self_serve_business_prolite'), Allocator()
+        service.NativePolicy(backend, allocator).finish([backend.account['id']], [
+            (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight'], backend.account['supplier']), (10,20,'shannian'))
+        self.assertTrue(backend.account['enabled'])
 
     def test_beijing_midnight_and_recovery_keep_original_assignment(self):
         with tempfile.TemporaryDirectory() as root:
@@ -64,7 +75,9 @@ class Tests(unittest.TestCase):
             self.assertEqual(weights.reserve('old',1,'pro')['sequence'],'legacy')
             self.assertEqual(weights.reserve('a',2,'pro')['weight'],50)
             self.assertEqual(weights.reserve('b',3,'prolite')['weight'],100)
-            self.assertEqual(weights.reserve('c',4,'self_serve_business_prolite')['weight'],49)
+            with self.assertRaisesRegex(ValueError, 'unsupported_import_weight_plan'):
+                weights.reserve('c',4,'self_serve_business_prolite')
+            self.assertEqual(weights.reserve('c',4,'pro')['weight'],49)
             with self.assertRaisesRegex(ValueError,'sequence_changed'):
                 weights.reserve('a',2,'prolite')
             with closing(sqlite3.connect(path)) as db:
@@ -85,7 +98,7 @@ class Tests(unittest.TestCase):
     def test_native_finalization_shares_sequence_only_for_pro_plans(self):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
-            for index, (plan, expected) in enumerate([('pro', 50), ('free', 1), ('prolite', 100), ('self_serve_business_prolite', 49), ('promax', 1), ('pro', 48), ('prolite',99)]):
+            for index, (plan, expected) in enumerate([('pro', 50), ('free', 1), ('prolite', 100), ('self_serve_business_prolite', 20), ('promax', 1), ('pro', 49), ('prolite',99)]):
                 service = fixture()
                 # Apply to the original base, avoiding nested finalization wrappers.
                 service.NativePolicy = service.NativePolicy.__bases__[0]
@@ -97,7 +110,7 @@ class Tests(unittest.TestCase):
                 policy.finish([backend.account['id']], [(allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertEqual(backend.account['weight'], expected)
                 if plan in ['pro','prolite','self_serve_business_prolite']:
-                    self.assertEqual(backend.account['concurrencyLimit'], 10 if plan=='self_serve_business_prolite' else 50)
+                    self.assertEqual(backend.account['concurrencyLimit'], 10 if plan=='self_serve_business_prolite' else 100)
                 self.assertTrue(backend.account['enabled'])
             # Retry after a write failed must use the already allocated value.
             self.assertEqual(weights.reserve('account-2', 24001,'prolite')['weight'], 100)
@@ -108,7 +121,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             weights = DailyImportWeight.initialize(Path(root) / 'weights.sqlite3')
             weights.reserve('prior-import', 20000)
-            for plan, expected in [('pro',49),('self_serve_business_prolite',48),('prolite',100)]:
+            for plan, expected in [('pro',49),('self_serve_business_prolite',20),('prolite',100)]:
                 allocator = FleetAllocator(plan)
                 backend = FleetBackend(allocator)
                 entry = allocator.allocate('fixture-flow')
@@ -126,7 +139,10 @@ class Tests(unittest.TestCase):
                 for _ in range(2):
                     status, result = checker.call(IPV6_CHECK, {}, {'accountId': account_id, 'credentialRevision': 1})
                     self.assertEqual(status, 200)
-                    self.assertEqual(result['data']['importWeight']['weight'], expected)
+                    if plan == 'self_serve_business_prolite':
+                        self.assertNotIn('importWeight',result['data'])
+                    else:
+                        self.assertEqual(result['data']['importWeight']['weight'], expected)
                 self.assertFalse(backend.accounts[account_id]['enabled'])
                 self.assertEqual(backend.accounts[account_id]['weight'], 1) # Proof does not mutate the account.
 

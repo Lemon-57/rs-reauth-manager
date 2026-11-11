@@ -120,6 +120,7 @@ pub(crate) async fn apply_details(
     if business {
         wanted["supplier"] = json!("shannian");
         wanted["concurrencyLimit"] = json!(10);
+        wanted["weight"] = json!(20);
     } else if crate::plans::team(expected["planType"].as_str().unwrap_or_default())
         && expected["supplier"]
             .as_str()
@@ -140,7 +141,7 @@ pub(crate) async fn apply_details(
         .collect();
     let update = json!({
             "accountId":id,"name":wanted["name"],"notes":expected["notes"],"enabled":false,
-            "concurrencyLimit":wanted["concurrencyLimit"],"weight":expected["weight"],
+            "concurrencyLimit":wanted["concurrencyLimit"],"weight":wanted["weight"],
             "groupIds":group_ids,"modelAccess":expected["modelAccess"],
             "supplier":wanted["supplier"],"manualStartsAt":start,"manualExpiresAt":end
         });
@@ -171,6 +172,9 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
     if !supported(expected) {
         return Err(fault("导入套餐不适用共享权重策略"));
     }
+    if expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE)) {
+        return Ok((10, 20));
+    }
     let receipt = &proof["importWeight"];
     let prolite = expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case("prolite"));
     let (sequence, start) = if prolite { ("prolite", 100u64) } else { ("pro", 50u64) };
@@ -190,8 +194,7 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
                 && ordinal.is_some_and(|n| *w == (start + 1).saturating_sub(n).max(1))
         })
         .ok_or_else(|| fault("每日共享权重回执无效，账号保持暂停"))?;
-    let concurrency = if expected["planType"].as_str().is_some_and(|p| p.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE)) { 10 } else { 50 };
-    Ok((concurrency, weight))
+    Ok((100, weight))
 }
 
 #[cfg(test)]
@@ -214,15 +217,15 @@ mod tests {
 
     #[test]
     fn split_import_plans_require_matching_receipts_and_preserve_old_assignments() {
-        for (plan, sequence, start) in [("pro","pro",50u64),("self_serve_business_prolite","pro",50),("prolite","prolite",100)] {
+        for (plan, sequence, start) in [("pro","pro",50u64),("prolite","prolite",100)] {
             let expected = json!({"planType":plan});
             for ordinal in [1u64,2,50,100,105] {
                 let weight=(start+1).saturating_sub(ordinal).max(1);
                 let receipt=json!({"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai","sequence":sequence,"start":start});
-                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(if plan==crate::plans::BUSINESS_PROLITE {10} else {50},weight));
+                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(100,weight));
             }
             let receipt=json!({"weight":99,"ordinal":2,"timezone":"Asia/Shanghai","sequence":"legacy","start":100});
-            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(if plan==crate::plans::BUSINESS_PROLITE {10} else {50},99));
+            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(100,99));
             for receipt in [json!({}),
                 json!({"weight":start,"ordinal":2,"timezone":"Asia/Shanghai","sequence":sequence,"start":start}),
                 json!({"weight":start,"ordinal":1,"timezone":"UTC","sequence":sequence,"start":start}),
@@ -231,6 +234,11 @@ mod tests {
                 assert!(scheduling(&expected,&json!({"importWeight":receipt})).is_err());
             }
         }
+    }
+
+    #[test]
+    fn business_uses_fixed_weight_without_receipt() {
+        assert_eq!(scheduling(&json!({"planType":"self_serve_business_prolite"}), &json!({})).unwrap(), (10,20));
     }
 
     #[test]

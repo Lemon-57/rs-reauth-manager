@@ -19,7 +19,7 @@ function updateImportDetails(data) {
    assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
    assert.ok(data.name===a.name||data.name===a.email)
    if(data.manualStartsAt!=null){assert.equal(Date.parse(data.manualExpiresAt)-Date.parse(data.manualStartsAt),30*86400000);assert.ok(Number.isFinite(Date.parse(data.manualStartsAt)))}
-   if(a.planType==='self_serve_business_prolite'){assert.equal(data.supplier,'shannian');assert.equal(data.concurrencyLimit,10)}
+   if(a.planType==='self_serve_business_prolite'){assert.equal(data.supplier,'shannian');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,20)}
    else if(['team','business'].includes(a.planType))assert.equal(data.supplier,a.supplier||'AI_change_future')
    if(a.planType!=='self_serve_business_prolite')assert.deepEqual(data.groupIds,a.groups.map(g=>g.id))
    if(a.planType==='self_serve_business_prolite'){a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':'Custom',enabled:true}));groupMoves.push(a.id)}
@@ -109,13 +109,13 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/_management/onboarding/ipv6-check') {
    const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);assert.equal(data.credentialRevision,revisions.get(a.id))
    reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
-   if(['pro','prolite','self_serve_business_prolite'].includes(a.planType))reply.importWeight={weight:(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0),ordinal:a.id.includes('daily_weight')?2:1,timezone:'Asia/Shanghai',sequence:a.planType==='prolite'?'prolite':'pro',start:a.planType==='prolite'?100:50}
+   if(['pro','prolite'].includes(a.planType))reply.importWeight={weight:(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0),ordinal:a.id.includes('daily_weight')?2:1,timezone:'Asia/Shanghai',sequence:a.planType==='prolite'?'prolite':'pro',start:a.planType==='prolite'?100:50}
    if(a.id.includes('proof_unavailable'))protectedStatus=409
   } else if(url.pathname==='/api/admin/accounts/update') {
    reply=updateImportDetails(data)
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='self_serve_business_prolite'?10:50);assert.equal(data.weight,(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0));assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='self_serve_business_prolite'?10:100);assert.equal(data.weight,a.planType==='self_serve_business_prolite'?20:(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0));assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
    else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
    reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
@@ -178,7 +178,7 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.groupIds) {
    assert.deepEqual(Object.keys(data).sort(),data.concurrencyLimit===undefined?['accountIds','groupIds']:['accountIds','concurrencyLimit','groupIds','weight']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.planType,'self_serve_business_prolite');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,10);a.concurrencyLimit=10;a.weight=10}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.planType,'self_serve_business_prolite');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,20);a.concurrencyLimit=10;a.weight=20}
    a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':id==='free-wait'?'Free Wait':'Custom',enabled:true}));groupMoves.push(a.id);dataReply={}
    if(a.id==='group_lost'||a.id==='fb_wait_lost'){status=503;code=50301}
    if(a.id==='group_revision_race'||a.id==='fb_wait_revision_race')revisions.set(a.id,revisions.get(a.id)+1)
@@ -470,9 +470,9 @@ try {
   for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
   const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost|readback_wrong|group_missing|group_disabled|group_duplicate/.test(id)
   assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
-  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
-  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
-  if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[10,a.id.includes('daily_weight')?49:50]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
+  if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[10,20]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
   if(!failed){assert.equal(a.name,a.email);assert.equal(Date.parse(a.manualExpiresAt)-Date.parse(a.manualStartsAt),30*86400000);assert.equal(Date.parse(a.manualStartsAt),done.startedAt)}
@@ -557,7 +557,7 @@ try {
   for(let i=0;i<80;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
   assert.equal(done.status,'success',done.message)
   const a=accounts.find(a=>a.id===id)
-  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   else{assert.equal(a.enabled,false);assert.equal(a.concurrencyLimit,3)}
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(id+': legacy import also reserves its fresh proxy automatically without caller proxy or group fields')
@@ -606,7 +606,7 @@ try {
   const a=add(id);a.planType='self_serve_business_prolite';a.concurrencyLimit=50;a.weight=37;a.supplier='Previous supplier';credentials.set(id,credential(a))
   const before=structuredClone(a),r=refreshes.length
   await submit([id]);const done=await finish(id);assert.equal(done.status,'review',done.message)
-  assert.equal(a.enabled,false);assert.equal(a.weight,37);assert.equal(refreshes.length,r)
+  assert.equal(a.enabled,false);assert.equal(a.weight,20);assert.equal(refreshes.length,r)
   for(const key of ['notes','name','userId','accountId','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[key],before[key])
   const counts=[starts.length,completes.length,refreshes.length];await tick();await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
   accounts.splice(accounts.findIndex(x=>x.id===id),1)
@@ -618,11 +618,11 @@ try {
   await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message)
   assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.enabled,id.startsWith('fb_')?false:before.enabled)
-  assert.deepEqual([a.concurrencyLimit,a.weight],id.startsWith('fb_')?[7,9]:[10,9]);assert.equal(a.supplier,id.startsWith('fb_')?before.supplier:'shannian')
+  assert.deepEqual([a.concurrencyLimit,a.weight],id.startsWith('fb_')?[7,9]:[10,20]);assert.equal(a.supplier,id.startsWith('fb_')?before.supplier:'shannian')
   assert.equal(a.planType,id.startsWith('fb_')?'free':'self_serve_business_prolite')
   assert.deepEqual(a.groups.map(g=>g.id),[id.startsWith('fb_')?'free-wait':'gpt-pro'])
   for(const key of ['notes','name','userId','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[key],before[key])
-  check(id+': Team flow applies concurrency 10 and shannian while preserving weight, identity, proxy and pause policy')
+  check(id+': Team flow applies concurrency 10 and shannian with weight 20 while preserving identity, proxy and pause policy')
  }
  for(const id of ['good','disabled','free','legacy_principal','business']) {
   const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'||id==='business'){a.planType=id;credentials.set(id,credential(a))}
@@ -771,7 +771,7 @@ try {
   const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
   assert.equal(a.planType,id.includes('business_sku')?'self_serve_business_prolite':id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id.includes('business_sku')?enabled:id==='auto_up_enabled');if(a.planType==='team'||id.includes('business_sku'))assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
   if(id==='auto_fb_team')assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])
-  if(id.includes('business_sku')){assert.deepEqual([a.concurrencyLimit,a.weight],[10,3]);assert.equal(a.supplier,'shannian')}
+  if(id.includes('business_sku')){assert.deepEqual([a.concurrencyLimit,a.weight],[10,20]);assert.equal(a.supplier,'shannian')}
   assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted??false,false);assert.equal(done.logoutOthers??false,false)
   await request('automation',{enabled:false})
   check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')

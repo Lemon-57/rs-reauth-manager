@@ -225,7 +225,7 @@ def main():
                     'freshIndependentIPv6': True, 'proImportGroup': 'GPT Pro',
                     'independentIPv6Pool': True, 'loadedSourceSha256': LOADED_SOURCE_HASHES,
                     'dailyImportWeight': {'enabled': daily_weights is not None, 'timezone': 'Asia/Shanghai',
-                                         'step': 1, 'minimum': 1, 'plans': ['pro', 'prolite', 'self_serve_business_prolite'], 'sequences': [{'id': 'pro', 'start': 50, 'plans': ['pro', 'self_serve_business_prolite']}, {'id': 'prolite', 'start': 100, 'plans': ['prolite']}]}}
+                                         'step': 1, 'minimum': 1, 'plans': ['pro', 'prolite'], 'fixed': {'self_serve_business_prolite': {'concurrency': 10, 'weight': 20}}, 'sequences': [{'id': 'pro', 'start': 50, 'plans': ['pro']}, {'id': 'prolite', 'start': 100, 'plans': ['prolite']}]}}
                 self.reply(200, {'code': 200, 'data': health} if path == '/health' else health)
                 return
             if path not in {'/_management/onboarding/start', '/_management/onboarding/ipv6-check',

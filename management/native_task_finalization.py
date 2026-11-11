@@ -27,7 +27,7 @@ def import_details(account, started_at):
                   manualStartsAt=start.isoformat(),
                   manualExpiresAt=(start + datetime.timedelta(days=30)).isoformat())
     if account['planType'].strip().lower() == 'self_serve_business_prolite':
-        fields.update(concurrencyLimit=10, supplier='shannian')
+        fields.update(concurrencyLimit=10, weight=20, supplier='shannian')
     elif account['planType'].strip().lower() in ('team', 'business') and not (account.get('supplier') or '').strip():
         fields['supplier'] = 'AI_change_future'
     return fields
@@ -190,7 +190,7 @@ def install(service, daily_weights=None):
                             details = import_details(account, controls['importStartedAt'])
                         else:
                             details = {key: account.get(key) for key in ('name','notes','enabled','weight','modelAccess','manualStartsAt','manualExpiresAt')}
-                            details.update(accountId=account_id, concurrencyLimit=10, supplier='shannian', groupIds=[g['id'] for g in account['groups']])
+                            details.update(accountId=account_id, concurrencyLimit=10, weight=20, supplier='shannian', groupIds=[g['id'] for g in account['groups']])
                     except (KeyError, ValueError, TypeError, OverflowError):
                         raise Error('导入开始时间未确认，账号保持暂停', 409) from None
                     self.backend('/api/admin/accounts/update', details)
@@ -219,9 +219,12 @@ def install(service, daily_weights=None):
                             break
                     if len(groups) != 1:
                         raise Error('需要唯一启用的 GPT Pro 分组，账号保持暂停', 409)
-                    if daily_weights is None:
-                        raise Error('Shared daily weight ledger unavailable; account remains paused', 503)
-                    concurrency, weight = (10 if plan == 'self_serve_business_prolite' else 50), daily_weights.reserve(account_id, entry['port'], plan)['weight']
+                    if plan == 'self_serve_business_prolite':
+                        concurrency, weight = 10, 20
+                    else:
+                        if daily_weights is None:
+                            raise Error('Daily weight ledger unavailable; account remains paused', 503)
+                        concurrency, weight = 100, daily_weights.reserve(account_id, entry['port'], plan)['weight']
                     fields.update(concurrencyLimit=concurrency, weight=weight,
                                   groupIds=[groups[0]['id']])
                     # 启用前先保存并回读配置，不能把一次写入成功当作验收

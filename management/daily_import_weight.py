@@ -13,7 +13,7 @@ class DailyImportWeight:
         plan = str(plan).strip().lower()
         if plan == 'prolite':
             return 'prolite', 100
-        if plan in ('pro', 'self_serve_business_prolite'):
+        if plan == 'pro':
             return 'pro', 50
         raise ValueError('unsupported_import_weight_plan')
 

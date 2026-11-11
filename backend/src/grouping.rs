@@ -147,9 +147,10 @@ pub async fn assign(
     }
     let update = if business {
         wanted["concurrencyLimit"] = json!(10);
+        wanted["weight"] = json!(20);
         wanted["supplier"] = json!("shannian");
         json!({"accountId":id,"name":expected["name"],"notes":expected["notes"],"enabled":false,
-            "concurrencyLimit":10,"weight":expected["weight"],"groupIds":group_ids,
+            "concurrencyLimit":10,"weight":20,"groupIds":group_ids,
             "modelAccess":expected["modelAccess"],"supplier":"shannian",
             "manualStartsAt":expected["manualStartsAt"],"manualExpiresAt":expected["manualExpiresAt"]})
     } else {
@@ -164,7 +165,7 @@ pub async fn assign(
     if settings(&guard) != *expected || guard["_credentialRevision"].as_u64() != Some(revision) {
         return Err(fault("归组前账号配置或凭据变化，未修改分组"));
     }
-    // 已核验的团队子类型使用指定并发和供应商，原权重与凭据保持
+    // 已核验的团队子类型使用指定并发、权重和供应商，凭据保持
     admin(
         host,
         "POST",
