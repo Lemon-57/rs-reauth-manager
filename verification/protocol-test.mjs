@@ -749,6 +749,19 @@ try {
   const a=add('slow');await submit([a.id]);await tick();await request('cancel',{requestId:null});assert.equal(job(a.id).status,'cancelled')
   check('Cancel stops the helper without replaying login or OAuth completion')
  }
+ {
+  const a=add('automatic_once_failure');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  await submit([a.id]);assert.equal((await finish(a.id)).status,'failed')
+  const before=starts.length
+  await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  assert.equal(job(a.id).automatic,true);assert.equal((await finish(a.id)).status,'failed');assert.equal(starts.length,before+1)
+  for(let i=0;i<3;i++)await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  await request('automation',{enabled:false});await stop();records.get('executor').value.expires=0;await start()
+  await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  assert.equal(starts.length,before+1,'The same failure cannot retry after polling, switch changes or restart')
+  await request('automation',{enabled:false})
+  check('A prior manual login failure permits one automatic attempt, persisted across polling, disable/enable and restart')
+ }
  for(const id of ['auto_good','auto_wrong_user','auto_native_503','auto_legacy_principal']) {
   const a=add(id);a.errorReason='credential_expired';a.runtimeCredentialState='expired';if(id==='auto_legacy_principal'){const c=credentials.get(id);c.facts.material.principal=null;for(const key of ['id_token','access_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;c.facts.material[key]=jwt(p)}}
   const n=completes.length,r=refreshes.length,m=metadataSaves.length

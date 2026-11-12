@@ -33,3 +33,5 @@ verification/*
 !verification/polling-test.mjs
 !verification/columns-sandbox-test.mjs
 !verification/conventions.mjs
+
+!verification/status-filter-test.mjs

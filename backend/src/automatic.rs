@@ -62,6 +62,47 @@ pub fn ready(a: &Value) -> bool {
 }
 
 impl Automation {
+    fn observe_jobs(&mut self, jobs: &[Job], timestamp: u64) -> Result<(), PluginFault> {
+        // 保留最新任务的人工核对边界，历史失败不会覆盖较新的人工成功
+        let mut seen = std::collections::BTreeSet::new();
+        for job in jobs
+            .iter()
+            .rev()
+            .filter(|j| !j.account_id.is_empty() && seen.insert(j.account_id.clone()))
+        {
+            if matches!(job.status.as_str(), "review" | "interrupted" | "cancelled")
+                || (job.automatic && job.status == "failed")
+            {
+                if !self.attempts.contains_key(&job.account_id) {
+                    if self.attempts.len() >= 1000 {
+                        return Err(fault("自动授权尝试记录已满，请人工核对"));
+                    }
+                    self.attempts.insert(
+                        job.account_id.clone(),
+                        Attempt {
+                            at: timestamp,
+                            recovered: false,
+                            requires_review: true,
+                        },
+                    );
+                }
+                if matches!(job.status.as_str(), "review" | "interrupted" | "cancelled")
+                    && let Some(attempt) = self.attempts.get_mut(&job.account_id)
+                {
+                    attempt.requires_review = true;
+                }
+            } else if !job.automatic
+                && job.status == "success"
+                && let Some(attempt) = self.attempts.get_mut(&job.account_id)
+                && job
+                    .finished_at
+                    .is_some_and(|finished| finished >= attempt.at)
+            {
+                attempt.requires_review = false;
+            }
+        }
+        Ok(())
+    }
     pub fn observe(&mut self, accounts: &[Value]) {
         for a in accounts {
             if (a["status"] == "normal"
@@ -89,46 +130,7 @@ pub async fn scan(host: &HostClient, queue: &mut Queue) -> Result<(), PluginFaul
         return Ok(());
     }
     let mut accounts = crate::directory(host).await?;
-    // 保留最新任务的人工核对边界，历史失败不会覆盖较新的人工成功
-    let mut seen = std::collections::BTreeSet::new();
-    for job in queue
-        .jobs
-        .iter()
-        .rev()
-        .filter(|j| !j.account_id.is_empty() && seen.insert(j.account_id.clone()))
-    {
-        if matches!(
-            job.status.as_str(),
-            "failed" | "review" | "interrupted" | "cancelled"
-        ) {
-            if !queue.automation.attempts.contains_key(&job.account_id) {
-                if queue.automation.attempts.len() >= 1000 {
-                    return Err(fault("自动授权尝试记录已满，请人工核对"));
-                }
-                queue.automation.attempts.insert(
-                    job.account_id.clone(),
-                    Attempt {
-                        at: timestamp,
-                        recovered: false,
-                        requires_review: true,
-                    },
-                );
-            }
-            if matches!(job.status.as_str(), "review" | "interrupted" | "cancelled")
-                && let Some(attempt) = queue.automation.attempts.get_mut(&job.account_id)
-            {
-                attempt.requires_review = true;
-            }
-        } else if !job.automatic
-            && job.status == "success"
-            && let Some(attempt) = queue.automation.attempts.get_mut(&job.account_id)
-            && job
-                .finished_at
-                .is_some_and(|finished| finished >= attempt.at)
-        {
-            attempt.requires_review = false;
-        }
-    }
+    queue.automation.observe_jobs(&queue.jobs, timestamp)?;
     // 暂停不等于凭据已恢复，只为待观察的暂停账号读取原生凭据终态
     for summary in &mut accounts {
         if summary["enabled"] == false
@@ -266,5 +268,37 @@ mod tests {
         state.observe(&[json!({"id":"a","status":"normal","errorReason":null})]);
         assert!(!state.permitted("a", 11));
         assert!(state.permitted("a", COOLDOWN_MS + 10));
+    }
+    #[test]
+    fn manual_failure_does_not_consume_the_single_automatic_attempt() {
+        let mut state = Automation::default();
+        let mut job = Job::queued("manual", "a".into());
+        job.finish("failed", "登录失败");
+        state.observe_jobs(&[job.clone()], 10).unwrap();
+        assert!(state.permitted("a", 10));
+        state.attempts.insert(
+            "a".into(),
+            Attempt {
+                at: 11,
+                recovered: false,
+                requires_review: false,
+            },
+        );
+        job.automatic = true;
+        state.observe_jobs(&[job], 12).unwrap();
+        assert!(!state.permitted("a", COOLDOWN_MS + 12));
+        let restored: Automation =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(!restored.permitted("a", COOLDOWN_MS * 2));
+    }
+    #[test]
+    fn uncertain_manual_results_still_require_review() {
+        for status in ["review", "interrupted", "cancelled"] {
+            let mut state = Automation::default();
+            let mut job = Job::queued("manual", "a".into());
+            job.finish(status, "结果待核对");
+            state.observe_jobs(&[job], 10).unwrap();
+            assert!(!state.permitted("a", COOLDOWN_MS * 2));
+        }
     }
 }

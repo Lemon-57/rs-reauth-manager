@@ -94,12 +94,20 @@ pub struct Queue {
     automation: automatic::Automation,
     #[serde(default, rename = "pendingBatches")]
     pending_batches: Vec<PendingBatch>,
+    #[serde(default, rename = "loginFailureHistory")]
+    login_failure_history: std::collections::BTreeMap<String, LoginFailure>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingBatch {
     request_id: String,
     account_ids: std::collections::VecDeque<String>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginFailure {
+    failed_at: u64,
+    manual_success_at: u64,
 }
 impl Job {
     fn queued(batch: &str, account_id: String) -> Self {
@@ -125,6 +133,30 @@ impl Job {
     }
 }
 impl Queue {
+    fn login_failure_history(&self) -> std::collections::BTreeMap<String, LoginFailure> {
+        let mut history = self.login_failure_history.clone();
+        for job in self.jobs.iter().filter(|job| !job.account_id.is_empty()) {
+            let Some(at) = job.finished_at else { continue };
+            if job.status == "failed" {
+                let record = history.entry(job.account_id.clone()).or_default();
+                record.failed_at = record.failed_at.max(at);
+            } else if job.status == "success"
+                && !job.automatic
+                && !job.new_account
+                && job.import_info.is_none()
+            {
+                let record = history.entry(job.account_id.clone()).or_default();
+                record.manual_success_at = record.manual_success_at.max(at);
+            }
+        }
+        history
+    }
+    fn login_failures(&self) -> Vec<String> {
+        self.login_failure_history()
+            .into_iter()
+            .filter_map(|(id, record)| (record.failed_at > record.manual_success_at).then_some(id))
+            .collect()
+    }
     fn visible_jobs(&self) -> Vec<Job> {
         self.jobs
             .iter()
@@ -203,9 +235,10 @@ impl Queue {
 impl Serialize for Queue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Queue", 2)?;
+        let mut state = serializer.serialize_struct("Queue", 3)?;
         state.serialize_field("jobs", &self.visible_jobs())?;
         state.serialize_field("automation", &self.automation)?;
+        state.serialize_field("loginFailures", &self.login_failures())?;
         state.end()
     }
 }
@@ -1012,6 +1045,9 @@ async fn handle(
                 manager.worker.take();
             }
             queue.jobs.retain(|j| !ids.contains(&j.account_id));
+            queue
+                .login_failure_history
+                .retain(|id, _| !ids.contains(id));
             queue.remove_pending(&ids);
             host::save(&call.host, &queue, version).await.map_err(|_| {
                 fault("账号已从 RS 网关删除，但插件任务列表同步失败，请刷新核对；不会自动重复删除")
@@ -1375,6 +1411,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_failure_survives_history_trimming_and_only_manual_success_clears_it() {
+        let mut queue = Queue::default();
+        let mut failure = Job::queued("manual", "a".into());
+        failure.finish("failed", "登录失败");
+        failure.finished_at = Some(10);
+        queue.jobs.push(failure.clone());
+        queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
+        queue.jobs.clear();
+        assert_eq!(queue.login_failures(), vec!["a"]);
+        let mut success = Job::queued("automatic", "a".into());
+        success.finish("success", "自动授权成功");
+        success.finished_at = Some(20);
+        success.automatic = true;
+        queue.jobs.push(success.clone());
+        queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
+        assert_eq!(queue.login_failures(), vec!["a"]);
+        success.automatic = false;
+        success.finished_at = Some(30);
+        queue.jobs.push(success);
+        queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
+        queue.jobs = vec![failure.clone()];
+        assert!(queue.login_failures().is_empty());
+        failure.finished_at = Some(40);
+        queue.jobs.push(failure);
+        assert_eq!(queue.login_failures(), vec!["a"]);
+    }
 
     #[test]
     fn release_uses_current_rpc_and_management_contract() {

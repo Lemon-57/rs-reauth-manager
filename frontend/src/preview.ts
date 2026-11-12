@@ -12,7 +12,7 @@ export function installPreview() {
   jobs.push({ requestId: 'preview-import:import', accountId: 'acct_preview_1', importInfo: { line: 1, email: 'account-2@example.com' }, status: 'review', step: 'review', message: '工作区授权身份校验失败，未更改账号或提交凭据', startedAt: Date.now() - 3600000, finishedAt: Date.now() - 3590000, implementationVersion: '0.1.40' })
   jobs.push({ requestId: 'preview-later:acct_preview_1', accountId: 'acct_preview_1', status: 'review', step: 'review', message: '账号仍有在途请求，未重复授权', startedAt: Date.now() - 60000, finishedAt: Date.now() - 50000, implementationVersion: '0.1.42' })
   let automationEnabled = false
-  const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer })
+  const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify({ ...(body as object), loginFailures: jobs.filter(job => job.status === 'failed').map(job => job.accountId) })).buffer as ArrayBuffer })
   window.codexProxyPlugin = { version: 2, theme, async request(input) {
     const body = input.body ? JSON.parse(input.body) : {}
     if (input.path === 'api/accounts') return encode({ accounts })

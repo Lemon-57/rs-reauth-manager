@@ -42,6 +42,7 @@ pub async fn load(host: &HostClient) -> Result<(crate::Queue, Option<u64>), Plug
         )),
         None => Ok((crate::Queue::default(), None)),
     }?;
+    queue.login_failure_history = queue.login_failure_history();
     queue.automation.enabled = crate::control::enabled(host, queue.automation.enabled).await?;
     Ok((queue, version))
 }
@@ -70,7 +71,7 @@ pub(crate) async fn save_with_limit(
 /// every active job; discard oldest completed history only when the SDK's
 /// 256 KiB record budget requires it. HTTP responses still expose full jobs.
 pub(crate) fn queue_value(queue: &crate::Queue, limit: usize) -> Result<Value, PluginFault> {
-    let mut value = json!({"jobs": &queue.jobs, "automation": &queue.automation, "pendingBatches": &queue.pending_batches});
+    let mut value = json!({"jobs": &queue.jobs, "automation": &queue.automation, "pendingBatches": &queue.pending_batches, "loginFailureHistory": queue.login_failure_history()});
     for job in value["jobs"]
         .as_array_mut()
         .ok_or_else(|| fault("任务状态格式无效"))?

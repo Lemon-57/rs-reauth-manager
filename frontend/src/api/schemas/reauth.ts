@@ -30,12 +30,14 @@ export function parseAccounts(value: unknown): { accounts: Account[] } {
     throw new Error('插件账号列表格式无效')
   return { accounts: value.accounts }
 }
-export function parseJobs(value: unknown): { jobs: Job[]; automation?: { enabled: boolean } } {
+export function parseJobs(value: unknown): { jobs: Job[]; loginFailures: string[]; automation?: { enabled: boolean } } {
   if (!isRecord(value) || !Array.isArray(value.jobs) || !value.jobs.every(job))
     throw new Error('插件任务列表格式无效')
   if (value.automation !== undefined && (!isRecord(value.automation) || typeof value.automation.enabled !== 'boolean'))
     throw new Error('自动授权状态格式无效')
-  return { jobs: value.jobs, ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
+  if (value.loginFailures !== undefined && (!Array.isArray(value.loginFailures) || !value.loginFailures.every(id => typeof id === 'string')))
+    throw new Error('登录失败标记格式无效')
+  return { jobs: value.jobs, loginFailures: value.loginFailures as string[] || [], ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
 }
 export function parseTick(value: unknown): { ok: true } {
   if (!isRecord(value) || value.ok !== true) throw new Error('插件任务推进结果无效')

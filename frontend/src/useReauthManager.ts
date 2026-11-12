@@ -21,7 +21,7 @@ export function useReauthManager() {
     try {
       receiveJobs((await api.importLine(line, requestId)).jobs)
       showImport.value = false
-      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
       await api.tick()
     } catch (e) {
       importError.value = `${(e as Error).message}，未自动重新提交，请先核对账号与任务`
@@ -35,9 +35,11 @@ export function useReauthManager() {
   }
   watch(showImport, open => { if (!open) { importText.value = ''; importError.value = '' } })
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
+  const loginFailureIds = ref<string[]>([])
+  const loginFailed = (account: Account) => loginFailureIds.value.includes(account.id)
   const lastUpdated = ref<number | null>(null), readWarning = ref(''), tickWarning = ref('')
   const refreshWarning = computed(() => readWarning.value || tickWarning.value)
-  const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), supplier = ref(''), filter = ref('all'), page = ref(1), pageSize = ref(20)
+  const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), supplier = ref(''), filter = ref('error'), page = ref(1), pageSize = ref(20)
   const deleting = ref(false), notice = ref(''), automationEnabled = ref(false), automationBusy = ref(false), automationLoaded = ref(false)
   let automationChange = 0
   async function setAutomation(enabled: boolean) {
@@ -94,7 +96,7 @@ export function useReauthManager() {
     if (!source) return
     const requestId = crypto.randomUUID()
     busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
-    if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+    if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
     try {
       receiveJobs((await api.freeFallback(source.requestId, requestId)).jobs)
       await api.tick()
@@ -110,7 +112,7 @@ export function useReauthManager() {
     try {
       const result = await api.forceSubmit(source.requestId, forceWorkspace.value, requestId)
       batchId.value = requestId; batchJobs.value = []; receiveJobs(result.jobs); showForce.value = false
-      if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+      if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
       await api.tick()
     } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
     finally { busy.value = false }
@@ -120,14 +122,19 @@ export function useReauthManager() {
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
   const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
   const planOptions = computed(() => [{ value: 'all', label: '全部订阅' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
+  const statusOptions = [{ value: 'error', label: '账号异常' }, { value: 'login_failed', label: '登录失败' }]
+  const statusSelection = computed({
+    get: () => ['error', 'login_failed'].includes(filter.value) ? filter.value : '',
+    set: (value: string) => { if (value === 'error' || value === 'login_failed') filter.value = value },
+  })
+  const statusPlaceholder = computed(() => filter.value === 'success' ? '本次成功' : filter.value === 'failed' ? '本次未完成' : '状态筛选')
   const supplierOptions = computed(() => makeSupplierOptions(accounts.value))
   const filtered = computed(() => accounts.value.filter(a => {
     if (!supplierMatches(a, supplier.value)) return false
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
-    const job = jobOf(a)
     const batchJob = batchByAccount.value.get(a.id)
-    return filter.value === 'all' || filter.value === 'error' && needsReauth(a) || filter.value === 'ready' && ready(a) || filter.value === 'active' && isActive(job) || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success' || filter.value === 'invalid' && (!a.notesValid || !a.proxy) || filter.value === 'disabled' && !a.enabled
+    return filter.value === 'error' && needsReauth(a) || filter.value === 'login_failed' && loginFailed(a) || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success'
   }))
   const visible = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
   const pageCandidates = computed(() => visible.value)
@@ -163,6 +170,7 @@ export function useReauthManager() {
     const settingChange = automationChange
     const results = await Promise.allSettled([
       api.jobs().then(state => {
+        loginFailureIds.value = state.loginFailures
         if (state.automation && !automationBusy.value && settingChange === automationChange) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
         receiveJobs(state.jobs)
       }),
@@ -206,7 +214,7 @@ export function useReauthManager() {
     if (!accountIds.length) return
     const requestId = crypto.randomUUID()
     busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
-    if (['success', 'failed'].includes(filter.value)) filter.value = 'all'
+    if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
     try {
       receiveJobs((await api.submit(accountIds, requestId)).jobs)
       selected.value = selected.value.filter(id => !accountIds.includes(id))
@@ -231,6 +239,7 @@ export function useReauthManager() {
           void api.tick().catch(e => { if (!destroyed) tickWarning.value = (e as Error).message }).finally(() => { ticking = false })
         }
         const state = await api.jobs()
+        loginFailureIds.value = state.loginFailures
         if (state.automation && !automationBusy.value && settingChange === automationChange) automationEnabled.value = state.automation.enabled
         receiveJobs(state.jobs)
         accounts.value = (await api.accounts()).accounts
@@ -241,5 +250,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
-  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, statusOptions, statusSelection, statusPlaceholder, loginFailed, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }
