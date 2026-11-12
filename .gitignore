@@ -35,3 +35,4 @@ verification/*
 !verification/conventions.mjs
 
 !verification/status-filter-test.mjs
+!verification/import-status-test.mjs

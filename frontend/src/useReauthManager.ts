@@ -29,12 +29,22 @@ export function useReauthManager() {
       try { receiveJobs((await api.jobs()).jobs) } catch { /* Read back only; never replay a submitted RT. */ }
     } finally {
       line = ''
-      try { accounts.value = (await api.accounts()).accounts } catch { error.value ||= '导入后列表读取未确认，请刷新核对' }
+      try { await readAccounts() } catch { error.value ||= '导入后列表读取未确认，请刷新核对' }
       busy.value = false
     }
   }
   watch(showImport, open => { if (!open) { importText.value = ''; importError.value = '' } })
   const accounts = ref<Account[]>([]), jobs = ref<Job[]>([]), selected = ref<string[]>([])
+  const accountReadState = ref<'loading' | 'unavailable' | 'ready'>('loading')
+  async function readAccounts() {
+    try {
+      accounts.value = (await api.accounts()).accounts
+      accountReadState.value = 'ready'
+    } catch (e) {
+      accountReadState.value = 'unavailable'
+      throw e
+    }
+  }
   const loginFailureIds = ref<string[]>([])
   const loginFailed = (account: Account) => loginFailureIds.value.includes(account.id)
   const lastUpdated = ref<number | null>(null), readWarning = ref(''), tickWarning = ref('')
@@ -76,8 +86,8 @@ export function useReauthManager() {
     return imports.filter(job => job.requestId.startsWith(prefix))
   })
   const latestByAccount = computed(() => new Map(jobs.value.map(j => [j.accountId, j])))
-  const importViews = computed(() => new Map(recentImports.value.map(job => [job.requestId, importResult(job, accounts.value, latestByAccount.value.get(job.accountId))])))
-  const importView = (job: Job) => importViews.value.get(job.requestId) || importResult(job, accounts.value, latestByAccount.value.get(job.accountId))
+  const importViews = computed(() => new Map(recentImports.value.map(job => [job.requestId, importResult(job, accounts.value, latestByAccount.value.get(job.accountId), accountReadState.value)])))
+  const importView = (job: Job) => importViews.value.get(job.requestId) || importResult(job, accounts.value, latestByAccount.value.get(job.accountId), accountReadState.value)
   const importsActive = computed(() => recentImports.value.some(isActive))
   const batchByAccount = computed(() => new Map(batchJobs.value.map(j => [j.accountId, j])))
   const jobOf = (a: Account) => {
@@ -100,7 +110,7 @@ export function useReauthManager() {
     try {
       receiveJobs((await api.freeFallback(source.requestId, requestId)).jobs)
       await api.tick()
-      if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts
+      if (receiveJobs((await api.jobs()).jobs)) await readAccounts()
     } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
     finally { busy.value = false }
   }
@@ -167,6 +177,7 @@ export function useReauthManager() {
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; supplier.value = ''; filter.value = value; page.value = 1 }
   async function load() {
     loading.value = true; error.value = ''
+    if (!accounts.value.length) accountReadState.value = 'loading'
     const settingChange = automationChange
     const results = await Promise.allSettled([
       api.jobs().then(state => {
@@ -174,7 +185,7 @@ export function useReauthManager() {
         if (state.automation && !automationBusy.value && settingChange === automationChange) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
         receiveJobs(state.jobs)
       }),
-      api.accounts().then(state => { accounts.value = state.accounts }),
+      readAccounts(),
     ])
     for (const result of results) if (result.status === 'rejected') error.value ||= (result.reason as Error).message
     loading.value = false
@@ -197,7 +208,7 @@ export function useReauthManager() {
       error.value = `${(e as Error).message}，请核对当前列表，未自动重复删除`
     } finally {
       try {
-        accounts.value = (await api.accounts()).accounts
+        await readAccounts()
         selected.value = selected.value.filter(id => accounts.value.some(a => a.id === id))
         receiveJobs((await api.jobs()).jobs)
         batchJobs.value = batchJobs.value.filter(j => accounts.value.some(a => a.id === j.accountId))
@@ -219,7 +230,7 @@ export function useReauthManager() {
       receiveJobs((await api.submit(accountIds, requestId)).jobs)
       selected.value = selected.value.filter(id => !accountIds.includes(id))
       await api.tick()
-      if (receiveJobs((await api.jobs()).jobs)) accounts.value = (await api.accounts()).accounts
+      if (receiveJobs((await api.jobs()).jobs)) await readAccounts()
     } catch (e) {
       error.value = (e as Error).message
       // A failed response does not prove the submission was rejected; read, never replay it.
@@ -242,7 +253,7 @@ export function useReauthManager() {
         loginFailureIds.value = state.loginFailures
         if (state.automation && !automationBusy.value && settingChange === automationChange) automationEnabled.value = state.automation.enabled
         receiveJobs(state.jobs)
-        accounts.value = (await api.accounts()).accounts
+        await readAccounts()
         readWarning.value = ''; tickWarning.value = ''
       }
     } catch (e) { readWarning.value = `状态读取失败，正在重试：${(e as Error).message}` }

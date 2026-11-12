@@ -40,3 +40,31 @@ Every explicit submission gets a fresh reservation namespace. Same-flow recovery
 An explicit reimport may replace a paused, idle account's exit. The broker retains its prior authentication and first ownership before binding the new reservation; the old data plane remains available for other consumers and is never reassigned. `fleet_sync.py` adds only verified new pool bindings to the existing incremental engines. Existing Chat2API identities, quotas, counters, cooling, pause state and in-flight guards remain owned by those engines.
 
 The older shared fixed-pool adapters documented above remain recovery material and support existing consumers. They are not the import allocation path for the fleet independent-pool policy. Keep rollback routes, native flow receipts, broker site keys and both permanent IPv6 ledgers across upgrades. Recheck the effective gateway port and proxy/manager source paths at deployment time.
+# Short polling for protected RT imports
+
+`protected_operations.py` is an authenticated loopback front end for the existing
+protected import manager. Plugin 0.1.86 requires its `/_management/import-operation`
+endpoint. Install and validate this front end before changing the plugin's
+`protectedManagementUrl`. The original manager, allocator, policy layers and
+native OAuth routes remain in place.
+
+The front end authenticates every operation request against the native admin
+API. It forwards RT imports once to the current protected import policy and
+forwards the other supported paths to the prior protected entry. Configure
+`--auth-port`, `--forward-port`, `--legacy-port`, `--origin`, a private `--root`
+and a separate loopback `--port` explicitly from the target instance's effective
+configuration.
+
+Operation intents contain a UUID and request hash. Completed receipts retain
+only native account IDs, counters and finite diagnostic codes. Login notes,
+tokens and administrator headers remain in memory. Repeated polls do not start
+another native request. A persisted intent without an in-memory worker after
+restart returns an uncertain result and requires reconciliation. An already
+sent native operation can finish after plugin cancellation; inspect the account
+and receipt before resubmitting.
+
+The worker's HTTP operation has a 600 second limit. Individual plugin callbacks
+keep the SDK's default budget and return pending results promptly. Extending the
+plugin's total budget alone is insufficient because the current managed outbound
+HTTP client limits individual calls to 120 seconds.
+

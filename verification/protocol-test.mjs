@@ -26,7 +26,7 @@ function updateImportDetails(data) {
    for(const key of ['name','notes','enabled','concurrencyLimit','weight','modelAccess','supplier','manualStartsAt','manualExpiresAt'])if(data[key]!==undefined&&data[key]!==null)a[key]=data[key]
    return {accountId:a.id,configRevision:1}
 }
-const importFlows=new Map(), providedImports=[], startReceipts=new Map(), startRequests=[]
+const importFlows=new Map(), providedImports=[], startReceipts=new Map(), startRequests=[], importOperations=new Map()
 let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null,protectedGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
@@ -50,7 +50,7 @@ function send(meta, payload = Buffer.alloc(0)) {
 }
 const result = (id, value = {}, payload) => send({ type: 'result', id, result: value }, payload)
 async function callback(meta,payload) {
- const data=payload.length?JSON.parse(payload.toString()):meta.params
+ let data=payload.length?JSON.parse(payload.toString()):meta.params
  if(meta.method==='host.auth.get_runtime')return result(meta.id,{}, {account_id:data.account_id,provider_id:'openai',credential_revision:revisions.get(data.account_id),credential_state:accounts.find(a=>a.id===data.account_id)?.runtimeCredentialState||'ready'})
  if(meta.method==='host.auth.get')return result(meta.id,{},credentials.get(data.account_id))
  if(meta.method==='host.auth.save') {
@@ -76,6 +76,15 @@ async function callback(meta,payload) {
   const url=new URL(meta.params.url);assert.equal(url.origin,'http://127.0.0.1:18139')
   assert.ok(meta.params.headers.some(([name,value])=>name==='x-api-key'&&Buffer.from(value).toString()==='fixture-admin-key'))
   let reply,protectedStatus=200,diagnostic
+  if(url.pathname==='/_management/import-operation') {
+   const id=data.request.data.email.split('@')[0],previous=importOperations.get(data.requestId)
+   if(id==='rt_budget_delay' && (!previous || previous.remaining>0)) {
+    importOperations.set(data.requestId,{remaining:(previous?.remaining??3)-1})
+    const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:200,data:{pending:true}})))
+    return result(meta.id,{status:202,http_version:'HTTP/1.1',headers:[],stream,trailers:[]})
+   }
+   data=data.request;url.pathname='/api/admin/accounts/import'
+  }
   if(url.pathname==='/_management/onboarding/start') {
    const id=data.email.split('@')[0],flowId='import_'+id
    startRequests.push({email:data.email,requestId:data.requestId})
@@ -244,7 +253,7 @@ function parse() {
       else if (meta.type === 'result') meta.result = data
     }
     payload = payload.subarray(requestBytes + dataBytes)
-    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 7); ready.resolve() }
+    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 7); assert.equal(meta.call_budgets?.maintenance, undefined); ready.resolve() }
     else if (meta.type === 'resume') send({type:'resumed',id:meta.id,epoch:meta.epoch})
     else if (meta.type === 'suspend' || meta.type === 'callback_consumed') {}
     else if (meta.type === 'callback') callback(meta, payload).catch(e => { ready.reject(e); for (const w of pending.values()) w.reject(e) })
@@ -261,10 +270,10 @@ async function start() {
   await ready.promise
 }
 async function stop() { const exited = new Promise(resolve => child.once('exit', resolve)); send({ type: 'shutdown' }); child.stdin.end(); await exited }
-async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'management') {
+async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'management', budgetMs = 1000, waitMs = 10000) {
   const id = sequence += 2, w = Promise.withResolvers(); pending.set(id, w)
-  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: 1000, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
-  return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), 10000).unref())])
+  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: budgetMs, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
+  return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), waitMs).unref())])
 }
 async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [{name:'x-api-key',value:Array.from(Buffer.from('fixture-admin-key'))}] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
 const submit = async (ids, requestId = randomUUID()) => { const result = await request('submit', { accountIds: ids, requestId }); if (process.env.RS_REAUTH_TEST_CASE !== 'durable-batches') await tick(); return result }
@@ -316,6 +325,16 @@ async function verifyDurableBatches() {
 }
 try {
  await start()
+ {
+  const id='rt_budget_delay',requestId=randomUUID()
+  await request('import-line',{requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]})
+  for(let i=0;i<3;i++) {
+   await tick();const row=(await request('jobs')).value.jobs.find(j=>j.requestId===requestId+':import')
+   assert.equal(row.status,'queued');assert.equal(row.step,'waiting_import');assert.equal(providedImports.filter(value=>value===id).length,0)
+  }
+  assert.equal((await finish(id)).status,'success');assert.equal(providedImports.filter(value=>value===id).length,1)
+  check('A long protected import is polled as one idempotent operation across maintenance calls and completes without replay')
+ }
  if(process.env.RS_REAUTH_TEST_CASE==='import-cancellation') {
   for(const phase of ['start','complete','rt']) {
    const id='new_cancel_'+phase,requestId=randomUUID(),path=phase==='start'?'/_management/onboarding/start':phase==='rt'?'/api/admin/accounts/import':'/api/admin/accounts/oauth/complete'

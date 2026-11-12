@@ -8,22 +8,30 @@ export function resultMessage(job?: Job): string {
   return message
 }
 
-export function importResult(job: Job, accounts: Account[], latest?: Job) {
+export function importResult(job: Job, accounts: Account[], latest?: Job, readState: 'loading' | 'unavailable' | 'ready' = 'ready') {
   const account = accounts.find(a => !!job.accountId && a.id === job.accountId
     && !!a.email && a.email.toLowerCase() === job.importInfo?.email.toLowerCase())
+  const matches = accounts.filter(a => !!a.email && a.email.toLowerCase() === job.importInfo?.email.toLowerCase())
+  const existing = matches.length === 1 ? matches[0] : undefined
   const saved = !!account
   const label = saved ? (isActive(job) ? '已入库，授权处理中' : '已入库')
-    : isActive(job) ? '导入处理中' : job.status === 'success' ? '历史导入已完成' : '入库结果待核对'
+    : existing ? '同邮箱账号已存在，原导入待核对'
+    : readState === 'loading' ? '正在读取账号状态' : readState === 'unavailable' ? '账号状态读取失败'
+    : isActive(job) ? '导入处理中' : job.status === 'success' ? '历史导入已完成' : '导入结果待核对'
   const tone = account ? account.status === 'error' ? 'danger' : account.enabled && account.status === 'normal' ? 'success' : ''
     : isUnfinished(job) ? 'danger' : ''
   const current = account ? `账号状态：${planLabel(account.planType || 'unknown')} · ${statusText(account)} · ${account.groups.map(g => g.name).join(' / ') || '未分组'}`
-    : isActive(job) ? '后台正在处理，账号状态尚未读回' : '当前列表未找到对应账号，请刷新核对，不要重复导入'
+    : existing ? `同邮箱账号：${planLabel(existing.planType || 'unknown')} · ${statusText(existing)}；原导入记录尚未确认关联，不要重复导入`
+    : readState === 'loading' ? '账号列表尚未读取完成，暂不能判断入库结果'
+    : readState === 'unavailable' ? '账号列表读取失败，暂不能核对入库结果，请刷新核对'
+    : isActive(job) ? '后台正在处理，账号状态尚未读回' : '当前完整列表未找到对应账号，请核对原始结果，不要重复导入'
   const original = `${displayTime(job.finishedAt || job.startedAt)}${job.implementationVersion ? ` · ${job.implementationVersion}` : ''} · ${progress(job)}：${resultMessage(job) || '未记录具体结果'}`
   const followup = latest && latest.requestId !== job.requestId
     ? `${displayTime(latest.finishedAt || latest.startedAt)} · ${progress(latest)}：${resultMessage(latest) || '未记录具体结果'}` : ''
   const note = isActive(job) ? '' : latest?.status === 'success' && latest.requestId !== job.requestId
     ? '后续授权任务已完成，原始记录保留' : saved && isUnfinished(job) ? '原导入任务的后续核验未完成，原始记录保留' : ''
-  return { saved, label, tone, current, original, followup, note }
+  const issue = isUnfinished(job) ? resultMessage(job) : ''
+  return { saved, label, tone, current, original, followup, note, issue }
 }
 
 export const isActive = (job?: Job) => !!job && ['queued', 'running'].includes(job.status)

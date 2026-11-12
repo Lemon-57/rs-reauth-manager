@@ -24,6 +24,7 @@ struct Submission {
     weight: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct Input {
     pub email: String,
     pub notes: String,
@@ -112,12 +113,14 @@ pub async fn request(
     match request_inner(host, transport, path, body, false).await? {
         ImportReply::Success(value) => Ok(value),
         ImportReply::InvalidRt(_) => Err(fault("当前操作不允许回退登录")),
+        ImportReply::Pending => Err(fault("当前操作返回未完成回执，请核对原任务，未重放")),
     }
 }
 
 enum ImportReply {
     Success(Value),
     InvalidRt(String),
+    Pending,
 }
 
 fn invalid_rt_reason(status: u16, result: &Value) -> Option<&str> {
@@ -157,7 +160,8 @@ async fn request_inner(
     crate::executor::check(host).await?;
     if !matches!(
         path,
-        "/_management/onboarding/start"
+        "/_management/import-operation"
+            | "/_management/onboarding/start"
             | "/_management/onboarding/prolite-check"
             | "/_management/onboarding/ipv6-check"
             | "/api/admin/accounts/import"
@@ -196,11 +200,15 @@ async fn request_inner(
         .map_err(|_| fault("导入回执读取未确认，请核对账号，勿重复提交"))?;
     let result: Value = serde_json::from_slice(&raw)
         .map_err(|_| fault("导入回执格式未确认，请核对账号，勿重复提交"))?;
+    if status == 202 && result["code"] == 200 && result["data"]["pending"] == true {
+        return Ok(ImportReply::Pending);
+    }
     if !(200..300).contains(&status) || result["code"] != 200 {
-        if allow_rt_fallback && path == "/api/admin/accounts/import" {
-            if let Some(reason) = invalid_rt_reason(status, &result) {
-                return Ok(ImportReply::InvalidRt(reason.to_owned()));
-            }
+        if allow_rt_fallback
+            && matches!(path, "/api/admin/accounts/import" | "/_management/import-operation")
+            && let Some(reason) = invalid_rt_reason(status, &result)
+        {
+            return Ok(ImportReply::InvalidRt(reason.to_owned()));
         }
         return Err(fault(&import_error(status, &result)));
     }
@@ -262,6 +270,7 @@ fn import_error(status: u16, result: &Value) -> String {
     format!("{explanation}（管理接口 HTTP {status}）；请核对账号与任务，未自动重试或改用账密登录")
 }
 
+#[derive(Clone)]
 pub struct Pending {
     request_id: String,
     nonce: String,
@@ -535,8 +544,19 @@ async fn execute(
 ) -> Result<(), PluginFault> {
     let config = json!({"name":input.email,"enabled":false,"concurrencyLimit":data.concurrency_limit,"weight":data.weight,"groupIds":data.group_ids,"notes":input.notes,"modelAccess":{"mode":"all","models":[]}});
     if let Some(rt) = &input.refresh_token {
-        let result = match request_inner(host, transport, "/api/admin/accounts/import", json!({"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config}), true).await? {
+        let result = match request_inner(host, transport, "/_management/import-operation", json!({"requestId":data.nonce,"request":{"provider":"openai","data":{"email":input.email,"refreshToken":rt},"settings":config}}), true).await? {
             ImportReply::Success(result) => result,
+            ImportReply::Pending => {
+                let (mut queue, version) = crate::host::load(host).await?;
+                let job = queue.jobs.iter_mut().find(|job| job.request_id == request_id)
+                    .ok_or_else(|| fault("导入任务缺失"))?;
+                job.status = "queued".into();
+                job.step = "waiting_import".into();
+                job.message = "受保护管理服务正在完成原生导入，正在查询同一任务结果，不重复提交".into();
+                crate::host::save(host, &queue, version).await?;
+                manager.imports.push_front(data.clone());
+                return Ok(());
+            }
             ImportReply::InvalidRt(reason) => {
                 // A definite rejection cannot have persisted tokens. Still read
                 // the entire directory again to protect concurrent imports.
