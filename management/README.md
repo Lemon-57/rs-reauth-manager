@@ -68,3 +68,15 @@ keep the SDK's default budget and return pending results promptly. Extending the
 plugin's total budget alone is insufficient because the current managed outbound
 HTTP client limits individual calls to 120 seconds.
 
+
+## Current proxy provisioning
+
+When the shared managed GOST data plane moves to a new container or physical
+listener offset, `fleet_slots.py --gost-configuration` validates new immutable
+reservations against that manager's current container, API service identity,
+listener and IPv6 interface. `--allocator-root` fixes the verified permanent
+ownership implementation independently of the manager process working directory.
+The adapter does not start or reload proxies, recycle slots or change fixed
+authentication. The original permanent history, reservations, registry and
+retirement blacklist remain authoritative. Existing authenticated IPv6 exit
+verification still runs before any supplied RT is sent.

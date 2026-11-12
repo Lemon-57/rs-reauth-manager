@@ -294,14 +294,19 @@ def main():
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--listen', required=True)
     parser.add_argument('--legacy-site', required=True)
+    parser.add_argument('--allocator-root', type=Path)
+    parser.add_argument('--gost-configuration', type=Path)
     args = parser.parse_args()
     assert subprocess.check_output(['systemctl', 'is-active', args.manager_unit], text=True).strip() == 'active'
-    root = Path(subprocess.check_output(['systemctl', 'show', args.manager_unit, '-p', 'WorkingDirectory', '--value'], text=True).strip()).resolve(strict=True)
+    root = (args.allocator_root or Path(subprocess.check_output(['systemctl', 'show', args.manager_unit, '-p', 'WorkingDirectory', '--value'], text=True).strip())).resolve(strict=True)
     assert hashlib.sha256((root / 'native_allocator.py').read_bytes()).hexdigest() == args.allocator_sha256
     sys.path.insert(0, str(root))
     module = importlib.import_module('native_allocator')
     assert Path(module.__file__).resolve() == root / 'native_allocator.py'
     allocator = module.NativeAllocator()
+    if args.gost_configuration:
+        from current_gost_provision import provisioner
+        allocator.provisioner = provisioner(allocator, args.gost_configuration, module.run)
     allocator.slots()
     allocator.use_history()
     server = ThreadingHTTPServer((args.listen, args.port), Handler)
