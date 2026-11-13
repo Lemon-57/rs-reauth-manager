@@ -124,7 +124,7 @@ async function callback(meta,payload) {
    reply=updateImportDetails(data)
   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
-   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='self_serve_business_prolite'?10:100);assert.equal(data.weight,a.planType==='self_serve_business_prolite'?20:(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0));assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='self_serve_business_prolite'?10:50);assert.equal(data.weight,a.planType==='self_serve_business_prolite'?20:(a.planType==='prolite'?100:50)-(a.id.includes('daily_weight')?1:0));assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
    else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
    reply={}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
@@ -489,8 +489,8 @@ try {
   for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
   const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost|readback_wrong|group_missing|group_disabled|group_duplicate/.test(id)
   assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
-  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
-  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
+  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
   if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[10,20]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
   assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
@@ -576,7 +576,7 @@ try {
   for(let i=0;i<80;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
   assert.equal(done.status,'success',done.message)
   const a=accounts.find(a=>a.id===id)
-  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,100);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,50);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
   else{assert.equal(a.enabled,false);assert.equal(a.concurrencyLimit,3)}
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(id+': legacy import also reserves its fresh proxy automatically without caller proxy or group fields')

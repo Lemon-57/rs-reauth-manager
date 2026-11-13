@@ -160,7 +160,7 @@ class Tests(unittest.TestCase):
                 path.write_text(json.dumps(record))
                 app.finish_task(path, record, backend, policy)
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 100, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
                 self.assertEqual(allocator.owner(allocator.entry), 'fixture-account')
                 self.assertEqual(backend.account['name'], backend.account['email'])
@@ -195,7 +195,7 @@ class Tests(unittest.TestCase):
                     self.assertFalse(backend.account['enabled'])
                     expected_supplier = 'shannian' if plan=='self_serve_business_prolite' else 'AI_change_future' if plan in ['team','business'] and not supplier else supplier
                     self.assertEqual(backend.account.get('supplier'),expected_supplier)
-                    self.assertEqual(backend.account['concurrencyLimit'],10 if plan=='self_serve_business_prolite' else 100 if plan in ['pro','prolite'] else 3)
+                    self.assertEqual(backend.account['concurrencyLimit'],10 if plan=='self_serve_business_prolite' else 50 if plan in ['pro','prolite'] else 3)
                     self.assertEqual(backend.account.get('manualStartsAt'),'2026-01-31T12:34:56+00:00')
 
     def test_business_receipt_without_start_time_preserves_metadata(self):
@@ -235,7 +235,7 @@ class Tests(unittest.TestCase):
                 service.NativePolicy(backend, allocator).finish(['fixture-account'], [
                     (allocator.entry, ('fixture-user', 'fixture-workspace'), True)])
                 self.assertTrue(backend.account['enabled'])
-                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 100, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
+                self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
                 self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_at_only_does_not_require_or_invent_refresh_or_id_tokens(self):
@@ -308,7 +308,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(prepared['settings']['notes'], 'fixture-notes')
         policy.finish(['fixture-account'], allocations)
         self.assertTrue(backend.account['enabled'])
-        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 100, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
+        self.assertEqual((backend.account['concurrencyLimit'], backend.account['weight']), (10 if backend.account['planType']=='self_serve_business_prolite' else 50, 20 if backend.account['planType']=='self_serve_business_prolite' else 100 if backend.account['planType']=='prolite' else 50))
         self.assertEqual(backend.account['groups'], [{'id': 'fixture-pro-group'}])
 
     def test_known_older_refresh_version_cannot_overwrite_current_credentials(self):

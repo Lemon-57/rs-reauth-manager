@@ -194,7 +194,7 @@ fn scheduling(expected: &Value, proof: &Value) -> Result<(u64, u64), PluginFault
                 && ordinal.is_some_and(|n| *w == (start + 1).saturating_sub(n).max(1))
         })
         .ok_or_else(|| fault("每日共享权重回执无效，账号保持暂停"))?;
-    Ok((100, weight))
+    Ok((50, weight))
 }
 
 #[cfg(test)]
@@ -222,10 +222,10 @@ mod tests {
             for ordinal in [1u64,2,50,100,105] {
                 let weight=(start+1).saturating_sub(ordinal).max(1);
                 let receipt=json!({"weight":weight,"ordinal":ordinal,"timezone":"Asia/Shanghai","sequence":sequence,"start":start});
-                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(100,weight));
+                assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,weight));
             }
             let receipt=json!({"weight":99,"ordinal":2,"timezone":"Asia/Shanghai","sequence":"legacy","start":100});
-            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(100,99));
+            assert_eq!(scheduling(&expected,&json!({"importWeight":receipt})).unwrap(),(50,99));
             for receipt in [json!({}),
                 json!({"weight":start,"ordinal":2,"timezone":"Asia/Shanghai","sequence":sequence,"start":start}),
                 json!({"weight":start,"ordinal":1,"timezone":"UTC","sequence":sequence,"start":start}),

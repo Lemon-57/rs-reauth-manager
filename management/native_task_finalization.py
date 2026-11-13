@@ -224,7 +224,7 @@ def install(service, daily_weights=None):
                     else:
                         if daily_weights is None:
                             raise Error('Daily weight ledger unavailable; account remains paused', 503)
-                        concurrency, weight = 100, daily_weights.reserve(account_id, entry['port'], plan)['weight']
+                        concurrency, weight = 50, daily_weights.reserve(account_id, entry['port'], plan)['weight']
                     fields.update(concurrencyLimit=concurrency, weight=weight,
                                   groupIds=[groups[0]['id']])
                     # 启用前先保存并回读配置，不能把一次写入成功当作验收
