@@ -1,7 +1,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './api'
-import { importResult, isActive, isUnfinished, needsReauth, planKey, planLabel } from './format'
-import type { Account, Job } from './types'
+import { importResult, isActive, isUnfinished, needsReauth, planKey, planLabel, resultMessage } from './format'
+import type { Account, Job, JobsState, LoginFailureDetail } from './types'
 import { supplierOptions as makeSupplierOptions, supplierMatches } from './suppliers'
 import { validateImportLine } from './importInput'
 
@@ -19,14 +19,14 @@ export function useReauthManager() {
     // No local/session storage, clipboard reads or logging. Clear the editor before sending.
     importText.value = ''
     try {
-      receiveJobs((await api.importLine(line, requestId)).jobs)
+      receiveState(await api.importLine(line, requestId))
       showImport.value = false
       if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
       await api.tick()
     } catch (e) {
       importError.value = `${(e as Error).message}，未自动重新提交，请先核对账号与任务`
       error.value = importError.value
-      try { receiveJobs((await api.jobs()).jobs) } catch { /* Read back only; never replay a submitted RT. */ }
+      try { receiveState(await api.jobs()) } catch { /* Read back only; never replay a submitted RT. */ }
     } finally {
       line = ''
       try { await readAccounts() } catch { error.value ||= '导入后列表读取未确认，请刷新核对' }
@@ -46,7 +46,11 @@ export function useReauthManager() {
     }
   }
   const loginFailureIds = ref<string[]>([])
+  const loginFailureDetails = ref<Record<string, LoginFailureDetail>>({})
   const loginFailed = (account: Account) => loginFailureIds.value.includes(account.id)
+  const failureOf = (account: Account) => loginFailureDetails.value[account.id]
+  const failureLabel = (account: Account) => failureOf(account)?.category === 'email_verification' ? '邮箱验证' : failureOf(account)?.category === 'account_banned' ? '账号封禁' : '登录失败'
+  const failureMessage = (account: Account) => resultMessage({ message: failureOf(account)?.message || '历史登录失败记录未保存具体原因' })
   const lastUpdated = ref<number | null>(null), readWarning = ref(''), tickWarning = ref('')
   const refreshWarning = computed(() => readWarning.value || tickWarning.value)
   const loading = ref(false), busy = ref(false), error = ref(''), search = ref(''), plan = ref('all'), supplier = ref(''), filter = ref('error'), page = ref(1), pageSize = ref(20)
@@ -61,14 +65,14 @@ export function useReauthManager() {
       if (!state.automation || state.automation.enabled !== enabled) throw new Error('自动授权设置未确认，请刷新核对')
       automationEnabled.value = state.automation.enabled
       automationLoaded.value = true
-      receiveJobs(state.jobs)
+      receiveState(state)
     } catch (e) {
       error.value = (e as Error).message
       try {
         const state = await api.jobs()
         if (!state.automation) throw new Error('自动授权设置未确认，请刷新核对')
         automationEnabled.value = state.automation.enabled; automationLoaded.value = true
-        receiveJobs(state.jobs)
+        receiveState(state)
         if (state.automation.enabled === enabled) error.value = ''
         else error.value ||= '自动授权设置未确认，请刷新核对'
       } catch (e) { error.value ||= (e as Error).message }
@@ -108,10 +112,10 @@ export function useReauthManager() {
     busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
     if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
     try {
-      receiveJobs((await api.freeFallback(source.requestId, requestId)).jobs)
+      receiveState(await api.freeFallback(source.requestId, requestId))
       await api.tick()
-      if (receiveJobs((await api.jobs()).jobs)) await readAccounts()
-    } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
+      if (receiveState(await api.jobs())) await readAccounts()
+    } catch (e) { error.value = (e as Error).message; try { receiveState(await api.jobs()) } catch { /* Preserve request error */ } }
     finally { busy.value = false }
   }
   async function submitForce() {
@@ -121,10 +125,10 @@ export function useReauthManager() {
     busy.value = true; error.value = ''
     try {
       const result = await api.forceSubmit(source.requestId, forceWorkspace.value, requestId)
-      batchId.value = requestId; batchJobs.value = []; receiveJobs(result.jobs); showForce.value = false
+      batchId.value = requestId; batchJobs.value = []; receiveState(result); showForce.value = false
       if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
       await api.tick()
-    } catch (e) { error.value = (e as Error).message; try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve request error */ } }
+    } catch (e) { error.value = (e as Error).message; try { receiveState(await api.jobs()) } catch { /* Preserve request error */ } }
     finally { busy.value = false }
   }
   const active = computed(() => jobs.value.filter(isActive).length)
@@ -132,10 +136,10 @@ export function useReauthManager() {
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
   const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
   const planOptions = computed(() => [{ value: 'all', label: '全部订阅' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
-  const statusOptions = [{ value: 'error', label: '账号异常' }, { value: 'login_failed', label: '登录失败' }]
+  const statusOptions = [{ value: 'error', label: '账号异常' }, { value: 'email_verification', label: '邮箱验证' }, { value: 'account_banned', label: '账号封禁' }]
   const statusSelection = computed({
-    get: () => ['error', 'login_failed'].includes(filter.value) ? filter.value : '',
-    set: (value: string) => { if (value === 'error' || value === 'login_failed') filter.value = value },
+    get: () => statusOptions.some(option => option.value === filter.value) ? filter.value : '',
+    set: (value: string) => { if (statusOptions.some(option => option.value === value)) filter.value = value },
   })
   const statusPlaceholder = computed(() => filter.value === 'success' ? '本次成功' : filter.value === 'failed' ? '本次未完成' : '状态筛选')
   const supplierOptions = computed(() => makeSupplierOptions(accounts.value))
@@ -144,7 +148,7 @@ export function useReauthManager() {
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
     const batchJob = batchByAccount.value.get(a.id)
-    return filter.value === 'error' && needsReauth(a) || filter.value === 'login_failed' && loginFailed(a) || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success'
+    return filter.value === 'error' && (needsReauth(a) || loginFailed(a)) || loginFailed(a) && failureOf(a)?.category === filter.value || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success'
   }))
   const visible = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
   const pageCandidates = computed(() => visible.value)
@@ -174,6 +178,11 @@ export function useReauthManager() {
     }
     return changed
   }
+  function receiveState(state: JobsState) {
+    if (state.loginFailures !== undefined) loginFailureIds.value = state.loginFailures
+    if (state.loginFailureDetails !== undefined) loginFailureDetails.value = state.loginFailureDetails
+    return receiveJobs(state.jobs)
+  }
   function showResults(value: 'error' | 'success' | 'failed') { search.value = ''; plan.value = 'all'; supplier.value = ''; filter.value = value; page.value = 1 }
   async function load() {
     loading.value = true; error.value = ''
@@ -181,9 +190,8 @@ export function useReauthManager() {
     const settingChange = automationChange
     const results = await Promise.allSettled([
       api.jobs().then(state => {
-        loginFailureIds.value = state.loginFailures
         if (state.automation && !automationBusy.value && settingChange === automationChange) { automationEnabled.value = state.automation.enabled; automationLoaded.value = true }
-        receiveJobs(state.jobs)
+        receiveState(state)
       }),
       readAccounts(),
     ])
@@ -201,7 +209,7 @@ export function useReauthManager() {
       accounts.value = accounts.value.filter(a => !ids.includes(a.id))
       selected.value = selected.value.filter(id => !ids.includes(id))
       batchJobs.value = batchJobs.value.filter(j => !ids.includes(j.accountId))
-      receiveJobs(result.jobs)
+      receiveState(result)
       if (forceTarget.value && ids.includes(forceTarget.value.id)) showForce.value = false
       notice.value = `已从 RS 网关删除 ${ids.length} 个账号`
     } catch (e) {
@@ -210,7 +218,7 @@ export function useReauthManager() {
       try {
         await readAccounts()
         selected.value = selected.value.filter(id => accounts.value.some(a => a.id === id))
-        receiveJobs((await api.jobs()).jobs)
+        receiveState(await api.jobs())
         batchJobs.value = batchJobs.value.filter(j => accounts.value.some(a => a.id === j.accountId))
       } catch {
         error.value ||= '删除请求已结束，但最新列表读取失败，请手动刷新核对'
@@ -227,17 +235,17 @@ export function useReauthManager() {
     busy.value = true; error.value = ''; batchId.value = requestId; batchJobs.value = []
     if (['success', 'failed'].includes(filter.value)) filter.value = 'error'
     try {
-      receiveJobs((await api.submit(accountIds, requestId)).jobs)
+      receiveState(await api.submit(accountIds, requestId))
       selected.value = selected.value.filter(id => !accountIds.includes(id))
       await api.tick()
-      if (receiveJobs((await api.jobs()).jobs)) await readAccounts()
+      if (receiveState(await api.jobs())) await readAccounts()
     } catch (e) {
       error.value = (e as Error).message
       // A failed response does not prove the submission was rejected; read, never replay it.
-      try { receiveJobs((await api.jobs()).jobs) } catch { /* Preserve the original submission error. */ }
+      try { receiveState(await api.jobs()) } catch { /* Preserve the original submission error. */ }
     } finally { busy.value = false }
   }
-  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { receiveJobs((await api.cancel(job?.requestId || null)).jobs); const state = await api.jobs(); if (state.automation) automationEnabled.value = state.automation.enabled; receiveJobs(state.jobs) } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
+  async function cancel(job?: Job) { busy.value = true; error.value = ''; try { receiveState(await api.cancel(job?.requestId || null)); const state = await api.jobs(); if (state.automation) automationEnabled.value = state.automation.enabled; receiveState(state) } catch (e) { error.value = (e as Error).message } finally { busy.value = false } }
   async function poll() {
     if (destroyed || polling) return
     polling = true
@@ -250,9 +258,8 @@ export function useReauthManager() {
           void api.tick().catch(e => { if (!destroyed) tickWarning.value = (e as Error).message }).finally(() => { ticking = false })
         }
         const state = await api.jobs()
-        loginFailureIds.value = state.loginFailures
         if (state.automation && !automationBusy.value && settingChange === automationChange) automationEnabled.value = state.automation.enabled
-        receiveJobs(state.jobs)
+        receiveState(state)
         await readAccounts()
         readWarning.value = ''; tickWarning.value = ''
       }
@@ -261,5 +268,5 @@ export function useReauthManager() {
   }
   onMounted(async () => { await load(); await poll() })
   onUnmounted(() => { importText.value = ''; destroyed = true; clearTimeout(timer) })
-  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, statusOptions, statusSelection, statusPlaceholder, loginFailed, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
+  return { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, jobs, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, statusOptions, statusSelection, statusPlaceholder, loginFailed, failureOf, failureLabel, failureMessage, filtered, visible, pageCandidates, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback }
 }

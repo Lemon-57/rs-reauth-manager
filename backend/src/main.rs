@@ -108,6 +108,8 @@ struct PendingBatch {
 struct LoginFailure {
     failed_at: u64,
     manual_success_at: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    message: String,
 }
 impl Job {
     fn queued(batch: &str, account_id: String) -> Self {
@@ -139,7 +141,10 @@ impl Queue {
             let Some(at) = job.finished_at else { continue };
             if job.status == "failed" {
                 let record = history.entry(job.account_id.clone()).or_default();
-                record.failed_at = record.failed_at.max(at);
+                if at > record.failed_at || at == record.failed_at && record.message.is_empty() {
+                    record.failed_at = at;
+                    record.message = job.message.clone();
+                }
             } else if job.status == "success"
                 && !job.automatic
                 && !job.new_account
@@ -155,6 +160,24 @@ impl Queue {
         self.login_failure_history()
             .into_iter()
             .filter_map(|(id, record)| (record.failed_at > record.manual_success_at).then_some(id))
+            .collect()
+    }
+    fn login_failure_details(&self) -> std::collections::BTreeMap<String, Value> {
+        self.login_failure_history()
+            .into_iter()
+            .filter(|(_, record)| record.failed_at > record.manual_success_at)
+            .map(|(id, record)| {
+                let category = diagnostics::login_failure_category(&record.message);
+                let message = if record.message.is_empty() {
+                    "历史登录失败记录未保存具体原因".to_owned()
+                } else {
+                    record.message
+                };
+                (
+                    id,
+                    json!({"category": category, "message": message, "failedAt": record.failed_at}),
+                )
+            })
             .collect()
     }
     fn visible_jobs(&self) -> Vec<Job> {
@@ -235,10 +258,11 @@ impl Queue {
 impl Serialize for Queue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Queue", 3)?;
+        let mut state = serializer.serialize_struct("Queue", 4)?;
         state.serialize_field("jobs", &self.visible_jobs())?;
         state.serialize_field("automation", &self.automation)?;
         state.serialize_field("loginFailures", &self.login_failures())?;
+        state.serialize_field("loginFailureDetails", &self.login_failure_details())?;
         state.end()
     }
 }
@@ -1416,12 +1440,18 @@ mod tests {
     fn login_failure_survives_history_trimming_and_only_manual_success_clears_it() {
         let mut queue = Queue::default();
         let mut failure = Job::queued("manual", "a".into());
-        failure.finish("failed", "登录失败");
+        let reason = "邮箱验证码验证：上游要求邮箱验证码，当前任务不支持人工补码续跑（HTTP 200）";
+        failure.finish("failed", reason);
         failure.finished_at = Some(10);
         queue.jobs.push(failure.clone());
         queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
         queue.jobs.clear();
         assert_eq!(queue.login_failures(), vec!["a"]);
+        assert_eq!(
+            queue.login_failure_details()["a"]["category"],
+            "email_verification"
+        );
+        assert_eq!(queue.login_failure_details()["a"]["message"], reason);
         let mut success = Job::queued("automatic", "a".into());
         success.finish("success", "自动授权成功");
         success.finished_at = Some(20);
@@ -1429,15 +1459,71 @@ mod tests {
         queue.jobs.push(success.clone());
         queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
         assert_eq!(queue.login_failures(), vec!["a"]);
+        assert_eq!(queue.login_failure_details()["a"]["message"], reason);
         success.automatic = false;
         success.finished_at = Some(30);
         queue.jobs.push(success);
         queue = serde_json::from_value(host::queue_value(&queue, 256 * 1024).unwrap()).unwrap();
         queue.jobs = vec![failure.clone()];
         assert!(queue.login_failures().is_empty());
+        assert!(queue.login_failure_details().is_empty());
+        failure.message =
+            "提交 2FA 动态码：账号已被封禁或停用，上游拒绝继续登录（HTTP 403）".into();
         failure.finished_at = Some(40);
         queue.jobs.push(failure);
         assert_eq!(queue.login_failures(), vec!["a"]);
+        assert_eq!(
+            queue.login_failure_details()["a"]["category"],
+            "account_banned"
+        );
+    }
+
+    #[test]
+    fn old_marks_keep_unknown_causes_and_available_history_fills_them() {
+        let mut queue: Queue = serde_json::from_value(
+            json!({"jobs":[],"loginFailureHistory":{"a":{"failedAt":10,"manualSuccessAt":0}}}),
+        )
+        .unwrap();
+        assert_eq!(queue.login_failure_details()["a"]["category"], "other");
+        assert_eq!(
+            queue.login_failure_details()["a"]["message"],
+            "历史登录失败记录未保存具体原因"
+        );
+        let mut failure = Job::queued("legacy", "a".into());
+        failure.finish(
+            "failed",
+            "密码验证：上游拒绝请求，未取得可公开的具体原因（HTTP 403）",
+        );
+        failure.finished_at = Some(10);
+        queue.jobs.push(failure);
+        let stored = host::queue_value(&queue, 256 * 1024).unwrap();
+        queue = serde_json::from_value(stored).unwrap();
+        queue.jobs.clear();
+        assert_eq!(queue.login_failure_details()["a"]["category"], "other");
+        assert!(
+            queue.login_failure_details()["a"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP 403")
+        );
+    }
+
+    #[test]
+    fn large_failure_batches_retain_causes_within_the_existing_state_budget() {
+        let mut queue = Queue::default();
+        let reason = "提交 2FA 动态码：账号已被封禁或停用，上游拒绝继续登录（HTTP 403）";
+        for index in 0..1001u64 {
+            let mut job = Job::queued("batch", format!("acct_{index:032}"));
+            job.finish("failed", reason);
+            job.finished_at = Some(1794500000000 + index);
+            queue.jobs.push(job);
+        }
+        let stored = host::queue_value(&queue, 256 * 1024).unwrap();
+        assert!(serde_json::to_vec(&stored).unwrap().len() <= 256 * 1024);
+        queue = serde_json::from_value(stored).unwrap();
+        assert!(queue.jobs.len() < 1001);
+        assert_eq!(queue.login_failure_details().len(), 1001);
+        assert!(queue.login_failure_details().values().all(|detail| detail["message"] == reason && detail["category"] == "account_banned"));
     }
 
     #[test]

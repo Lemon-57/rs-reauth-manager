@@ -6,13 +6,18 @@ export function installPreview() {
   applyResolvedTheme(document.documentElement, resolveTheme(theme, DEFAULT_THEME_COLOR, DEFAULT_CUSTOM_THEME_COLOR))
   let accounts: Account[] = Array.from({ length: 61 }, (_, i) => ({ id: `acct_preview_${i}`, name: `account-${i + 1}@example.com`, email: `account-${i + 1}@example.com`, enabled: i !== 4, planType: i % 6 ? 'team' : 'plus', status: i % 3 ? 'normal' : 'error', accessTokenExpiresAt: new Date(Date.now() + 86400000 * 6).toISOString(), proxy: i === 3 ? null : `http://127.0.0.1:${21001 + i}`, notesValid: i !== 7, groups: i % 5 === 0 ? [] : [{ id: 'preview-primary', name: '示例部署组' }, ...(i % 7 === 0 ? [{ id: 'preview-shared', name: '跨区域共享账号组' }] : [])] }))
   let jobs: Job[] = [{ requestId: 'preview-workspace:acct_preview_0', accountId: 'acct_preview_0', status: 'failed', step: 'workspace', message: '无法匹配原账号工作区，已停止写回', startedAt: Date.now() - 10000, finishedAt: Date.now(), workspaceChoices: [{ id: 'preview-other-team' }, { id: 'preview-personal-free' }] }]
-  const diagnostics = ['提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误（HTTP 409） [上游错误码 invalid_state]\n首次登录失败：提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效（HTTP 409）\n已重建一次登录会话，本次仍失败，不再自动重登\n错误码：fixture_' + 'diagnostic_'.repeat(18) + '完整错误结尾', '提交 2FA 动态码：上游限制登录频率，不自动重试（最后响应 HTTP 429）', '密码验证：请求超时，保留原代理，不自动重试', '2FA 验证未通过，请检查原账号备注']
+  const diagnostics = ['邮箱验证码验证：上游要求邮箱验证码，当前任务不支持人工补码续跑（HTTP 200）', '提交 2FA 动态码：账号已被封禁或停用，上游拒绝继续登录（HTTP 403）', '提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效，不等同于密钥错误（HTTP 409） [上游错误码 invalid_state]\n首次登录失败：提交 2FA 动态码：上游明确返回 2FA 验证挑战状态无效（HTTP 409）\n已重建一次登录会话，本次仍失败，不再自动重登\n错误码：fixture_' + 'diagnostic_'.repeat(18) + '完整错误结尾', '提交 2FA 动态码：上游限制登录频率，不自动重试（最后响应 HTTP 429）', '密码验证：请求超时，保留原代理，不自动重试', '2FA 验证未通过，请检查原账号备注']
   jobs.push(...diagnostics.map((message, i): Job => ({ requestId: `preview-diagnostic:${i}`, accountId: `acct_preview_${i + 1}`, status: 'failed', step: 'failed', message, startedAt: Date.now() - 10000, finishedAt: Date.now() })))
   accounts[1]!.groups = [{ id: 'preview-pro', name: 'GPT Pro' }]
   jobs.push({ requestId: 'preview-import:import', accountId: 'acct_preview_1', importInfo: { line: 1, email: 'account-2@example.com' }, status: 'review', step: 'review', message: '工作区授权身份校验失败，未更改账号或提交凭据', startedAt: Date.now() - 3600000, finishedAt: Date.now() - 3590000, implementationVersion: '0.1.40' })
   jobs.push({ requestId: 'preview-later:acct_preview_1', accountId: 'acct_preview_1', status: 'review', step: 'review', message: '账号仍有在途请求，未重复授权', startedAt: Date.now() - 60000, finishedAt: Date.now() - 50000, implementationVersion: '0.1.42' })
   let automationEnabled = false
-  const encode = (body: unknown) => ({ status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify({ ...(body as object), loginFailures: jobs.filter(job => job.status === 'failed').map(job => job.accountId) })).buffer as ArrayBuffer })
+  const retainedFailure = { category: 'email_verification', message: '邮箱验证码验证：上游要求邮箱验证码，当前任务不支持人工补码续跑（HTTP 200）', failedAt: Date.now() - 86400000 }
+  const encode = (body: unknown) => {
+    const loginFailureDetails = Object.fromEntries(jobs.filter(job => job.status === 'failed').map(job => [job.accountId, { category: job.accountId === 'acct_preview_1' ? 'email_verification' : job.accountId === 'acct_preview_2' ? 'account_banned' : 'other', message: job.message, failedAt: job.finishedAt || 0 }]))
+    loginFailureDetails['acct_preview_9'] = retainedFailure
+    return { status: 200, contentType: 'application/json', body: new TextEncoder().encode(JSON.stringify({ ...(body as object), loginFailures: Object.keys(loginFailureDetails), loginFailureDetails })).buffer as ArrayBuffer }
+  }
   window.codexProxyPlugin = { version: 2, theme, async request(input) {
     const body = input.body ? JSON.parse(input.body) : {}
     if (input.path === 'api/accounts') return encode({ accounts })

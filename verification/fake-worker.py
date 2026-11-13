@@ -14,6 +14,8 @@ assert '----' in data['notes'] and data['email'] in data['notes']
 assert authorization(data['authorizationUrl'])[1]=='fixture'
 if name in {'slow','cleanup_slow_login'}:time.sleep(60)
 if name in {'password_failure', 'automatic_once_failure'}:emit({'event':'error','code':'password'});sys.exit(0)
+if name in {'diagnostic_email', 'diagnostic_banned'}:
+    emit({'event':'error','code':'protocol','diagnostic':{'stage':'email_verify' if name=='diagnostic_email' else 'mfa_verify','reason':'email_code_required' if name=='diagnostic_email' else 'account_banned','httpStatus':200 if name=='diagnostic_email' else 403}});sys.exit(0)
 if name.startswith('force_') and not data.get('forceWorkspaceId'):
     emit({'event':'error','code':'workspace','workspaces':[{'id':'alternate-workspace'}]});sys.exit(0)
 if name=='free_fallback_no_candidates' and not data.get('forceFree'):

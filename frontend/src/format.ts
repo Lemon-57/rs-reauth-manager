@@ -1,6 +1,6 @@
 import type { Account, Job } from './types'
 
-export function resultMessage(job?: Job): string {
+export function resultMessage(job?: Pick<Job, 'message'>): string {
   const message = job?.message || ''
   if (message.includes('工作区授权身份校验失败，未更改账号或提交凭据')) return message.replaceAll('工作区授权身份校验失败，未更改账号或提交凭据', '历史授权核验未通过，请结合账号当前状态核对已保存结果')
   if (message === '2FA 验证未通过，请检查原账号备注') return '历史记录：2FA 流程未完成，未记录具体原因，不能据此判断密钥错误'

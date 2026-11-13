@@ -1,4 +1,4 @@
-import type { Account, Job } from '../../types'
+import type { Account, Job, JobsState, LoginFailureDetail } from '../../types'
 import { isRecord } from '../request'
 
 const nullableString = (value: unknown) => value === null || typeof value === 'string'
@@ -30,20 +30,24 @@ export function parseAccounts(value: unknown): { accounts: Account[] } {
     throw new Error('插件账号列表格式无效')
   return { accounts: value.accounts }
 }
-export function parseJobs(value: unknown): { jobs: Job[]; loginFailures: string[]; automation?: { enabled: boolean } } {
+export function parseJobs(value: unknown): JobsState {
   if (!isRecord(value) || !Array.isArray(value.jobs) || !value.jobs.every(job))
     throw new Error('插件任务列表格式无效')
   if (value.automation !== undefined && (!isRecord(value.automation) || typeof value.automation.enabled !== 'boolean'))
     throw new Error('自动授权状态格式无效')
   if (value.loginFailures !== undefined && (!Array.isArray(value.loginFailures) || !value.loginFailures.every(id => typeof id === 'string')))
     throw new Error('登录失败标记格式无效')
-  return { jobs: value.jobs, loginFailures: value.loginFailures as string[] || [], ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
+  if (value.loginFailureDetails !== undefined && (!isRecord(value.loginFailureDetails) || !Object.values(value.loginFailureDetails).every(detail => isRecord(detail)
+    && ['email_verification', 'account_banned', 'other'].includes(detail.category as string) && typeof detail.message === 'string'
+    && typeof detail.failedAt === 'number' && nullableTime(detail.failedAt))))
+    throw new Error('登录失败原因格式无效')
+  return { jobs: value.jobs, ...(value.loginFailures !== undefined ? { loginFailures: value.loginFailures as string[] } : {}), ...(value.loginFailureDetails !== undefined ? { loginFailureDetails: value.loginFailureDetails as Record<string, LoginFailureDetail> } : {}), ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
 }
 export function parseTick(value: unknown): { ok: true } {
   if (!isRecord(value) || value.ok !== true) throw new Error('插件任务推进结果无效')
   return { ok: true }
 }
-export function parseDeletion(value: unknown): { deletedAccountIds: string[]; jobs: Job[] } {
+export function parseDeletion(value: unknown): JobsState & { deletedAccountIds: string[] } {
   if (!isRecord(value) || !Array.isArray(value.deletedAccountIds) || !value.deletedAccountIds.length
     || !value.deletedAccountIds.every(id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id))
     || new Set(value.deletedAccountIds).size !== value.deletedAccountIds.length)

@@ -840,6 +840,25 @@ try {
   const r=refreshes.length;assert.equal((await finish(a.id)).status,'success');assert.equal(refreshes.length,r+1);assert.equal(a.enabled,true)
   check('Legacy queued device flags are inert; native refresh remains required without any device action')
  }
+ {
+  for(const [id,category] of [['diagnostic_email','email_verification'],['diagnostic_banned','account_banned']]) {
+   add(id);await submit([id]);assert.equal((await finish(id)).status,'failed')
+   const detail=(await request('jobs')).value.loginFailureDetails[id]
+   assert.equal(detail.category,category);assert.ok(detail.message.includes(category==='account_banned'?'账号已被封禁或停用':'上游要求邮箱验证码'))
+   check(id+': explicit protocol evidence is exposed as a classified, safe failure reason')
+  }
+  await stop();records.get('executor').value.expires=0
+  const state=records.get('queue').value
+  state.jobs=state.jobs.filter(j=>!j.accountId.startsWith('diagnostic_'))
+  add('marker_unknown');state.loginFailureHistory.marker_unknown={failedAt:1,manualSuccessAt:0}
+  await start()
+  const stateAfter=(await request('jobs')).value
+  assert.equal(stateAfter.loginFailureDetails.diagnostic_email.category,'email_verification')
+  assert.equal(stateAfter.loginFailureDetails.diagnostic_banned.category,'account_banned')
+  assert.equal(stateAfter.loginFailureDetails.marker_unknown.category,'other')
+  assert.match(stateAfter.loginFailureDetails.marker_unknown.message,/未保存具体原因/)
+  check('Restart and terminal-history removal retain precise causes while timestamp-only legacy marks remain explicitly unknown')
+ }
  assert.ok(!records.get('queue').value.automation.attempts[''],'Import failures without an account ID never create an empty automatic-attempt identity')
  await stop();console.log(`Verified ${passed} unified native protocol scenarios`)
  }

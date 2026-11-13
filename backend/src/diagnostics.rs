@@ -1,6 +1,25 @@
 //! 将协议诊断白名单投影为可公开的中文错误，不透传上游正文
 use serde_json::Value;
 
+pub fn login_failure_category(message: &str) -> &'static str {
+    // 复用已公开的明确诊断，不把 HTTP 403 或通用验证错误当成封禁
+    if message.contains("账号已被封禁或停用，上游拒绝继续登录") {
+        "account_banned"
+    } else if [
+        "上游要求邮箱验证码",
+        "上游未能发送邮箱验证码",
+        "上游拒绝邮箱验证码",
+        "邮箱验证流程未完成",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+    {
+        "email_verification"
+    } else {
+        "other"
+    }
+}
+
 pub fn message(output: &Value, fallback: &str) -> String {
     let Some(diagnostic) = output.get("diagnostic").filter(|d| d.is_object()) else {
         return fallback.into();
@@ -179,6 +198,25 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn failure_categories_require_explicit_login_evidence() {
+        for (reason, expected) in [
+            ("email_code_required", "email_verification"),
+            ("email_send_failed", "email_verification"),
+            ("email_code_rejected", "email_verification"),
+            ("email_verification_failed", "email_verification"),
+            ("account_banned", "account_banned"),
+            ("http_rejected", "other"),
+            ("security_challenge", "other"),
+            ("primary_factor_required", "other"),
+            ("password_rejected", "other"),
+        ] {
+            let text = message(&json!({"diagnostic":{"stage":"mfa_verify","reason":reason,"httpStatus":403}}), "fallback");
+            assert_eq!(login_failure_category(&text), expected);
+        }
+        assert_eq!(login_failure_category(""), "other");
+    }
 
     #[test]
     fn renders_only_known_diagnostic_fields() {
