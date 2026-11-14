@@ -136,7 +136,7 @@ export function useReauthManager() {
   const failed = computed(() => batchJobs.value.filter(isUnfinished).length)
   const eligibleCount = computed(() => accounts.value.filter(needsReauth).length)
   const planOptions = computed(() => [{ value: 'all', label: '全部订阅' }, ...Array.from(new Set(accounts.value.map(a => planKey(a.planType)))).sort().map(value => ({ value, label: planLabel(value) }))])
-  const statusOptions = [{ value: 'error', label: '账号异常' }, { value: 'email_verification', label: '邮箱验证' }, { value: 'account_banned', label: '账号封禁' }]
+  const statusOptions = [{ value: 'error', label: '账号异常' }, { value: 'normal', label: '账号正常' }, { value: 'email_verification', label: '邮箱验证' }, { value: 'account_banned', label: '账号封禁' }]
   const statusSelection = computed({
     get: () => statusOptions.some(option => option.value === filter.value) ? filter.value : '',
     set: (value: string) => { if (statusOptions.some(option => option.value === value)) filter.value = value },
@@ -148,7 +148,7 @@ export function useReauthManager() {
     if (plan.value !== 'all' && planKey(a.planType) !== plan.value) return false
     if (search.value && !`${a.id} ${a.name} ${a.email || ''} ${a.proxy || ''} ${a.groups.map(group => group.name).join(' ')}`.toLowerCase().includes(search.value.trim().toLowerCase())) return false
     const batchJob = batchByAccount.value.get(a.id)
-    return filter.value === 'error' && (needsReauth(a) || loginFailed(a)) || loginFailed(a) && failureOf(a)?.category === filter.value || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success'
+    return filter.value === 'error' && (needsReauth(a) || loginFailed(a)) || filter.value === 'normal' && a.enabled && a.status === 'normal' || loginFailed(a) && failureOf(a)?.category === filter.value || filter.value === 'failed' && isUnfinished(batchJob) || filter.value === 'success' && batchJob?.status === 'success'
   }))
   const visible = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
   const pageCandidates = computed(() => visible.value)

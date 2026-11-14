@@ -9,6 +9,7 @@ const { createRenderer, nextTick } = await import(pathToFileURL(require.resolve(
 const server = await createServer({ root: path.join(root, 'frontend'), configFile: false, server: { middlewareMode: true, hmr: false } })
 const row = (id, status) => ({ id, name: id, email: `${id}@example.invalid`, enabled: true, planType: 'team', status, accessTokenExpiresAt: null, proxy: 'http://127.0.0.1:21001', notesValid: true, groups: [] })
 const accounts = [row('abnormal', 'error'), row('email', 'error'), row('banned', 'error'), row('recovered', 'normal'), row('unknown', 'normal')]
+accounts[4].enabled = false
 const result = (id, status) => ({ accountId: id, requestId: `${id}-${status}`, status, step: status, message: '', startedAt: 1, finishedAt: 2 })
 let jobs = [{ ...result('recovered', 'success'), automatic: true }]
 const emailMessage = '邮箱验证码验证：上游要求邮箱验证码，当前任务不支持人工补码续跑（HTTP 200）'
@@ -49,8 +50,10 @@ try {
   assert.throws(() => parseJobs({ jobs: [], loginFailureDetails: { a: { category: 'guessed-ban', message: 'HTTP 403', failedAt: 1 } } }), /登录失败原因/)
   for (let load=0;load<2;load++) {
     app = renderer.createApp({ setup() { state=useReauthManager();return () => null } });app.mount(node());await flush()
-    assert.deepEqual(state.statusOptions.map(option => option.label), ['账号异常', '邮箱验证', '账号封禁'])
+    assert.deepEqual(state.statusOptions.map(option => option.label), ['账号异常', '账号正常', '邮箱验证', '账号封禁'])
     assert.deepEqual(state.filtered.value.map(row => row.id), accounts.map(row => row.id))
+    state.statusSelection.value = 'normal';await nextTick()
+    assert.deepEqual(state.filtered.value.map(row => row.id), ['recovered'])
     state.statusSelection.value = 'email_verification';await nextTick()
     assert.deepEqual(state.filtered.value.map(row => row.id), ['email', 'recovered'])
     assert.equal(state.failureMessage(accounts[3]), emailMessage)
@@ -73,7 +76,7 @@ try {
   await state.submit([accounts[3]]);await nextTick()
   assert.deepEqual(state.filtered.value.map(row => row.id), ['email'])
   assert.equal(state.loginFailed(accounts[3]), false)
-  console.log('PASS three status categories, retained reasons after history removal, automatic success and reload, unknown causes and confirmed manual recovery')
+  console.log('PASS four status categories, current normal accounts, retained reasons after history removal, automatic success and reload, unknown causes and confirmed manual recovery')
 } finally {
   app?.unmount();delete globalThis.window;await server.close()
 }
