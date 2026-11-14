@@ -2,7 +2,7 @@
 import json,sys,time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'protocol'))
-from runner import authorization
+from runner import authorization, parse_notes
 DID='59859b73-b63b-45f4-86f9-e728a9512905'
 def emit(value):
     print(json.dumps(value),flush=True)
@@ -12,6 +12,9 @@ name=data.get('email','').split('@')[0]
 assert data.get('action') is None, 'Authorization must never launch a device-management worker'
 assert '----' in data['notes'] and data['email'] in data['notes']
 assert authorization(data['authorizationUrl'])[1]=='fixture'
+if 'mailbox' in name:
+    parsed = parse_notes(data['notes'], data['email'])
+    assert parsed[1] == 'fixture-password' and parsed[2] == 'GEZDGNBVGY3TQOJQ'
 if name in {'slow','cleanup_slow_login'}:time.sleep(60)
 if name in {'password_failure', 'automatic_once_failure'}:emit({'event':'error','code':'password'});sys.exit(0)
 if name in {'diagnostic_email', 'diagnostic_banned'}:

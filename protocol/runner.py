@@ -26,10 +26,11 @@ def parse_notes(notes, email):
     if not isinstance(notes, str) or len(notes) > 2000 or any(c in notes for c in "\r\n\0"):
         raise ValueError("credentials")
     parts = notes.strip().split("----")
-    if len(parts) != 3 or parts[0].strip().casefold() != email.strip().casefold() or not parts[1]:
+    if len(parts) not in (3, 4) or parts[0].strip().casefold() != email.strip().casefold() or not all(parts[1:]):
         raise ValueError("credentials")
-    secret = parts[2].strip().upper().replace(" ", "")
-    if not secret or not base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True):
+    secret = parts[-1].strip().upper().replace(" ", "")
+    core = secret.rstrip('=')
+    if len(core) < 16 or not base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True):
         raise ValueError("credentials")
     return parts[0].strip(), parts[1], secret
 

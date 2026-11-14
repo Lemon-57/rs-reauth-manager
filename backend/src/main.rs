@@ -394,13 +394,13 @@ fn notes_valid(a: &Value) -> bool {
         return false;
     };
     let parts: Vec<_> = notes.trim().split("----").collect();
-    parts.len() == 3
+    matches!(parts.len(), 3 | 4)
         && a["email"]
             .as_str()
             .is_some_and(|email| parts[0].trim().eq_ignore_ascii_case(email))
         && !parts[1].is_empty()
-        && !parts[2].trim().is_empty()
-        && !notes.contains(['\r', '\n', '\0'])
+        && parts[2..].iter().all(|part| !part.trim().is_empty())
+        && !notes.chars().any(char::is_control)
 }
 
 fn import_notes_valid(email: &str, notes: &str) -> bool {
@@ -408,13 +408,16 @@ fn import_notes_valid(email: &str, notes: &str) -> bool {
         return false;
     }
     let parts: Vec<_> = notes.trim().split("----").collect();
-    if parts.len() != 3
+    if !matches!(parts.len(), 3 | 4)
         || !parts[0].trim().eq_ignore_ascii_case(email.trim())
-        || parts[1].is_empty()
+        || parts[1..].iter().any(|part| part.is_empty())
     {
         return false;
     }
-    let secret = parts[2].trim().replace(' ', "").to_ascii_uppercase();
+    totp_valid(parts.last().unwrap())
+}
+fn totp_valid(value: &str) -> bool {
+    let secret = value.trim().replace(' ', "").to_ascii_uppercase();
     let core = secret.trim_end_matches('=');
     core.len() >= 16
         && matches!(core.len() % 8, 0 | 2 | 4 | 5 | 7)
@@ -845,7 +848,7 @@ impl Manager {
                 if job.automatic && (!control::enabled(host, queue.automation.enabled).await? || !automatic::ready(&a) || job.expected_revision != a["_credentialRevision"].as_u64()) {
                     return Err(fault("自动授权条件或账号版本已变化，未发起登录，不会自动重试"))
                 }
-                if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA"))}
+                if !notes_valid(&a){return Err(fault("备注须为与原账号邮箱一致的 邮箱----密码----2FA 或 邮箱----密码----邮箱密码----2FA"))}
                 let proxy=proxy(host,&a).await?;
                 let recover_workspace = recovery::missing_workspace(&settings(&a)) && job.force_workspace_id.is_none() && !job.free_fallback;
                 if recover_workspace { let old = recovery::credential(host, &job.account_id).await?; if Some(old.credential_revision) != a["_credentialRevision"].as_u64() { return Err(fault("补齐工作区前凭据版本变化，未发起登录")); } recovery::validate_existing_binding(&recovery::tokens(&old), &settings(&a))?; }
@@ -939,7 +942,7 @@ async fn handle(
                 .len()
                 != request.group_ids.len()
         {
-            return Err(fault("新增账号参数或三字段备注无效"));
+            return Err(fault("新增账号参数或登录备注无效"));
         }
         let (mut queue, version) = host::load(&call.host).await?;
         if queue

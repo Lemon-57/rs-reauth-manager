@@ -78,12 +78,12 @@ const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetCo
     </ZTable>
     <ZPagination v-model:current-page="page" v-model:page-size="pageSize" :total="filtered.length" :page-sizes="[10, 20, 50, 100]" />
     <ZDialog :draggable="false" v-model="showImport" title="导入账号" width="38rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
-      <p>每行输入一个账号，可混合两种格式，支持超过 100 行；整批校验后逐行导入（内容最多 500 KiB，任务容量不足时整批拒绝）:</p>
-      <p class="import-formats">邮箱----密码----2FA<br>邮箱----密码----2FA----RT</p>
-      <p class="muted">三字段通过插件获取授权，四字段先验证并保存提供的 RT，Team/Business 直接入库并启用，Free 继续通过插件重新授权，重复账号保留现有凭据和代理</p>
+      <p>每行输入一个账号，可混合以下四种格式，支持超过 100 行，内容最多 500 KiB，整批校验后逐行处理</p>
+      <p class="import-formats">邮箱----密码----2FA<br>邮箱----密码----2FA----RT<br>邮箱----密码----邮箱密码----2FA<br>邮箱----密码----邮箱密码----2FA----RT</p>
+      <p class="muted">提供 RT 时先验证并保存 RT，否则通过插件获取授权，邮箱密码仅保存到备注，不用于自动收取验证码</p>
       <label class="import-label" for="account-import">账号资料</label>
-      <ZTextarea id="account-import" v-model="importText" class="import-input" :rows="8" :disabled="busy" autocomplete="off" autocapitalize="off" spellcheck="false" :placeholder="'邮箱----密码----2FA\n邮箱----密码----2FA----RT'" />
-      <p class="muted">备注只保存邮箱、密码和 2FA，RT 不写入备注，提交或关闭后清空输入框</p>
+      <ZTextarea id="account-import" v-model="importText" class="import-input" :rows="8" :disabled="busy" autocomplete="off" autocapitalize="off" spellcheck="false" :placeholder="'邮箱----密码----2FA\n邮箱----密码----邮箱密码----2FA----RT'" />
+      <p class="muted">备注按输入保留邮箱、密码、可选邮箱密码及 2FA，RT 不写入备注，提交或关闭后清空输入框</p>
       <p v-if="importError" class="danger" role="alert">{{ importError }}</p>
       <template #footer><ZButton :disabled="busy" @click="closeImport">取消</ZButton><ZButton type="primary" :loading="busy" :disabled="busy || !importText.trim() || !!active" @click="submitImport">开始导入<span v-if="importLineCount">（{{ importLineCount }} 行）</span></ZButton></template>
     </ZDialog>

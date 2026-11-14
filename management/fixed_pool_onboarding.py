@@ -305,7 +305,7 @@ class Adapter:
         if not isinstance(settings, dict) or settings.get('enabled') is not False or not isinstance(notes, str):
             raise Rejected(422)
         fields = notes.split('----')
-        if len(fields) != 3 or not all(fields) or fields[0].casefold() != receipt['email'].casefold():
+        if len(fields) not in (3, 4) or not all(fields) or fields[0].casefold() != receipt['email'].casefold():
             raise Rejected(422)
         body = {**body, 'settings': {**settings, 'concurrencyLimit': 3}}
         rows = self.directory(headers)
@@ -372,7 +372,7 @@ class Adapter:
                 or settings.get('enabled') is not False or not isinstance(notes, str)):
             raise Rejected(422)
         fields = notes.split('----')
-        if len(fields) != 3 or not all(fields) or fields[0].casefold() != email.casefold():
+        if len(fields) not in (3, 4) or not all(fields) or fields[0].casefold() != email.casefold():
             raise Rejected(422)
         rows = self.directory(headers)
         if any(row.get('provider') == 'openai' and str(row.get('email') or '').casefold() == email.casefold() for row in rows):

@@ -105,6 +105,8 @@ class ProtocolTests(unittest.TestCase):
 
     def test_password_keeps_whitespace(self):
         self.assertEqual(runner.parse_notes(f"{EMAIL}---- space password ----{SECRET}", EMAIL)[1], " space password ")
+        for mailbox in ["mail-Päss!", "ABCDEFGHIJKLMN23"]:
+            self.assertEqual(runner.parse_notes(f"{EMAIL}---- space password ----{mailbox}----{SECRET}", EMAIL), (EMAIL, " space password ", SECRET))
 
     def test_import_prefers_unique_team_and_accepts_explicit_free_without_exchanging_tokens(self):
         self.data.update(newAccount=True, allowFreeNew=True, accountId='', userId='', planType='team')

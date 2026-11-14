@@ -125,6 +125,15 @@ class OnboardingTests(unittest.TestCase):
             self.start()
         self.assertEqual(self.manager.rows(), [])
 
+    def test_native_complete_keeps_optional_mailbox_password_in_notes(self):
+        started = self.start()
+        body = self.body(started)
+        notes = 'fixture@example.com----fixture-password----mail-pass!----JBSWY3DPEHPK3PXP'
+        body['settings']['notes'] = notes
+        self.adapter.call('/api/admin/accounts/oauth/complete', {}, body)
+        self.assertEqual(self.account['notes'], notes)
+        self.assertNotIn('mail-pass!', self.adapter.receipt_path('fixture@example.com').read_text())
+
     def test_authentication_failure_precedes_registry_access(self):
         self.adapter.backend = lambda *args: (_ for _ in ()).throw(Rejected(403))
         with self.assertRaises(Rejected):
@@ -251,6 +260,16 @@ class OnboardingTests(unittest.TestCase):
         receipt = self.adapter.receipt_path(entry['email']).read_text()
         self.assertNotIn('fixture-rt', receipt)
         self.assertNotIn('fixture-password', receipt)
+
+    def test_rt_import_keeps_optional_mailbox_password_but_excludes_rt_from_notes(self):
+        body = self.import_body()
+        notes = 'fixture@example.com----fixture-password----mail-pass!----JBSWY3DPEHPK3PXP'
+        body['settings']['notes'] = notes
+        self.adapter.call('/api/admin/accounts/import', {}, body)
+        self.assertEqual(self.account['notes'], notes)
+        receipt = self.adapter.receipt_path('fixture@example.com').read_text()
+        self.assertNotIn('mail-pass!', receipt)
+        self.assertNotIn('fixture-rt', self.account['notes'])
 
     def test_uncertain_rt_import_cannot_allocate_or_import_again(self):
         real = self.backend

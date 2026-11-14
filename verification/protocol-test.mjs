@@ -94,7 +94,7 @@ async function callback(meta,payload) {
     startReceipts.set(data.requestId,reply)
    }
   } else if(url.pathname==='/api/admin/accounts/import') {
-   const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,3);assert.equal(data.settings.enabled,false)
+   const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,id.includes('mailbox')?4:3);assert.equal(data.settings.enabled,false)
    assert.equal(data.data.refreshToken,'fixture-provided-rt')
    if(id.startsWith('rt_fallback_')) {
     const reason=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'][Number(id.slice('rt_fallback_'.length))]
@@ -463,6 +463,16 @@ try {
  } else {
  const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
+ for(const id of ['new_mailbox_import','rt_mailbox_import']) {
+  const requestId=randomUUID(),notes=id+'@example.com----fixture-password----mail-password!----GEZDGNBVGY3TQOJQ',line=notes+(id.startsWith('rt_')?'----fixture-provided-rt':'')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  let done
+  for(let i=0;i<100;i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break}
+  assert.equal(done.status,'success',done.message)
+  const a=accounts.find(a=>a.id===id);assert.equal(a.notes,notes);assert.equal(a.enabled,true)
+  await submit([id]);assert.equal((await finish(id)).status,'success');assert.equal(a.notes,notes)
+  check(id+': import and subsequent native reauthorization preserve the mailbox password note and exclude RT')
+ }
  for(const [index,reason] of ['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'].entries()) {
   const id='rt_fallback_'+index,requestId=randomUUID(),n=starts.length,c=completes.length,r=providedImports.length
   const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]}

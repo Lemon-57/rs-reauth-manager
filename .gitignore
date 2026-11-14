@@ -36,3 +36,4 @@ verification/*
 
 !verification/status-filter-test.mjs
 !verification/import-status-test.mjs
+!verification/import-format-test.mjs

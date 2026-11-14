@@ -33,17 +33,25 @@ pub struct Input {
 
 pub fn parse(line: &str) -> Result<Input, PluginFault> {
     let fields: Vec<_> = line.trim().split("----").collect();
-    if !matches!(fields.len(), 3 | 4)
+    if !matches!(fields.len(), 3..=5)
         || fields
             .iter()
             .any(|v| v.is_empty() || v.chars().any(char::is_control))
     {
         return Err(fault(
-            "请输入 邮箱----密码----2FA 或 邮箱----密码----2FA----RT",
+            "请输入 邮箱----密码----[邮箱密码----]2FA[----RT]，方括号内为可选字段",
         ));
     }
     let email = fields[0].trim().to_owned();
-    let notes = fields[..3].join("----");
+    let note_fields = match fields.len() {
+        3 => 3,
+        5 => 4,
+        4 if crate::totp_valid(fields[3]) => 4,
+        4 if crate::totp_valid(fields[2]) => 3,
+        4 => return Err(fault("未识别到有效 2FA 密钥，请核对字段顺序")),
+        _ => unreachable!(),
+    };
+    let notes = fields[..note_fields].join("----");
     if email.len() > 254
         || email.chars().any(char::is_whitespace)
         || email.split('@').count() != 2
@@ -53,15 +61,15 @@ pub fn parse(line: &str) -> Result<Input, PluginFault> {
             .is_some_and(|host| host.contains('.'))
         || !import_notes_valid(&email, &notes)
         || fields
-            .get(3)
+            .get(note_fields)
             .is_some_and(|v| v.len() > 32768 || v.chars().any(char::is_whitespace))
     {
-        return Err(fault("导入格式或三字段登录资料无效"));
+        return Err(fault("导入格式或登录资料无效"));
     }
     Ok(Input {
         email,
         notes,
-        refresh_token: fields.get(3).map(|v| (*v).to_owned()),
+        refresh_token: fields.get(note_fields).map(|v| (*v).to_owned()),
     })
 }
 
@@ -293,7 +301,7 @@ pub fn parse_lines(text: &str) -> Result<Vec<(usize, Input)>, PluginFault> {
         }
         let input = parse(line).map_err(|_| {
             fault(&format!(
-                "第 {} 行格式无效，请核对三字段或四字段格式",
+                "第 {} 行格式无效，请核对邮箱、密码、可选邮箱密码、2FA 和可选 RT 的顺序",
                 index + 1
             ))
         })?;
@@ -880,14 +888,21 @@ mod tests {
         assert!(serde_json::from_value::<Submission>(explicit).is_err());
     }
     #[test]
-    fn accepts_both_formats_without_putting_rt_in_notes() {
-        let three = "fixture@example.com----fixture-password----JBSWY3DPEHPK3PXP";
-        let a = parse(three).unwrap();
-        assert!(a.refresh_token.is_none());
-        assert_eq!(a.notes, three);
-        let b = parse(&format!("{three}----fixture-rt")).unwrap();
-        assert_eq!(b.notes, three);
-        assert_eq!(b.refresh_token.as_deref(), Some("fixture-rt"));
+    fn accepts_all_formats_preserving_optional_mailbox_password_but_never_rt() {
+        for mailbox in [None, Some("mail-Päss!"), Some("ABCDEFGHIJKLMN23")] {
+            let notes = format!("fixture@example.com----fixture-password----{}JBSWY3DPEHPK3PXP", mailbox.map(|value| format!("{value}----")).unwrap_or_default());
+            for token in [None, Some("fixture-rt"), Some("v1.fixture-variable-length-refresh-token")] {
+                let line = format!("{notes}{}", token.map(|value| format!("----{value}")).unwrap_or_default());
+                let parsed = parse(&line).unwrap();
+                assert_eq!(parsed.notes, notes);
+                assert_eq!(parsed.refresh_token.as_deref(), token);
+                assert!(crate::import_notes_valid("fixture@example.com", &parsed.notes));
+                assert!(crate::notes_valid(&json!({"email":"fixture@example.com","notes":parsed.notes})));
+            }
+        }
+        for invalid in ["fixture@example.com----pass----123456", "fixture@example.com----pass----mail-pass----123456", "fixture@example.com----pass----mail-pass----JBSWY3DPEHPK3PXP----bad rt"] {
+            assert!(parse(invalid).is_err());
+        }
     }
     #[test]
     fn mixed_multiline_preserves_physical_line_numbers_and_rejects_duplicates() {
