@@ -1,0 +1,16 @@
+[
+  {"name":"three fields","accepted":true,"line":"sample@example.com----test-only----JBSWY3DPEHPK3PXP"},
+  {"name":"four fields with RT","accepted":true,"line":"sample@example.com----test-only----jbsw y3dp ehpk 3pxp----test-refresh-token"},
+  {"name":"four fields with mailbox password","accepted":true,"line":"sample@example.com----test-only----test-mailbox-password----JBSWY3DPEHPK3PXP"},
+  {"name":"five fields with mailbox password and RT","accepted":true,"line":"sample@example.com----test-only----test-mailbox-password----JBSWY3DPEHPK3PXP----test-refresh-token"},
+  {"name":"mailbox password may contain spaces","accepted":true,"line":"sample@example.com----test-only----test mailbox password----jbsw y3dp ehpk 3pxp"},
+  {"name":"both final fields resemble 2FA","accepted":true,"line":"sample@example.com----test-only----JBSWY3DPEHPK3PXP----JBSWY3DPEHPK3PXP"},
+  {"name":"short email password and RT","accepted":true,"line":"a@b.c----x----y----JBSWY3DPEHPK3PXP----z"},
+  {"name":"invalid third field in RT format","accepted":false,"line":"sample@example.com----test-only----bad_secret----test-refresh-token"},
+  {"name":"invalid fourth field in five-field input","accepted":false,"line":"sample@example.com----test-only----test-mailbox-password----bad_secret----test-refresh-token"},
+  {"name":"empty mailbox password","accepted":false,"line":"sample@example.com----test-only--------JBSWY3DPEHPK3PXP----test-refresh-token"},
+  {"name":"empty RT","accepted":false,"line":"sample@example.com----test-only----JBSWY3DPEHPK3PXP----"},
+  {"name":"RT with whitespace","accepted":false,"line":"sample@example.com----test-only----test-mailbox-password----JBSWY3DPEHPK3PXP----test refresh token"},
+  {"name":"extra field","accepted":false,"line":"sample@example.com----test-only----test-mailbox-password----JBSWY3DPEHPK3PXP----test-refresh-token----extra"},
+  {"name":"missing secret","accepted":false,"line":"sample@example.com----test-only"}
+]

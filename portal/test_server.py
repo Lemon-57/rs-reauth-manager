@@ -23,6 +23,7 @@ class Upstream(BaseHTTPRequestHandler):
     broken_import = False
     revision = 7
     reject_import = False
+    payloads = []
 
     def log_message(self, *args):
         pass
@@ -64,6 +65,7 @@ class Upstream(BaseHTTPRequestHandler):
             if value.get('groupIds') != []:
                 return self.answer(400, {'message': '导入参数无效'})
             type(self).imports += 1
+            type(self).payloads.append(value)
             if type(self).reject_import:
                 return self.answer(403, {'code': 403, 'message': '第 1 行账号已存在，本批未提交'})
             if type(self).broken_import:
@@ -87,7 +89,7 @@ class ContractTests(unittest.TestCase):
         cls.upstream.shutdown(); cls.upstream.server_close()
 
     def setUp(self):
-        Upstream.calls = []; Upstream.imports = 0; Upstream.broken_import = False; Upstream.revision = 7; Upstream.reject_import = False
+        Upstream.calls = []; Upstream.imports = 0; Upstream.broken_import = False; Upstream.revision = 7; Upstream.reject_import = False; Upstream.payloads = []
         self.portal.auth.sessions.clear(); self.portal.auth.attempts.clear(); self.portal.auth.global_attempts.clear()
         token, status = self.portal.auth.login('test-admin', 'test-password', 'test')
         self.assertEqual(status, 200)
@@ -197,12 +199,64 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(Upstream.imports, 1)
         for line in ('sample@example.com----test-only----bad_secret----test-refresh-token',
                      'sample@example.com----test-only----JBSWY3DPEHPK3PXP----',
-                     'sample@example.com----test-only----JBSWY3DPEHPK3PXP----test refresh token'):
+                     'sample@example.com----test-only----JBSWY3DPEHPK3PXP----test refresh-token'):
             value['line'] = line
             status, _, raw = self.call('POST', '/api/import', value, admin=True)
             self.assertEqual(status, 400)
-            self.assertIn('邮箱----密码----2FA----RT', raw.decode())
+            self.assertIn('邮箱----密码----[邮箱密码----]2FA[----RT]', raw.decode())
         self.assertEqual(Upstream.imports, 1)
+
+    def test_shared_formats_and_rejections(self):
+        cases = json.loads((Path(__file__).parent / 'validation_cases.json').read_text())
+        for case in cases:
+            with self.subTest(case=case['name']):
+                value = self.payload(); value['line'] = case['line']
+                if case['accepted']:
+                    self.assertEqual(import_payload(value), value)
+                else:
+                    with self.assertRaises(Rejected):
+                        import_payload(value)
+
+    def test_all_four_formats_reach_plugin_once_unchanged(self):
+        cases = json.loads((Path(__file__).parent / 'validation_cases.json').read_text())
+        for case in cases[:4]:
+            value = self.payload(); value['line'] = case['line']
+            self.assertEqual(self.call('POST', '/api/import', value, admin=True)[0], 200)
+            self.assertEqual(Upstream.payloads[-1], {**value, 'groupIds': []})
+        self.assertEqual(Upstream.imports, 4)
+
+    def test_mailbox_notes_and_rt_byte_limits(self):
+        value = self.payload()
+        secret = 'JBSWY3DPEHPK3PXP'
+        prefix = 'sample@example.com----test-only----'
+        suffix = '----' + secret
+        mailbox = 'm' * (2000 - len((prefix + suffix).encode()))
+        value['line'] = prefix + mailbox + suffix
+        self.assertEqual(import_payload(value), value)
+        value['line'] = prefix + mailbox + 'm' + suffix
+        with self.assertRaises(Rejected):
+            import_payload(value)
+        for length in (32768, 32769):
+            value['line'] = prefix + 'mailbox' + suffix + '----' + 'r' * length
+            if length == 32768:
+                self.assertEqual(import_payload(value), value)
+            else:
+                with self.assertRaises(Rejected):
+                    import_payload(value)
+        value['line'] = prefix + secret * 62 + '----' + secret * 62
+        with self.assertRaises(Rejected):
+            import_payload(value)
+
+    def test_mailbox_format_keeps_line_numbers_and_normalized_duplicates(self):
+        value = self.payload()
+        value['line'] = '\nsample@example.com----test-only----mailbox----JBSWY3DPEHPK3PXP\nSAMPLE@example.com ----test-only----JBSWY3DPEHPK3PXP'
+        with self.assertRaises(Rejected) as raised:
+            import_payload(value)
+        self.assertIn('第 3 行邮箱重复', raised.exception.message)
+        value['line'] = value['line'].rsplit('\n', 1)[0] + '\ninvalid'
+        with self.assertRaises(Rejected) as raised:
+            import_payload(value)
+        self.assertIn('第 3 行格式无效', raised.exception.message)
 
     def test_security_headers_and_no_directory_listing(self):
         status, headers, raw = self.call('GET', '/')

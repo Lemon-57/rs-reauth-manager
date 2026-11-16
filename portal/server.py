@@ -53,17 +53,20 @@ def import_payload(value):
         raise Rejected(400, "每批请输入 1 至 200 行账号")
     for number, line in lines:
         fields = line.split("----")
-        if (len(fields) not in (3, 4) or any(not f for f in fields)
+        # Match the installed plugin: a valid final 2FA field takes precedence
+        # in four-field input; five fields always include a mailbox password.
+        note_fields = 4 if len(fields) == 5 or len(fields) == 4 and valid_secret(fields[3]) else 3
+        if (len(fields) not in (3, 4, 5) or any(not f for f in fields)
                 or any(ord(c) < 32 or ord(c) == 127 for c in line)
                 or len(fields[0].strip().encode()) > 254
                 or re.search(r"\s", fields[0].strip())
                 or fields[0].count("@") != 1
                 or "." not in fields[0].split("@", 1)[1]
-                or len("----".join(fields[:3]).encode()) > 2000
-                or not valid_secret(fields[2])
-                or len(fields) == 4 and (len(fields[3].encode()) > 32768 or re.search(r"\s", fields[3]))):
-            raise Rejected(400, f"第 {number} 行格式无效，请核对 邮箱----密码----2FA 或 邮箱----密码----2FA----RT；2FA 需为有效 Base32 密钥")
-        email = fields[0].casefold()
+                or len("----".join(fields[:note_fields]).encode()) > 2000
+                or not valid_secret(fields[note_fields - 1])
+                or len(fields) > note_fields and (len(fields[note_fields].encode()) > 32768 or re.search(r"\s", fields[note_fields]))):
+            raise Rejected(400, f"第 {number} 行格式无效，请核对 邮箱----密码----[邮箱密码----]2FA[----RT]；方括号内为可选字段，2FA 需为有效 Base32 密钥")
+        email = fields[0].strip().casefold()
         if email in seen:
             raise Rejected(400, f"第 {number} 行邮箱重复，本批未提交")
         seen.add(email)

@@ -6,6 +6,22 @@ request. Account submission calls the plugin's `api/import-line` route exactly
 once. The existing plugin owns deduplication, fixed proxy allocation, native OAuth,
 subscription policy, persistence and final account verification.
 
+The portal accepts the same four input formats as the installed plugin:
+
+| Input | Notes saved by the plugin |
+| --- | --- |
+| `email----password----2FA` | `email----password----2FA` |
+| `email----password----2FA----RT` | `email----password----2FA` |
+| `email----password----mailbox password----2FA` | All four fields |
+| `email----password----mailbox password----2FA----RT` | The first four fields |
+
+In four-field input, a valid Base32 2FA secret in the final field identifies the
+mailbox-password format. Otherwise the third field must be a valid 2FA secret and
+the fourth is the RT. Five-field input uses the fixed positions shown above.
+Field recognition does not depend on password or RT length. Mailbox passwords are
+saved only; they are not used to retrieve verification mail. The portal forwards
+the original submission unchanged and the plugin excludes RTs from notes.
+
 Run with Python 3.10 or later:
 
 ```sh
@@ -52,4 +68,5 @@ Verification:
 ```sh
 python3 -B -m unittest discover -s portal -p 'test_*.py'
 node --check portal/web/app.js
+node portal/test_validation.cjs
 ```

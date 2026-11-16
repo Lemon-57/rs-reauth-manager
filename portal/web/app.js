@@ -66,8 +66,9 @@ function validate(value) {
   const seen = new Set()
   for (const { line, number } of lines) {
     const fields = line.split('----')
-    if (![3, 4].includes(fields.length) || fields.some(f => !f) || /[\x00-\x1f\x7f]/.test(line) || new TextEncoder().encode(fields[0].trim()).length > 254 || /\s/.test(fields[0].trim()) || fields[0].split('@').length !== 2 || !fields[0].split('@')[1].includes('.') || new TextEncoder().encode(fields.slice(0, 3).join('----')).length > 2000 || !validSecret(fields[2]) || fields.length === 4 && (new TextEncoder().encode(fields[3]).length > 32768 || /\s/.test(fields[3]))) throw new Error(`第 ${number} 行格式无效，请核对 邮箱----密码----2FA 或 邮箱----密码----2FA----RT；2FA 需为有效 Base32 密钥`)
-    const email = fields[0].toLowerCase()
+    const noteFields = fields.length === 5 || fields.length === 4 && validSecret(fields[3]) ? 4 : 3
+    if (![3, 4, 5].includes(fields.length) || fields.some(f => !f) || /[\x00-\x1f\x7f]/.test(line) || new TextEncoder().encode(fields[0].trim()).length > 254 || /\s/.test(fields[0].trim()) || fields[0].split('@').length !== 2 || !fields[0].split('@')[1].includes('.') || new TextEncoder().encode(fields.slice(0, noteFields).join('----')).length > 2000 || !validSecret(fields[noteFields - 1]) || fields.length > noteFields && (new TextEncoder().encode(fields[noteFields]).length > 32768 || /\s/.test(fields[noteFields]))) throw new Error(`第 ${number} 行格式无效，请核对 邮箱----密码----[邮箱密码----]2FA[----RT]；方括号内为可选字段，2FA 需为有效 Base32 密钥`)
+    const email = fields[0].trim().toLowerCase()
     if (seen.has(email)) throw new Error(`第 ${number} 行邮箱重复，本批未提交`)
     seen.add(email)
   }
