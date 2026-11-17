@@ -554,6 +554,7 @@ fn account_row(a: &Value, groups: Vec<Value>) -> Value {
 }
 async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
     let accounts = directory(host).await?;
+    let (queue, _) = host::load(host).await?;
     let mut rows = vec![];
     for a in accounts.iter().filter(|a| eligible(a)) {
         let groups = a["groups"]
@@ -567,7 +568,9 @@ async fn rows(host: &HostClient) -> Result<Value, PluginFault> {
                 },
             )
             .collect::<Result<Vec<_>, _>>()?;
-        rows.push(account_row(a, groups));
+        let mut row = account_row(a, groups);
+        row["automaticStatus"] = automatic::status(a, &queue, now()).unwrap_or(Value::Null);
+        rows.push(row);
     }
     Ok(json!({"accounts":rows}))
 }

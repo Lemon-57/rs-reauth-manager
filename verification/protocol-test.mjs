@@ -13,6 +13,7 @@ const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLS
 const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace3`,email:`${id}@example.com`,authenticationKind:'oauth',userId:'original-user',enabled:id!=='disabled',planType:'team',status:'error',notes:`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`,outboundProxyEndpoint:'http://127.0.0.1:21001',accountId:'original-workspace',groups:[{id:'g1',name:'Team'}],weight:3,concurrencyLimit:null,modelAccess:{mode:'all'},hasRefreshToken:true,capacity:{usedSlots:0},errorReason:null})
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
 const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
+const recoveryRecords = new Map()
 let groupMode='normal'
 function updateImportDetails(data) {
    const a=accounts.find(a=>a.id===data.accountId)
@@ -166,6 +167,12 @@ async function callback(meta,payload) {
    if(groupMode==='duplicate')items.push({id:'duplicate-pro',name:'GPT Pro',enabled:true})
    dataReply={items,page:{total:items.length}}
   }else if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
+  else if(url.pathname==='/api/admin/usage/records') {
+   assert.equal(url.searchParams.get('status'),'success');assert.equal(url.searchParams.get('provider'),'openai')
+   assert.equal(url.searchParams.get('pageSize'),'20')
+   const a=accounts.find(a=>a.name===url.searchParams.get('accountName'))
+   dataReply={items:recoveryRecords.get(a?.id)||[]}
+  }
   else if(url.pathname==='/api/admin/accounts/detail') {
    const a=accounts.find(a=>a.id===url.searchParams.get('accountId'))
    if(a.id.startsWith('up_projection_')&&nativeMaterials.has(a.id)) {
@@ -777,6 +784,32 @@ try {
  {
   const a=add('slow');await submit([a.id]);await tick();await request('cancel',{requestId:null});assert.equal(job(a.id).status,'cancelled')
   check('Cancel stops the helper without replaying login or OAuth completion')
+ }
+ {
+  const a=add('auto_old_review_recovered');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  const old=Date.now()-7*3600000,state=records.get('queue').value
+  state.automation.attempts[a.id]={at:old,recovered:false,requiresReview:true}
+  state.jobs.push({requestId:randomUUID()+':'+a.id,accountId:a.id,status:'cancelled',step:'cancelled',message:'尚未开始登录',startedAt:null,finishedAt:Date.now()})
+  recoveryRecords.set(a.id,[{accountId:a.id,provider:'openai',logicalOutcome:'succeeded',createdAt:new Date(old+1000).toISOString()}])
+  const before=starts.length
+  await request('automation',{enabled:true});await tick()
+  assert.equal(job(a.id).automatic,true);assert.equal((await finish(a.id)).status,'success')
+  assert.equal(starts.length,before+1)
+  for(let i=0;i<3;i++)await tick()
+  await request('automation',{enabled:false});await stop();records.get('executor').value.expires=0;await start();await tick()
+  assert.equal(starts.length,before+1)
+  check('A legacy review latch is reconciled only by later successful traffic from the same account; an unstarted cancellation cannot poison its new automatic attempt')
+ }
+ {
+  const a=add('auto_old_review_unconfirmed');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  records.get('queue').value.automation.attempts[a.id]={at:Date.now()-7*3600000,recovered:false,requiresReview:true}
+  recoveryRecords.set(a.id,[{accountId:'other',provider:'openai',logicalOutcome:'succeeded',createdAt:new Date().toISOString()},{accountId:a.id,provider:'openai',logicalOutcome:'failed',clientStatusCode:200,createdAt:new Date().toISOString()}])
+  const before=starts.length
+  await request('automation',{enabled:true});await tick();assert.equal(starts.length,before)
+  const row=(await request('accounts')).value.accounts.find(row=>row.id===a.id)
+  assert.equal(row.automaticStatus.code,'review');assert.match(row.automaticStatus.label,/待核对/)
+  await request('automation',{enabled:false})
+  check('Uncertain history without exact successful recovery stays blocked and exposes the reason through the account API')
  }
  {
   const a=add('automatic_once_failure');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
