@@ -1,0 +1,98 @@
+--- a/src/App.vue
++++ b/src/App.vue
+@@ -10,19 +10,13 @@
+ import { ZTable, ZTableColumnSettings, type TableColumn } from '@codex-proxy/ui/table'
+ import { ZTag } from '@codex-proxy/ui/tag'
+ import { ZTextarea } from '@codex-proxy/ui/textarea'
+-import { displayTime, isActive, planLabel, planType, progress, resultMessage, statusText } from './format'
++import { authorizationResult, displayTime, isActive, planLabel, planType, resultMessage, statusText } from './format'
+ import { useReauthManager } from './useReauthManager'
+ import type { Account } from './types'
+ import { useAccountColumns } from './useAccountColumns'
+ 
+ const { lastUpdated, refreshWarning, importLineCount, recentImports, importView, importsActive, showImport, importText, importError, openImport, closeImport, submitImport, automationEnabled, automationBusy, automationLoaded, setAutomation, accounts, selected, loading, busy, deleting, notice, error, search, plan, filter, page, pageSize, jobOf, resultOf, resultFinishedAt, ready, active, success, failed, eligibleCount, planOptions, supplier, supplierOptions, statusOptions, statusSelection, statusPlaceholder, loginFailed, failureLabel, failureMessage, filtered, visible, pageSelected, pageIndeterminate, allSelected, allIndeterminate, chosen, reauthChosen, selectOne, selectPage, selectAll, showResults, load, submit, cancel, deleteSelected, pageCandidates, showForce, forceTarget, forceSource, forceWorkspace, forceConfirmed, canForce, openForce, submitForce, canFreeFallback, submitFreeFallback } = useReauthManager()
+-const authorizationProgress = (row: Account) => resultOf(row) ? progress(resultOf(row)) : row.status === 'normal' ? '无需重新授权' : row.automaticStatus?.label || '未执行'
+-const authorizationLabel = (row: Account) => loginFailed(row) && !isActive(resultOf(row)) ? `历史：${failureLabel(row)}` : authorizationProgress(row)
+-const authorizationTone = (row: Account) => {
+-  if (loginFailed(row) && !isActive(resultOf(row))) return 'muted'
+-  const status = resultOf(row)?.status || ''
+-  return status === 'success' ? 'success' : ['failed', 'review', 'interrupted'].includes(status) ? 'danger' : ''
+-}
++const authorizationView = (row: Account) => authorizationResult(row, resultOf(row), loginFailed(row) ? failureLabel(row) : undefined)
+ const columns: TableColumn<Account>[] = [
+  { key: 'select', label: '', kind: 'selection', align: 'center', hideable: false },
+  { key: 'identity', label: '账号', kind: 'identity', width: 300, align: 'center', hideable: false },
+@@ -70,7 +64,7 @@
+     <ZTable class="account-table" :columns="visibleColumns" :data="visible" :row-key="a => a.id" :loading="loading && !accounts.length" :empty-text="loading ? '正在读取账号' : '没有匹配的 OAuth 账号'">
+       <template #header-select><ZCheckbox class="account-checkbox" :model-value="pageSelected" :indeterminate="pageIndeterminate" :disabled="!pageCandidates.length || busy" aria-label="选择当前页" title="选择当前页" @change="selectPage" /></template>
+       <template #select="{ row }"><ZCheckbox class="account-checkbox" :model-value="selected.includes(row.id)" :disabled="busy" :aria-label="`选择 ${row.email || row.name}`" @change="selectOne(row.id, $event)" /></template>
+-      <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> <span :class="{ danger: row.status === 'error' }">{{ statusText(row) }}</span></span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span :class="authorizationTone(row)">{{ authorizationLabel(row) }}<span v-if="loginFailed(row)" class="muted"> · {{ failureMessage(row) }}</span><span v-if="resultOf(row)?.message && (!loginFailed(row) || resultMessage(resultOf(row)) !== failureMessage(row))"> · {{ resultMessage(resultOf(row)) }}</span></span></div></div></div></template>
++      <template #identity="{ row }"><div class="identity" :title="`${row.name}\n${row.id}`"><span class="avatar" :class="{ green: row.planType === 'team' }">{{ (row.email || row.name).slice(0, 1).toUpperCase() }}</span><div class="identity-text"><span class="email">{{ row.email || row.name }}</span><div class="mobile-details"><span>分组：{{ row.groups.map(group => group.name).join(" / ") || "未分组" }}</span><span><ZTag :type="planType(row.planType)" size="small">{{ planLabel(row.planType || 'unknown') }}</ZTag> <span :class="{ danger: row.status === 'error' }">{{ statusText(row) }}</span></span><span :class="{ danger: !row.proxy || !row.notesValid }">{{ !row.proxy ? '未绑定代理' : !row.notesValid ? '备注待检查' : row.proxy }}</span><span><span :class="authorizationView(row).tone">{{ authorizationView(row).label }}</span><span v-if="authorizationView(row).history" class="muted"> · {{ authorizationView(row).history }}<template v-if="resultFinishedAt(row) != null"> · {{ displayTime(resultFinishedAt(row)) }}</template></span><span v-if="loginFailed(row)" class="muted"> · {{ failureMessage(row) }}</span><span v-if="resultOf(row)?.message && (!loginFailed(row) || resultMessage(resultOf(row)) !== failureMessage(row))" :class="authorizationView(row).history ? 'muted' : authorizationView(row).tone"> · {{ resultMessage(resultOf(row)) }}</span></span></div></div></div></template>
+       <template #supplier="{ row }"><span class="supplier-name" :title="row.supplier || undefined">{{ row.supplier || '—' }}</span></template>
+       <template #manualExpiry="{ row }"><span class="date" :title="row.manualExpiresAt || undefined">{{ row.manualExpiresAtDisplay || displayTime(row.manualExpiresAt) }}</span></template>
+       <template #lastUsed="{ row }"><span class="date" :title="row.usage?.lastUsedAtFullDisplay || row.usage?.lastUsedAt || undefined">{{ row.usage?.lastUsedAtDisplay || (row.usage?.lastUsedAt ? displayTime(row.usage.lastUsedAt) : '从未使用') }}</span></template>
+@@ -80,8 +74,8 @@
+       <template #credentials="{ row }"><span :class="row.notesValid ? 'success' : 'danger'">{{ row.notesValid ? '资料齐全' : '备注待检查' }}</span></template>
+       <template #proxy="{ row }"><span class="proxy" :title="row.proxy || '未绑定代理'">{{ row.proxy || '未绑定代理' }}</span></template>
+       <template #expiry="{ row }"><span class="date">{{ displayTime(row.accessTokenExpiresAt) }}</span></template>
+-      <template #result="{ row }"><div class="result" :class="authorizationTone(row)"><span :title="loginFailed(row) && !isActive(resultOf(row)) ? '历史登录失败；当前状态以 RS 网关为准' : undefined"><RefreshCw v-if="isActive(resultOf(row))" class="spin" :size="13" /><CircleCheck v-else-if="!loginFailed(row) && resultOf(row)?.status === 'success'" :size="14" />{{ authorizationLabel(row) }}</span><small v-if="row.status !== 'normal' && !resultOf(row) && !loginFailed(row) && row.automaticStatus" class="muted">{{ row.automaticStatus.message }}</small><small v-if="resultOf(row) && (!loginFailed(row) || isActive(resultOf(row)))" class="muted">{{ resultOf(row)?.importInfo ? '批量导入' : resultOf(row)?.newAccount ? '新增账号授权' : resultOf(row)?.automatic ? '自动重新授权' : '手动重新授权' }}</small><small v-if="loginFailed(row)" class="muted" :title="failureMessage(row)">{{ failureMessage(row) }}</small><small v-if="resultOf(row)?.message && (!loginFailed(row) || resultMessage(resultOf(row)) !== failureMessage(row))" :title="resultMessage(resultOf(row))">{{ resultMessage(resultOf(row)) }}</small>
+-        <time v-if="resultFinishedAt(row) != null" :title="resultOf(row) ? '本次任务结束时间' : '历史登录失败时间'">{{ loginFailed(row) && resultOf(row) ? '本次结束：' : '' }}{{ displayTime(resultFinishedAt(row)) }}</time>
++      <template #result="{ row }"><div class="result" :class="authorizationView(row).tone"><span :title="loginFailed(row) && !isActive(resultOf(row)) && !authorizationView(row).history ? '历史登录失败，当前状态以 RS 网关为准' : undefined"><RefreshCw v-if="isActive(resultOf(row))" class="spin" :size="13" /><CircleCheck v-else-if="authorizationView(row).tone === 'success'" :size="14" />{{ authorizationView(row).label }}</span><small v-if="authorizationView(row).history" class="muted">{{ authorizationView(row).history }}</small><small v-if="row.status !== 'normal' && !resultOf(row) && !loginFailed(row) && row.automaticStatus" class="muted">{{ row.automaticStatus.message }}</small><small v-if="resultOf(row) && (authorizationView(row).history || !loginFailed(row) || isActive(resultOf(row)))" class="muted">{{ resultOf(row)?.importInfo ? '批量导入' : resultOf(row)?.newAccount ? '新增账号授权' : resultOf(row)?.automatic ? '自动重新授权' : '手动重新授权' }}</small><small v-if="loginFailed(row)" class="muted" :title="failureMessage(row)">{{ failureMessage(row) }}</small><small v-if="resultOf(row)?.message && (!loginFailed(row) || resultMessage(resultOf(row)) !== failureMessage(row))" :class="{ muted: authorizationView(row).history }" :title="resultMessage(resultOf(row))">{{ resultMessage(resultOf(row)) }}</small>
++        <time v-if="resultFinishedAt(row) != null" :title="authorizationView(row).history ? '历史任务结束时间' : resultOf(row) ? '本次任务结束时间' : '历史登录失败时间'">{{ authorizationView(row).history ? '上次结束：' : loginFailed(row) && resultOf(row) ? '本次结束：' : '' }}{{ displayTime(resultFinishedAt(row)) }}</time>
+       </div></template>
+       <template #actions="{ row }"><ZButton v-if="canForce(row)" size="small" type="danger" :disabled="busy" @click="openForce(row)">强制写回</ZButton><ZButton v-else-if="canFreeFallback(row)" size="small" type="warning" :disabled="busy" title="退回同一用户的 Free 并停止该账号调度" @click="submitFreeFallback(row)">退回 Free</ZButton><ZIconButton v-else-if="isActive(jobOf(row))" title="取消该账号" :aria-label="`取消 ${row.email || row.name}`" :disabled="busy" @click="cancel(jobOf(row))"><Square :size="15" /></ZIconButton><ZIconButton v-else title="重新授权并写回原账号" :aria-label="`重新授权 ${row.email || row.name}`" :disabled="!ready(row) || busy" @click="submit([row])"><KeyRound :size="17" /></ZIconButton></template>
+     </ZTable>
+--- a/src/format.ts
++++ b/src/format.ts
+@@ -53,3 +53,13 @@
+ }
+ export function statusText(a: Account) { return !a.enabled ? (a.status === 'error' ? '异常（已停用）' : '已停用') : ({ normal: '正常', error: '异常', quota_exhausted: '额度耗尽', rate_limited: '限流' } as Record<string, string>)[a.status] || a.status }
+ export function progress(job?: Job) { return !job ? '未执行' : ({ queued: '等待处理', preparing: '核对资料', session: '建立会话', session_restart: '重建登录会话', login: '协议登录', mfa: '验证 2FA', mailshop_rt: '获取 GMX RT', saving: '写回授权', verify_refresh: '验证本次 RT', success: '已写回', free: '登录成功', failed: '登录失败', login_rejected: '登录失败', workspace: '工作区不匹配', review: '需要核对', mailshop_no_rt: '需要核对', interrupted: '已中断', cancelled: '已取消' } as Record<string, string>)[job.step] || '登录中' }
++
++export function authorizationResult(account: Pick<Account, 'status' | 'enabled' | 'automaticStatus'>, job?: Job, failureLabel?: string) {
++  if (account.status === 'error' && job?.status === 'success') {
++    return { label: account.enabled ? '当前异常' : '当前异常（已停用）', tone: 'danger', history: `历史：${progress(job)}` }
++  }
++  if (failureLabel && !isActive(job)) return { label: `历史：${failureLabel}`, tone: 'muted', history: '' }
++  const label = job ? progress(job) : account.status === 'normal' ? '无需重新授权' : account.automaticStatus?.label || '未执行'
++  const tone = job?.status === 'success' ? 'success' : isUnfinished(job) ? 'danger' : ''
++  return { label, tone, history: '' }
++}
+--- /dev/null
++++ b/tests/authorization-result.test.ts
+@@ -0,0 +1,35 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++import { authorizationResult } from '../src/format.ts'
++import type { Job } from '../src/types.ts'
++
++const account = { status: 'normal', enabled: true }
++const writtenBack: Job = { accountId: 'account', requestId: 'reauth', status: 'success', step: 'success', message: '已保存 RT', startedAt: 1, finishedAt: 2 }
++
++test('当前异常优先显示，成功写回仅保留为历史', () => {
++  const job = Object.freeze({ ...writtenBack, automatic: true })
++  assert.deepEqual(authorizationResult({ ...account, status: 'error' }, job), {
++    label: '当前异常', tone: 'danger', history: '历史：已写回',
++  })
++  assert.deepEqual(authorizationResult({ status: 'error', enabled: false }, job, '邮箱验证'), {
++    label: '当前异常（已停用）', tone: 'danger', history: '历史：已写回',
++  })
++  assert.equal(job.finishedAt, 2)
++  assert.equal(job.message, '已保存 RT')
++})
++
++test('当前正常时保留成功展示，正在处理和失败记录也保持原样', () => {
++  const abnormal = { ...account, status: 'error' }
++  assert.deepEqual(authorizationResult(account, writtenBack), { label: '已写回', tone: 'success', history: '' })
++  assert.deepEqual(authorizationResult(abnormal, { ...writtenBack, status: 'running', step: 'login', finishedAt: null }, '邮箱验证'), {
++    label: '协议登录', tone: '', history: '',
++  })
++  assert.deepEqual(authorizationResult(abnormal, { ...writtenBack, status: 'failed', step: 'failed' }, '邮箱验证'), {
++    label: '历史：邮箱验证', tone: 'muted', history: '',
++  })
++  assert.deepEqual(authorizationResult(abnormal, { ...writtenBack, status: 'failed', step: 'failed' }), {
++    label: '登录失败', tone: 'danger', history: '',
++  })
++  assert.equal(authorizationResult(account).label, '无需重新授权')
++  assert.equal(authorizationResult({ ...abnormal, automaticStatus: { code: 'eligible', label: '等待自动检查', message: '等待' } }).label, '等待自动检查')
++})
