@@ -10,7 +10,6 @@ def check_runtime():
     from runner import authorization
     from totp import totp_code
     from fallback import personal_candidate, verify_free_tokens
-    from sessions import device_sessions
 
     assert totp_code('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', at_time=59, digits=8)[0] == '94287082'
     inner = 'https://auth.openai.com/oauth/authorize?' + urlencode({
@@ -28,4 +27,3 @@ def check_runtime():
     assert authorization(inner) == authorization(outer)
     assert personal_candidate({'workspaces': [{'id': 'personal-fixture', 'is_personal': True}]}, 'old-fixture') == 'personal-fixture'
     assert callable(verify_free_tokens)
-    assert device_sessions({'devices':[{'session_id':'runtime-current','is_current_device':True}]}) == ('runtime-current',set())

@@ -12,7 +12,9 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-from diagnostics import describe_failure, mfa_generation_failure, response_mfa_error, retry_action, stage_for_url, transport_reason
+from diagnostics import describe_failure, mfa_generation_failure, mfa_shape, mfa_page, response_mfa_error, retry_action, stage_for_url, transport_reason
+from mailcom import MailcomClient, mailbox_password
+from mailshop_rt import MailshopError, fetch_rt
 from tracing import ObservedSession
 from workspace_pages import workspace_page
 
@@ -26,12 +28,24 @@ def parse_notes(notes, email):
     if not isinstance(notes, str) or len(notes) > 2000 or any(c in notes for c in "\r\n\0"):
         raise ValueError("credentials")
     parts = notes.strip().split("----")
-    if len(parts) != 3 or parts[0].strip().casefold() != email.strip().casefold() or not parts[1]:
+    if len(parts) not in (3, 4) or parts[0].strip().casefold() != email.strip().casefold() or not all(parts[1:]):
         raise ValueError("credentials")
-    secret = parts[2].strip().upper().replace(" ", "")
-    if not secret or not base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True):
+    secret = parts[-1].strip().upper().replace(" ", "")
+    core = secret.rstrip('=')
+    if len(core) < 16 or not base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True):
         raise ValueError("credentials")
     return parts[0].strip(), parts[1], secret
+
+
+def mailcom_client(data, email):
+    key = data.get('mailcomKey')
+    password = mailbox_password(data.get('notes'), email)
+    if not password or not isinstance(key, str) or not key:
+        return None
+    try:
+        return MailcomClient(email, password, key)
+    except (TypeError, ValueError):
+        return None
 
 
 def authorization(url):
@@ -106,22 +120,27 @@ def _run_once(data, used_codes):
     from vendor.lib.chatgpt_client import ChatGPTClient
     from vendor.lib.oauth_client import OAuthClient
     from totp import TotpMfaClient
-    from fallback import WorkspaceUnavailable, WorkspaceUpgrade, automatic_free_candidate, free_workspace_candidate, merge_workspace_evidence, recover_free, recover_team, recover_unbound_free, team_candidate, workspace_choices
+    from fallback import WorkspaceUnavailable, WorkspaceUpgrade, automatic_free_candidate, free_workspace_candidate, new_account_workspace_candidate, merge_workspace_evidence, recover_free, recover_team, recover_unbound_free, team_candidate, workspace_choices
 
     target = str(data.get("accountId") or "")
     forced = data.get("forceWorkspaceId")
     forced_free = data.get("forceFree") is True
-    automatic = data.get("automatic") is True
-    new_account = data.get("newAccount") is True
-    auto_team = not automatic and str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
-    if automatic and (forced or forced_free or not target or not data.get("userId") or not data.get("planType")):
-        raise ValueError("workspace")
+    recover_workspace = data.get('recoverWorkspace') is True
+    if recover_workspace and (target or not data.get('userId') or str(data.get('planType') or '').lower() != 'free' or forced or forced_free or data.get('newAccount')):
+        raise ValueError('workspace')
+    new_account = data.get("newAccount") is True or recover_workspace
+    allow_free_new = recover_workspace or (new_account and data.get("allowFreeNew") is True)
+    accept_current_profile = data.get('acceptCurrentProfile') is True and bool(target and data.get('userId')) and not (new_account or forced or forced_free)
+    auto_team = str(data.get('planType') or '').strip().lower() == 'free' and not forced and not forced_free
     if forced is not None and (not isinstance(forced, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", forced) or forced == target):
         raise ValueError("workspace")
 
     class BoundOAuthClient(OAuthClient):
         bound_workspace = False
+        workspace_selection_attempted = False
         selected_workspace = forced or ("" if new_account else target)
+        selected_plan = None
+        followed_current_workspace = False
         workspace_candidates = []
         unbound_workspace = False
         last_attempt = None
@@ -131,9 +150,39 @@ def _run_once(data, used_codes):
         session_evidence = None
         session_lookup_failure = None
         unresolved_workspace = None
+        phone_resume_attempted = False
+
+        def _phone_required(self):
+            self.last_attempt = {'stage': 'phone', 'httpStatus': None}
+            self.failed_authorization = describe_failure({'error': 'phone_required'}, attempt=self.last_attempt)
+            self.last_oauth_error = 'phone_required'
+
+        def _oauth_drive_external_login_for_continue(self, **kwargs):
+            if self.phone_resume_attempted:
+                self._phone_required()
+                return ''
+            return super()._oauth_drive_external_login_for_continue(**kwargs)
+
+        def _oauth_complete_totp_mfa_for_continue(self, **kwargs):
+            if self.phone_resume_attempted:
+                self._phone_required()
+                return ''
+            return super()._oauth_complete_totp_mfa_for_continue(**kwargs)
+
+        def _oauth_complete_add_phone_for_continue(self, email, device_id, user_agent, impersonate, sms_client, current_url):
+            # Resume exactly the RS-owned URL with the authenticated session.
+            # The upstream still decides whether phone verification is mandatory.
+            if not self.phone_resume_attempted:
+                self.phone_resume_attempted = True
+                emit('step', step='phone_resume')
+                return authorize_url
+            self._phone_required()
+            raise ValueError('phone_required')
 
         def _oauth_request(self, method, url, **kwargs):
             self.last_attempt = {'stage': stage_for_url(url), 'httpStatus': None}
+            if method.upper() == 'POST' and self.last_attempt['stage'] in {'workspace', 'organization'}:
+                self.workspace_selection_attempted = True
             if self.last_attempt['stage'] == 'mfa_verify':
                 code = kwargs.get('json', {}).get('code')
                 if isinstance(code, str) and re.fullmatch(r'\d{6}', code):
@@ -149,6 +198,9 @@ def _run_once(data, used_codes):
             if self.last_attempt['stage'] in {'mfa_verify', 'mfa_issue'}:
                 self.last_attempt['mfaError'] = response_mfa_error(response)
             if self.last_attempt['stage'] == 'mfa_verify':
+                if self.last_attempt['httpStatus'] == 200:
+                    self.last_attempt['mfaShape'] = mfa_shape(response)
+                    self.last_attempt['mfaPage'] = mfa_page(response)
                 self.last_mfa_verification = describe_failure(attempt=self.last_attempt)
             if self.last_attempt['stage'] in {'workspace', 'organization'}:
                 status = self.last_attempt['httpStatus']
@@ -180,6 +232,13 @@ def _run_once(data, used_codes):
                 self._remember_workspace(choice['id'])
             if new_account and not selected:
                 candidate = team_candidate(session, "")
+                self.selected_plan = 'team' if candidate else 'free'
+                if not candidate and allow_free_new:
+                    try:
+                        candidate = (free_workspace_candidate if recover_workspace else new_account_workspace_candidate)(session, "")
+                    except ValueError as exc:
+                        if str(exc) != "free_workspace_missing":
+                            raise
                 if candidate:
                     self.selected_workspace = candidate
                     return candidate
@@ -211,23 +270,52 @@ def _run_once(data, used_codes):
             ids = {workspace['id'] for workspace in evidence['workspaces']}
             if new_account and not self.selected_workspace:
                 candidate = team_candidate(evidence, "")
+                self.selected_plan = 'team' if candidate else 'free'
+                if not candidate and allow_free_new:
+                    try:
+                        candidate = (free_workspace_candidate if recover_workspace else new_account_workspace_candidate)(evidence, "")
+                    except ValueError as exc:
+                        if str(exc) != "free_workspace_missing":
+                            raise
                 if candidate:
                     self.selected_workspace = candidate
                     return candidate
                 return ""
-            if auto_team and self.selected_workspace == target and not getattr(self, 'selecting_team', False):
-                combined = merge_workspace_evidence(self.session_evidence, evidence)
-                team = team_candidate(combined, target, allow_original=True)
+            session = self.session_evidence if isinstance(self.session_evidence, dict) else {}
+            original_selected = self.selected_workspace == target
+            prefer_team = auto_team and original_selected and not getattr(self, 'selecting_team', False)
+            if not prefer_team and self.selected_workspace and self.selected_workspace in ids:
+                return self._remember_workspace(self.selected_workspace)
+            combined = merge_workspace_evidence(session, evidence) if original_selected and (auto_team or accept_current_profile) else {'workspaces': []}
+            listed = {workspace['id'] for workspace in combined['workspaces']}
+            current = session.get('workspace_id')
+            manual_current = (accept_current_profile and original_selected and not data.get('automatic')
+                              and isinstance(current, str) and current in listed and target not in listed
+                              and (not ids or current in ids))
+            if prefer_team:
+                try:
+                    team = team_candidate(combined, target, allow_original=True)
+                except ValueError as failure:
+                    if str(failure) != 'workspace' or not manual_current:
+                        raise
+                    team = None
                 if team:
                     raise WorkspaceUpgrade(team)
-                session = self.session_evidence if isinstance(self.session_evidence, dict) else {}
-                if any(w['id'] == target for w in combined['workspaces']) or session.get('workspace_id') == target:
+                if target in listed or current == target:
                     return target
-            if self.selected_workspace and self.selected_workspace in ids:
-                return self._remember_workspace(self.selected_workspace)
+            if accept_current_profile and original_selected:
+                candidates = listed | {choice['id'] for choice in workspace_choices(session, target)}
+                if target not in candidates:
+                    candidate = current if manual_current else None
+                    if candidate is None and len(candidates) == 1:
+                        candidate = next(iter(candidates))
+                    if candidate and (not ids or candidate in ids):
+                        self.selected_workspace = candidate
+                        self.followed_current_workspace = manual_current
+                        return candidate
             if not ids:
                 personal = None
-                if self.selected_workspace == target:
+                if self.selected_workspace == target and not accept_current_profile:
                     try:
                         personal = automatic_free_candidate(self.session_evidence, target)
                     except ValueError:
@@ -247,15 +335,13 @@ def _run_once(data, used_codes):
                     raise
                 self.selected_workspace = selected
                 return selected
-            if self.selected_workspace == target:
+            if self.selected_workspace == target and not accept_current_profile:
                 for source in [evidence, self.session_evidence]:
                     try:
                         personal = automatic_free_candidate(source, target)
                     except ValueError:
                         continue
                     if personal in ids:
-                        if automatic:
-                            raise ValueError("workspace")
                         raise WorkspaceUnavailable(personal)
             if not ids and self.session_lookup_failure:
                 self.failed_authorization = self.session_lookup_failure
@@ -297,6 +383,7 @@ def _run_once(data, used_codes):
 
     emit("step", step="session")
     chat = None
+    mail_client = mailcom_client(data, email)
     try:
         impersonates = "chrome124,chrome133a,chrome136,chrome120"
         chat = ChatGPTClient(proxy=proxy, verbose=False, impersonate=random.choice(impersonates.split(",")))
@@ -317,7 +404,7 @@ def _run_once(data, used_codes):
             if result.get('state') != state or not result.get('code'):
                 raise ValueError('state')
             fields['callbackUrl'] = urlunsplit((redirect.scheme, redirect.netloc, redirect.path, urlencode({'state': state, 'code': result['code']}), ''))
-        emit(event, deviceId=chat.device_id, **fields)
+        emit(event, **fields)
     try:
         emit("step", step="login")
         def authorize(url, expected):
@@ -326,27 +413,34 @@ def _run_once(data, used_codes):
             oauth.last_mfa_verification = None
             oauth.local_mfa_failure = None
             oauth.bound_workspace = False
+            oauth.followed_current_workspace = False
+            oauth.workspace_selection_attempted = False
             oauth.workspace_candidates = []
             oauth.session_evidence = None
             oauth.session_lookup_failure = None
             oauth.unresolved_workspace = None
-            result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mfa_client=ProgressMfa(secret))
+            result = oauth.authorize_external_oauth_url(url, chat, expected_state=expected, user_agent=chat.ua, impersonate=chat.impersonate, email=email, password=password, mail_client=mail_client, mfa_client=ProgressMfa(secret))
             if not isinstance(result, dict) or result.get('ok') is not True:
                 pending = oauth.unresolved_workspace
                 if isinstance(result, dict) and result.get('error') in {'oauth_callback_not_found', 'oauth_callback_timeout'} and pending and pending['attempt'] is oauth.last_attempt:
                     if pending['personal']:
-                        if automatic:
-                            raise ValueError('workspace')
                         raise WorkspaceUnavailable(pending['personal'])
                     if pending['failure']['code'] == 'workspace':
                         raise ValueError('workspace')
                     oauth.failed_authorization = pending['failure']
+                if mail_client is not None and mail_client.last_error is not None:
+                    oauth.failed_authorization = {
+                        'code': 'human',
+                        'diagnostic': {
+                            'stage': 'email_verify',
+                            'reason': 'mailcom_' + mail_client.last_error.reason,
+                            **{name: value for name, value in mail_client.last_error.diagnostic().items() if name != 'reason'},
+                        },
+                    }
                 oauth.failed_authorization = oauth.failed_authorization or oauth.local_mfa_failure or describe_failure(result, attempt=oauth.last_attempt)
             return result
 
         def fallback(personal):
-            if automatic:
-                raise ValueError("workspace")
             if not data.get("userId"):
                 raise ValueError("fallback_identity")
             oauth.bound_workspace = False
@@ -372,22 +466,27 @@ def _run_once(data, used_codes):
                 fallback(unavailable.personal_id)
                 return
             if new_account:
+                require_workspace_binding = recover_workspace or oauth.workspace_selection_attempted or oauth.bound_workspace
+                if isinstance(result, dict) and result.get('ok') is True and result.get('state') != state:
+                    raise ValueError('state')
                 if (
                     not isinstance(result, dict)
                     or result.get("ok") is not True
-                    or result.get("state") != state
                     or not isinstance(result.get("code"), str)
                     or not result["code"]
-                    or not oauth.workspace_matches()
+                    or (require_workspace_binding and not oauth.workspace_matches())
                 ):
                     raise ValueError("workspace")
-                completed("complete", workspaceId=oauth.selected_workspace, result=result)
+                fields = {'selectedPlan': oauth.selected_plan, 'uniqueWorkspaceConfirmed': True} if recover_workspace else {}
+                if require_workspace_binding:
+                    fields['workspaceId'] = oauth.selected_workspace
+                completed("workspace_recovered" if recover_workspace else "complete", result=result, **fields)
                 return
             if not isinstance(result, dict) or not result.get("ok"):
                 return oauth.failed_authorization
             if result.get("state") != state or not result.get("code"):
                 raise ValueError("state")
-            if auto_team:
+            if auto_team and not (oauth.followed_current_workspace and oauth.bound_workspace):
                 session = oauth._decode_oauth_session_cookie()
                 oauth.session_evidence = session
                 for choice in workspace_choices(session, target):
@@ -397,6 +496,11 @@ def _run_once(data, used_codes):
                     result = recover_team(oauth, chat, authorize_url, data, team, authorize)
                     completed('team_upgrade', workspaceId=team, originalWorkspaceId=target, uniqueTeamConfirmed=True, result=result)
                     return
+            if accept_current_profile:
+                workspace = oauth.selected_workspace
+                fields = {'workspaceId': workspace} if workspace != target and oauth.workspace_matches() else {}
+                completed('complete', result=result, **fields)
+                return
             if not oauth.workspace_matches():
                 fallback(automatic_free_candidate(oauth._decode_oauth_session_cookie(), target))
                 return
@@ -424,6 +528,24 @@ def _run_once(data, used_codes):
         chat.session.close()
 
 
+def run_mailshop(data):
+    try:
+        email, password, secret = parse_notes(data['notes'], data['email'])
+        api_key = data.get('mailshopRtApiKey')
+        if email.rpartition('@')[2].casefold() != 'gmx.com' or not isinstance(api_key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,256}', api_key):
+            raise ValueError('mailshop_input')
+    except (ValueError, KeyError, TypeError, AttributeError):
+        emit('error', code='mailshop_rt_unconfirmed', diagnostic={'reason': 'invalid_input'})
+        return
+    emit('step', step='mailshop_rt')
+    try:
+        token = fetch_rt(email, password, secret, api_key)
+    except MailshopError as error:
+        emit('error', code='mailshop_rt_unconfirmed', diagnostic=error.diagnostic)
+    else:
+        emit('mailshop_rt', refreshToken=token)
+
+
 def main():
     logging.disable(logging.CRITICAL)
     parent = os.getppid()
@@ -440,14 +562,12 @@ def main():
         data = json.loads(raw)
         # Vendored diagnostics must never share the structured protocol pipe.
         with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            if data.get('action') in {'cleanup_sessions', 'verify_sessions'}:
-                from sessions import SessionCleanupError, cleanup
-                try:
-                    cleanup(data, emit)
-                except SessionCleanupError as exc:
-                    emit('error', code='sessions', diagnostic={'stage': 'other_sessions', 'reason': exc.reason, 'httpStatus': None})
-            else:
-                run(data)
+            if data.get('action') == 'mailshop_rt':
+                run_mailshop(data)
+                return
+            if data.get('action') is not None:
+                raise ValueError('protocol')
+            run(data)
     except ValueError as exc:
         code = str(exc)
         if code in {'credentials', 'authorization', 'workspace', 'proxy'}:

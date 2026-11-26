@@ -1,18 +1,48 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 
 const binary = process.argv[2] || fileURLToPath(new URL(`../backend/target/debug/reauth-manager${process.platform === 'win32' ? '.exe' : ''}`, import.meta.url))
+const releaseVersion = JSON.parse(readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version
 const python = process.env.RS_REAUTH_TEST_PYTHON || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
 const worker = fileURLToPath(new URL('./fake-worker.py', import.meta.url))
+const personalImportConcurrency = 20
 const innerAuthorization = 'https://auth.openai.com/oauth/authorize?' + new URLSearchParams({ response_type: 'code', client_id: 'fixture', redirect_uri: 'http://127.0.0.1:1455/auth/callback', state: 'fixture', code_challenge: 'a'.repeat(43), code_challenge_method: 'S256' })
 const nativeAuthorization = 'https://chatgpt.com/codex/desktop-auth?' + new URLSearchParams({ authorize_url: innerAuthorization, codex_streamlined_login: 'true', no_universal_links: '1' })
 const make = id => ({id,provider:'openai',name:`team+${id}@example.com+workspace3`,email:`${id}@example.com`,authenticationKind:'oauth',userId:'original-user',enabled:id!=='disabled',planType:'team',status:'error',notes:`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`,outboundProxyEndpoint:'http://127.0.0.1:21001',accountId:'original-workspace',groups:[{id:'g1',name:'Team'}],weight:3,concurrencyLimit:null,modelAccess:{mode:'all'},hasRefreshToken:true,capacity:{usedSlots:0},errorReason:null})
 const accounts=[],records=new Map(),handles=new Map(),credentials=new Map(),revisions=new Map(),nativeMaterials=new Map()
-const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[]
-const importFlows=new Map()
-let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null
+const starts=[],completes=[],refreshes=[],metadataSaves=[],controls=[],deleted=[],groupMoves=[]
+const teamScheduleWrites=[]
+const nativeRefreshGroupMoves=[]
+const rtReplacements=[]
+const rtDiagnosticReplies=new Map([
+ ['replace_diag_401',{status:502,code:50201,diagnostic:{upstreamStatus:401,upstreamCode:'invalid_grant',message:'fixture-echoed-secret'}}],
+ ['replace_diag_403',{status:502,code:50201,diagnostic:{upstreamStatus:403,upstreamCode:'fixture-echoed-secret'}}],
+ ['replace_diag_old',{status:502,code:50201,message:'令牌刷新被拒绝，请检查账号授权'}],
+ ['replace_diag_conflict',{status:409,code:40901}],
+ ['replace_diag_invalid_status',{status:502,code:50201,diagnostic:{upstreamStatus:999,upstreamCode:'invalid_grant'}}],
+ ['replace_diag_bad_reply',{status:502,code:50201,raw:'<html>fixture-echoed-secret</html>'}],
+])
+const postReplacementCredentialReads=[]
+const recoveryRecords = new Map()
+let groupMode='normal'
+function updateImportDetails(data) {
+   const a=accounts.find(a=>a.id===data.accountId)
+   assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
+   assert.ok(data.name===a.name||data.name===a.email)
+   if(data.manualStartsAt!=null){assert.equal(Date.parse(data.manualExpiresAt)-Date.parse(data.manualStartsAt),30*86400000);assert.ok(Number.isFinite(Date.parse(data.manualStartsAt)))}
+   if(a.planType==='self_serve_business_prolite'){assert.equal(data.supplier,'shannian');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,20)}
+   else if(['team','business'].includes(a.planType))assert.equal(data.supplier,a.supplier||'AI_change_future')
+   if(a.planType!=='self_serve_business_prolite')assert.deepEqual(data.groupIds,a.groups.map(g=>g.id))
+   if(a.planType==='self_serve_business_prolite'){a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':'Custom',enabled:true}));groupMoves.push(a.id)}
+   for(const key of ['name','notes','enabled','concurrencyLimit','weight','modelAccess','supplier','manualStartsAt','manualExpiresAt'])if(data[key]!==undefined&&data[key]!==null)a[key]=data[key]
+   return {accountId:a.id,configRevision:1}
+}
+const importFlows=new Map(), providedImports=[], startReceipts=new Map(), startRequests=[], importOperations=new Map()
+const providedBatchIds=new Map(), proProofBatchIds=new Map(), proBatchOrdinals=new Map(), importWeightProofs=new Map()
+let child,buffer,pending,ready,sequence=99,errors='',directoryGate=null,protectedGate=null
 const AUTH='https://api.openai.com/auth'
 const jwt = p => 'fixture.'+Buffer.from(JSON.stringify(p)).toString('base64url')+'.signature'
 function credential(a,workspace=a.accountId,plan=a.planType) {
@@ -35,9 +65,12 @@ function send(meta, payload = Buffer.alloc(0)) {
 }
 const result = (id, value = {}, payload) => send({ type: 'result', id, result: value }, payload)
 async function callback(meta,payload) {
- const data=payload.length?JSON.parse(payload.toString()):meta.params
+ let data=payload.length?JSON.parse(payload.toString()):meta.params
  if(meta.method==='host.auth.get_runtime')return result(meta.id,{}, {account_id:data.account_id,provider_id:'openai',credential_revision:revisions.get(data.account_id),credential_state:accounts.find(a=>a.id===data.account_id)?.runtimeCredentialState||'ready'})
- if(meta.method==='host.auth.get')return result(meta.id,{},credentials.get(data.account_id))
+ if(meta.method==='host.auth.get'){
+  if(rtReplacements.includes(data.account_id))postReplacementCredentialReads.push(data.account_id)
+  return result(meta.id,{},credentials.get(data.account_id))
+ }
  if(meta.method==='host.auth.save') {
   const a=accounts.find(a=>a.id===data.account_id),old=credentials.get(a.id)
   assert.equal(a.enabled,false);assert.equal(data.credential_revision,revisions.get(a.id));assert.equal(data.action,'replace')
@@ -53,15 +86,115 @@ async function callback(meta,payload) {
  if(meta.method==='host.state.put') {
   const old=records.get(data.key);assert.equal(data.expected_version,old?.version??null)
   const raw=JSON.stringify(data.value)
-  for(const secret of ['fixture-password','fixture:pass','secret-code','access_token','refresh_token','id_token','fixture-cookie','fixture-current-session','59859b73-b63b-45f4-86f9-e728a9512905'])assert.ok(!raw.includes(secret),'Private material must not enter job state')
+  assert.ok(Buffer.byteLength(raw)<=256*1024,'Every stored record must fit the real SDK state budget')
+  for(const secret of ['fixture-password','fixture:pass','secret-code','access_token','"refresh_token"','id_token','fixture-cookie','fixture-admin-key','fixture-provided-rt','fixture-mailshop-rt','fixture-mailshop-key','fixture-current-session','fixture-echoed-secret','59859b73-b63b-45f4-86f9-e728a9512905'])assert.ok(!raw.includes(secret),'Private material must not enter job state')
   const version=(old?.version||0)+1;records.set(data.key,{value:structuredClone(data.value),version,schema_version:1});return result(meta.id,{version})
  }
+ if(meta.method==='host.http.do_stream') {
+  const url=new URL(meta.params.url);assert.equal(url.origin,'http://127.0.0.1:18139')
+  assert.ok(meta.params.headers.some(([name,value])=>name==='x-api-key'&&Buffer.from(value).toString()==='fixture-admin-key'))
+  let reply,protectedStatus=200,diagnostic
+  if(url.pathname==='/_management/import-operation') {
+   const id=data.request.data.email.split('@')[0],previous=importOperations.get(data.requestId)
+   if(id==='rt_budget_delay' && (!previous || previous.remaining>0)) {
+    importOperations.set(data.requestId,{remaining:(previous?.remaining??3)-1})
+    const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:200,data:{pending:true}})))
+    return result(meta.id,{status:202,http_version:'HTTP/1.1',headers:[],stream,trailers:[]})
+   }
+   assert.match(data.request.batchId,/^[0-9a-f-]{36}$/)
+   providedBatchIds.set(id,data.request.batchId)
+   data=data.request;url.pathname='/api/admin/accounts/import'
+  }
+  if(url.pathname==='/_management/onboarding/start') {
+   const id=data.email.split('@')[0],retry=id==='new_retry_after_failure'
+   const flowId='import_'+id+(retry?'_'+data.requestId:'')
+   const previous=retry&&startRequests.findLast(start=>start.email===data.email)
+   startRequests.push({...data})
+   if(startReceipts.has(data.requestId))reply=startReceipts.get(data.requestId)
+   else {
+    if(previous)assert.equal(data.previousFailedRequestId,previous.requestId)
+    importFlows.set(flowId,id);starts.push({protected:true,email:data.email});reply={flowId,authorizationUrl:nativeAuthorization,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001',expiresAt:new Date(Date.now()+900000).toISOString()}
+    startReceipts.set(data.requestId,reply)
+   }
+  } else if(url.pathname==='/api/admin/accounts/import') {
+   const id=data.data.email.split('@')[0];providedImports.push(id);assert.equal(data.settings.notes.split('----').length,id.includes('mailbox')?4:3);assert.equal(data.settings.enabled,false)
+   assert.equal(data.data.refreshToken,'fixture-provided-rt')
+   if(id.startsWith('rt_fallback_')) {
+    const reason=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'][Number(id.slice('rt_fallback_'.length))]
+    protectedStatus=reason==='network'?502:422
+    diagnostic={code:reason==='network'?'rt_transport_unconfirmed':reason==='identity'?'identity_mismatch':'rt_rejected',upstreamStatus:400,reason}
+    reply=null
+   } else {
+   const a=add(id);Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:[],planType:(id.startsWith('up_')||id.startsWith('unbound_'))?'free':id.startsWith('rt_business')?'business':'team'})
+   if(id.includes('prolite'))a.planType='prolite'
+   if(id.includes('business_sku'))a.planType='self_serve_business_prolite'
+   if(/^(rt|new|legacy)_profile_pro(?:_|$)/.test(id))a.planType='pro'
+   if(id==='rt_profile_plus')a.planType='plus'
+   a.concurrencyLimit=data.settings.concurrencyLimit;a.weight=data.settings.weight
+   credentials.set(id,credential(a));
+   if(id.startsWith('unbound_')) {
+    a.accountId=null;const c=credentials.get(id);c.facts.upstream_account_id=null
+    for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
+   }
+   reply={accountIds:[id]};if(id==='rt_lost_batch')protectedStatus=503
+   }
+  } else if(url.pathname==='/_management/onboarding/ipv6-check') {
+   const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);assert.equal(data.credentialRevision,revisions.get(a.id))
+   reply={accountId:a.id,credentialRevision:revisions.get(a.id),independentIPv6:!a.id.includes('shared')}
+   if(a.planType==='pro') {
+    assert.match(data.batchId,/^[0-9a-f-]{36}$/)
+    if(providedBatchIds.has(a.id))assert.equal(data.batchId,providedBatchIds.get(a.id))
+    proProofBatchIds.set(a.id,data.batchId)
+   } else assert.equal(data.batchId,undefined)
+   if(['pro','prolite'].includes(a.planType)) {
+    let ordinal=a.id.includes('daily_weight')?2:1
+    if(a.planType==='pro'&&a.id.includes('_weight_batch_')) {
+     if(!proBatchOrdinals.has(data.batchId))proBatchOrdinals.set(data.batchId,proBatchOrdinals.size+1)
+     ordinal=proBatchOrdinals.get(data.batchId)
+    }
+    const start=a.planType==='prolite'?100:50
+    reply.importWeight={weight:start+1-ordinal,ordinal,timezone:'Asia/Shanghai',sequence:a.planType,start}
+    if(a.planType==='pro')reply.importWeight.batchId=a.id.endsWith('_mismatch')?randomUUID():data.batchId
+    importWeightProofs.set(a.id,reply.importWeight)
+   }
+   if(a.id.includes('proof_unavailable'))protectedStatus=409
+  } else if(url.pathname==='/api/admin/accounts/update') {
+   reply=updateImportDetails(data)
+  } else if(url.pathname==='/api/admin/accounts/batch-update') {
+   const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0)
+   if(data.concurrencyLimit!==undefined){assert.equal(a.enabled,false);assert.ok(['pro','prolite','self_serve_business_prolite'].includes(a.planType));assert.equal(data.concurrencyLimit,a.planType==='self_serve_business_prolite'?10:personalImportConcurrency);assert.equal(data.weight,a.planType==='self_serve_business_prolite'?20:importWeightProofs.get(a.id).weight);assert.deepEqual(data.groupIds,['gpt-pro']);a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];if(a.id.includes('group_readback_wrong'))a.groups=[];if(a.id.includes('group_disabled_readback'))a.groups[0].enabled=false;a.concurrencyLimit=data.concurrencyLimit;a.weight=data.weight;if(a.id.includes('readback_wrong'))a.weight=data.weight+1;if(a.id.includes('write_lost'))protectedStatus=503}
+   else {a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled'}
+   reply={}
+  } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
+   const id=importFlows.get(data.flowId);assert.ok(id);const a=add(id)
+   Object.assign(a,{enabled:false,status:'disabled',notes:data.settings.notes,groups:data.settings.groupIds.map(id=>({id,name:'Team',enabled:true})),concurrencyLimit:data.settings.concurrencyLimit,weight:1,modelAccess:data.settings.modelAccess})
+   if(id==='new_import_free_ui'||id==='legacy_free_auto')a.planType='free'
+   if(id.includes('prolite'))a.planType='prolite'
+   if(id.includes('business_sku'))a.planType='self_serve_business_prolite'
+   if(/^(rt|new|legacy)_profile_pro(?:_|$)/.test(id))a.planType='pro'
+   const saved=credential(a)
+   if(['new_callback_conflicting_tokens','new_wrong_user'].includes(id)) {
+    const claims=JSON.parse(Buffer.from(saved.facts.material.access_token.split('.')[1],'base64url'))
+    if(id==='new_wrong_user')claims[AUTH].chatgpt_user_id='wrong-user'
+    else claims[AUTH].chatgpt_account_id='conflicting-workspace'
+    saved.facts.material.access_token=jwt(claims)
+   }
+   if(id==='new_missing_rt')saved.facts.material.refresh_token=''
+   credentials.set(a.id,saved);completes.push({protected:true,flowId:data.flowId});reply={accountId:id}
+  } else throw Error('Unexpected protected route '+url.pathname)
+  if(protectedGate?.path===url.pathname){protectedGate.reached.resolve();await protectedGate.release.promise}
+  const stream=randomUUID();handles.set(stream,Buffer.from(JSON.stringify({code:diagnostic?protectedStatus:200,data:reply,diagnostic})))
+  return result(meta.id,{status:protectedStatus,http_version:'HTTP/1.1',headers:[],stream,trailers:[]})
+ }
+ if(meta.method==='host.http.stream_read'){const v=handles.get(meta.params.stream);if(v){handles.delete(meta.params.stream);return result(meta.id,{eof:false,trailers:[]},v)}return result(meta.id,{eof:true,trailers:[]})}
+ if(meta.method==='host.http.stream_close')return result(meta.id)
  if(meta.method==='host.http.dispatch') {
-  const url=new URL(meta.params.uri,'http://mock.invalid');let dataReply,status=200,code=200
+  const url=new URL(meta.params.uri,'http://mock.invalid');let dataReply,message,diagnostic,raw,status=200,code=200
   if(url.pathname==='/api/admin/accounts/oauth/start'&&!data.accountId){
    assert.deepEqual(Object.keys(data).sort(),['name','outboundProxyUrl','provider'])
    assert.equal(data.outboundProxyUrl,'http://fixture:pass@127.0.0.1:21001')
-   const id=data.name.slice('team+'.length).split('@')[0],flowId='import_'+id
+   assert.match(data.name,/^[^@]+@example\.com$/);assert.ok(!data.name.startsWith('team+'))
+   const id=data.name.split('@')[0],flowId='import_'+id
    importFlows.set(flowId,id);starts.push(structuredClone(data));dataReply={flowId,authorizationUrl:nativeAuthorization};status=201
   }else if(url.pathname==='/api/admin/accounts/oauth/complete'&&data.settings){
    assert.deepEqual(Object.keys(data).sort(),['callbackUrl','flowId','provider','settings'])
@@ -72,29 +205,110 @@ async function callback(meta,payload) {
    if(id==='new_wrong_user'){const c=credentials.get(a.id),p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'));p[AUTH].chatgpt_user_id='wrong-user';c.facts.material.access_token=jwt(p)}
    if(id==='new_missing_rt')credentials.get(a.id).facts.material.refresh_token=''
    dataReply={accountId:a.id}
+  }else if(url.pathname==='/api/admin/account-groups/options'){
+   let items=groupMode==='missing'?[]:[{id:'gpt-pro',name:'GPT Pro',enabled:groupMode!=='disabled'}]
+   if(groupMode!=='wait_missing')items.push({id:'free-wait',name:'Free Wait',enabled:groupMode!=='wait_disabled'})
+   if(groupMode==='wait_duplicate')items.push({id:'duplicate-wait',name:'Free Wait',enabled:true})
+   if(groupMode==='duplicate')items.push({id:'duplicate-pro',name:'GPT Pro',enabled:true})
+   dataReply={items,page:{total:items.length}}
   }else if(url.pathname==='/api/admin/accounts'){if(directoryGate)await directoryGate.promise;dataReply={items:accounts}}
-  else if(url.pathname==='/api/admin/accounts/detail')dataReply={account:accounts.find(a=>a.id===url.searchParams.get('accountId')),credentialConfiguration:{transport:'http'}}
+  else if(url.pathname==='/api/admin/usage/records') {
+   assert.equal(url.searchParams.get('status'),'success');assert.equal(url.searchParams.get('provider'),'openai')
+   assert.equal(url.searchParams.get('pageSize'),'20')
+   const a=accounts.find(a=>a.name===url.searchParams.get('accountName'))
+   dataReply={items:recoveryRecords.get(a?.id)||[]}
+  }
+  else if(url.pathname==='/api/admin/accounts/detail') {
+   const a=accounts.find(a=>a.id===url.searchParams.get('accountId'))
+   if(a.id.startsWith('up_projection_')&&nativeMaterials.has(a.id)) {
+    a.planType='team'
+    if(a.id==='up_projection_control')a.weight=99
+   }
+   dataReply={account:a,credentialConfiguration:{transport:'http'}}
+  }
   else if(url.pathname==='/api/admin/accounts/export') {
    assert.equal(url.searchParams.get('confirm'),'export_sensitive_accounts');const id=url.searchParams.get('accountIds');assert.ok(!id.includes(','))
    dataReply={documents:[{provider:'openai',document:{accounts:[{id,outboundProxyUrl:'http://fixture:pass@127.0.0.1:21001'+(id.startsWith('new_')?'/':'')}]}}]}
+  } else if(url.pathname==='/api/admin/accounts/oauth/replace-rt') {
+   const account=accounts.find(account=>account.id===data.accountId)
+   const mailshop=account.id.startsWith('mailshop_')
+   const options=mailshop?['allowWorkspaceAndPlanChange']:['allowAnyStatus','allowPlanMismatch','allowWorkspaceAndPlanChange']
+   assert.deepEqual(Object.keys(data).sort(),['accountId',...options,'expectedCredentialRevision','refreshToken'])
+   for(const option of options)assert.equal(data[option],true)
+   if(mailshop)assert.equal(account.status,'error')
+   assert.equal(account.capacity.usedSlots,0)
+   assert.equal(data.expectedCredentialRevision,revisions.get(account.id))
+   assert.equal(data.refreshToken,mailshop?'fixture-mailshop-rt':'fixture-provided-rt');rtReplacements.push(account.id)
+   if(rtDiagnosticReplies.has(account.id)){
+    ({status,code,diagnostic,raw,message='fixture-echoed-secret'}=rtDiagnosticReplies.get(account.id))
+    dataReply=null
+   }else if(account.id.endsWith('_reject')){status=422;code=42201}
+   else {
+     if(account.id==='mailshop_profile'||account.id.startsWith('mailshop_free_upgrade')){account.planType=account.id==='mailshop_free_upgrade_team_busy'?'team':'plus';account.accountId='new-workspace'}
+    if(account.id.startsWith('replace_workspace_')){account.accountId='new-workspace';account.planType='plus'}
+    const revision=revisions.get(account.id)+1
+    const plan=['replace_pro_five','team_schedule_mismatched_rt','replace_workspace_unconfirmed'].includes(account.id)?'free':account.planType
+    revisions.set(account.id,revision);credentials.set(account.id,credential(account,account.accountId,plan))
+    credentials.get(account.id).facts.material.refresh_token='fixture-rotated-rt'
+    if(account.status==='error'&&!account.id.endsWith('_error_stays'))account.status=account.enabled?'normal':'disabled'
+     if(['mailshop_free_upgrade_busy','mailshop_free_upgrade_team_busy'].includes(account.id))account.capacity.usedSlots=1
+    if(account.id==='mailshop_missing_saved_rt')account.hasRefreshToken=false
+    dataReply={accountId:account.id,credentialRevision:revision}
+   }
   } else if(url.pathname==='/api/admin/accounts/oauth/start') {
    assert.deepEqual(Object.keys(data).sort(),['accountId','name','provider']);starts.push(structuredClone(data));dataReply={flowId:`flow_${data.accountId}`,authorizationUrl:nativeAuthorization};status=201
-  } else if(url.pathname==='/api/admin/accounts/batch-update') {
+  } else if(url.pathname==='/api/admin/accounts/groups/move-after-refresh') {
+   nativeRefreshGroupMoves.push(data)
+   dataReply={moved:false}
+  } else if(url.pathname==='/api/admin/accounts/update') {
+   dataReply=updateImportDetails(data)
+   const a=accounts.find(a=>a.id===data.accountId)
+   if(a.id==='business_sku_update_lost'){status=503;code=50301}
+   if(a.id==='business_sku_supplier_wrong')a.supplier='unexpected supplier'
+  } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.groupIds) {
+   assert.deepEqual(Object.keys(data).sort(),data.concurrencyLimit===undefined?['accountIds','groupIds']:['accountIds','concurrencyLimit','groupIds','weight']);assert.equal(data.accountIds.length,1);assert.equal(new Set(data.groupIds).size,data.groupIds.length)
+   const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.enabled,a.id.startsWith('mailshop_free_upgrade'))
+    const moveWithActiveRequest=['mailshop_free_upgrade_busy','mailshop_free_upgrade_team_busy','current_profile_busy'].includes(a.id)
+   assert.equal(a.capacity.usedSlots,Number(moveWithActiveRequest))
+   if(moveWithActiveRequest)assert.deepEqual(data.groupIds,['gpt-pro'])
+   if(data.concurrencyLimit!==undefined){assert.equal(a.planType,'self_serve_business_prolite');assert.equal(data.concurrencyLimit,10);assert.equal(data.weight,20);a.concurrencyLimit=10;a.weight=20}
+   a.groups=data.groupIds.map(id=>({id,name:id==='gpt-pro'?'GPT Pro':id==='free-wait'?'Free Wait':'Custom',enabled:true}));groupMoves.push(a.id);dataReply={}
+   if(a.id==='group_lost'||a.id==='fb_wait_lost'){status=503;code=50301}
+   if(a.id==='group_revision_race'||a.id==='fb_wait_revision_race')revisions.set(a.id,revisions.get(a.id)+1)
+   } else if(url.pathname==='/api/admin/accounts/batch-update'&&data.concurrencyLimit!==undefined) {
+    assert.deepEqual(Object.keys(data).sort(),['accountIds','concurrencyLimit','weight']);assert.equal(data.accountIds.length,1)
+    const account=accounts.find(row=>row.id===data.accountIds[0]);assert.equal(account.planType,'team')
+    assert.deepEqual([data.concurrencyLimit,data.weight],[5,1]);teamScheduleWrites.push(account.id)
+    account.concurrencyLimit=data.concurrencyLimit;account.weight=data.weight
+    dataReply={accountIds:[account.id],configRevision:1}
+    if(account.id==='team_schedule_write_lost'){status=503;code=50301}
+    if(account.id==='team_schedule_wrong_readback')account.weight=2
+   } else if(url.pathname==='/api/admin/accounts/batch-update') {
    assert.deepEqual(Object.keys(data).sort(),['accountIds','enabled']);assert.equal(data.accountIds.length,1)
    const a=accounts.find(a=>a.id===data.accountIds[0]);assert.equal(a.capacity.usedSlots,0);controls.push([a.id,data.enabled])
    a.enabled=data.enabled;a.status=data.enabled?'normal':'disabled';dataReply={}
    if(a.id==='pause_race'&&!data.enabled)revisions.set(a.id,revisions.get(a.id)+1)
    if(a.id==='resume_lost'&&data.enabled){status=503;code=50301}
   } else if(url.pathname==='/api/admin/accounts/oauth/complete') {
-   assert.deepEqual(Object.keys(data).sort(),['callbackUrl','flowId','provider'])
    const a=accounts.find(a=>`flow_${a.id}`===data.flowId);assert.equal(a.enabled,false);assert.equal(a.capacity.usedSlots,0)
+   assert.deepEqual(Object.keys(data).sort(),data.expectedIdentityRevision===undefined?['callbackUrl','flowId','provider']:['callbackUrl','expectedIdentityRevision','flowId','provider'])
+   if(data.expectedIdentityRevision!==undefined)assert.equal(data.expectedIdentityRevision,revisions.get(a.id))
+   if(a.id.startsWith('current_profile_'))assert.equal(data.expectedIdentityRevision,revisions.get(a.id))
    assert.equal(data.callbackUrl,'http://127.0.0.1:1455/auth/callback?state=fixture&code=secret-code');completes.push(structuredClone(data))
    if(a.id==='native_503'||a.id==='auto_native_503'){status=503;code=50301;dataReply=null}
    else {
     let workspace=a.accountId,plan=a.planType
-    if(a.id.startsWith('fb_')||a.id==='free_fallback_no_candidates'){workspace='personal-workspace';plan='free'}
-    if(a.id.startsWith('up_')){workspace='team-workspace';plan='team'}
+    if(a.id.startsWith('fb_')||a.id.startsWith('auto_fb_')||a.id==='free_fallback_no_candidates'){workspace='personal-workspace';plan='free'}
+    if(a.id.startsWith('up_')||a.id.startsWith('auto_up_')){workspace='team-workspace';plan='team'}
+    if(a.id.startsWith('unbound_')){workspace=a.id.includes('personal')?'personal-workspace':'team-workspace';plan=a.id.includes('personal')?'free':'team'}
     if(a.id.startsWith('force_')){workspace='alternate-workspace';plan='plus'}
+    if(a.id.includes('business_sku')&&!a.id.startsWith('fb_'))plan='self_serve_business_prolite'
+    if(a.id.startsWith('current_profile_')) {
+     if(a.id!=='current_profile_plan')workspace='new-workspace'
+     if(a.id!=='current_profile_workspace')plan='plus'
+     a.accountId=workspace;a.planType=plan
+    }
+     if(a.id==='team_schedule_pro_switch'){plan='team';workspace='new-team-workspace';a.planType=plan;a.accountId=workspace}
     const c=credential(a,workspace,plan);c.facts.material.principal=credentials.get(a.id).facts.material.principal;const p=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'))
     if(a.id.includes('wrong_user'))p[AUTH].chatgpt_user_id='wrong-user'
     if(a.id.includes('wrong_workspace'))p[AUTH].chatgpt_account_id='other-workspace'
@@ -105,11 +319,22 @@ async function callback(meta,payload) {
     c.facts.material.access_token=c.facts.material.id_token=jwt(p);c.facts.material.refresh_token=a.id==='missing_rt'?'':'native-issued-private-rt'
     const rev=revisions.get(a.id)+1;revisions.set(a.id,rev);c.credential_revision=rev;credentials.set(a.id,c);nativeMaterials.set(a.id,structuredClone(c.facts.material));a.status='disabled'
     a.runtimeCredentialState='ready';a.errorReason=null
+    if(a.id==='current_profile_busy')a.capacity.usedSlots=1
     dataReply={accountId:a.id};status=201
    }
   } else if(url.pathname==='/api/admin/accounts/refresh') {
    assert.deepEqual(Object.keys(data),['accountId']);const a=accounts.find(a=>a.id===data.accountId);assert.equal(a.enabled,false);refreshes.push(a.id)
+   const attempt = refreshes.filter(id => id === a.id).length
    if(a.id==='refresh_503'){status=503;code=50301;dataReply=null}
+   else if(a.id==='refresh_other_409'){status=409;code=40901;message='凭据已更新，请刷新账号列表';dataReply=null}
+   else if(a.id==='refresh_lease_exhausted'||(attempt===1&&['refresh_lease_recovers','refresh_lease_revision_changed'].includes(a.id))){
+    status=409;code=40901;message='令牌刷新繁忙，请稍后重试';dataReply=null
+    if(a.id==='refresh_lease_revision_changed'){
+     const revision=revisions.get(a.id)+1
+     revisions.set(a.id,revision)
+     credentials.get(a.id).credential_revision=revision
+    }
+   }
    else {
     const c=credentials.get(a.id),rev=revisions.get(a.id)+1;c.credential_revision=rev;revisions.set(a.id,rev)
     c.facts.material.refresh_token='native-refreshed-private-rt'
@@ -119,7 +344,7 @@ async function callback(meta,payload) {
   } else if(url.pathname==='/api/admin/accounts/delete') {
    deleted.push(...data.accountIds);for(const id of data.accountIds){const i=accounts.findIndex(a=>a.id===id);if(i>=0)accounts.splice(i,1)}dataReply={accountIds:data.accountIds,deletedCount:data.accountIds.length}
   } else throw Error('Unexpected native route '+url.pathname)
-  const handle=randomUUID();handles.set(handle,Buffer.from(JSON.stringify({code,message:code===200?'ok':'private-upstream-response',data:dataReply})))
+  const handle=randomUUID();handles.set(handle,Buffer.from(raw??JSON.stringify({code,message:message??(code===200?'ok':'private-upstream-response'),data:dataReply,diagnostic})))
   return result(meta.id,{status,version:'HTTP/1.1',headers:[],body:{kind:'handle',handle},response:null,session:false})
  }
  if(meta.method==='host.http.body_read'){const v=handles.get(meta.params.handle);if(v){handles.delete(meta.params.handle);return result(meta.id,{eof:false,trailers:null},v)}return result(meta.id,{eof:true,trailers:null})}
@@ -139,9 +364,11 @@ function parse() {
       else if (meta.type === 'result') meta.result = data
     }
     payload = payload.subarray(requestBytes + dataBytes)
-    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 4); ready.resolve() }
+    if (meta.type === 'ready') { assert.equal(meta.protocol_version, 7); assert.equal(meta.call_budgets?.maintenance, undefined); ready.resolve() }
+    else if (meta.type === 'resume') send({type:'resumed',id:meta.id,epoch:meta.epoch})
+    else if (meta.type === 'suspend' || meta.type === 'callback_consumed') {}
     else if (meta.type === 'callback') callback(meta, payload).catch(e => { ready.reject(e); for (const w of pending.values()) w.reject(e) })
-    else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result') w.resolve({ result: meta.result, payload }); else w.reject(new Error(JSON.stringify(meta.error))) } }
+    else { const w = pending.get(meta.id); if (w) { pending.delete(meta.id); if (meta.type === 'result' || meta.type === 'cancelled') w.resolve({ result: meta.result, payload, cancelled:meta.type==='cancelled' }); else w.reject(new Error(JSON.stringify(meta.error))) } }
   }
 }
 async function start() {
@@ -150,38 +377,724 @@ async function start() {
   child.stdout.on('data', data => { buffer = Buffer.concat([buffer, data]); parse() }); child.stderr.on('data', data => errors += data)
   child.on('error', e => ready.reject(e))
   child.on('exit', code => { if (code) { const e = new Error(`Plugin exit ${code}: ${errors}`); ready.reject(e); for (const w of pending.values()) w.reject(e) } })
-  send({ type: 'hello', handshake: { protocol_version: 4, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration: {}, contributes: { management: { id: 'personal.reauth-manager.management', version: 2, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
+  const configuration={protectedManagementUrl:'http://127.0.0.1:18139'}
+  if(process.env.RS_REAUTH_TEST_CASE==='mailshop') {
+   configuration.mailshopRtApiKey='fixture-mailshop-key'
+   configuration.mailshopRtEmails=['success','paused','profile','free_upgrade','free_upgrade_busy','free_upgrade_team_busy','busy_before_rt','no_rt','missing_saved_rt','reject','race','limited','native_ok','legacy_failure'].map(suffix=>`mailshop_${suffix}@gmx.com`.toUpperCase())
+   configuration.mailshopRtEmails.push('MAILSHOP_OTHER_DOMAIN@GMX.US')
+  }
+  send({ type: 'hello', handshake: { protocol_version: 7, artifact_sha256: 'a'.repeat(64), plugin_id: 'personal.reauth-manager', instance_id: 'test_instance', generation: 1, incarnation: 'fixture', configuration, contributes: { management: { id: 'personal.reauth-manager.management', version: 2, stages: ['management'] }, maintenance: { id: 'personal.reauth-manager.maintenance', version: 1, stages: ['maintenance'] } } } })
   await ready.promise
 }
 async function stop() { const exited = new Promise(resolve => child.once('exit', resolve)); send({ type: 'shutdown' }); child.stdin.end(); await exited }
-async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'management') {
+async function call(method, params = {}, payload = Buffer.alloc(0), stage = 'management', budgetMs = 1000, waitMs = 10000) {
   const id = sequence += 2, w = Promise.withResolvers(); pending.set(id, w)
-  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: 60000, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
-  return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), 10000).unref())])
+  send({ type: 'call', id, method, params, context: { call_id: id, instance_id: 'test_instance', generation: 1, incarnation: 'fixture', stage, timeout_ms: budgetMs, resource_stream: false, resource_scope_id: `scope_${id}` } }, payload)
+  return Promise.race([w.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout ${method}`)), waitMs).unref())])
 }
-async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
-const submit = (ids, requestId = randomUUID()) => request('submit', { accountIds: ids, requestId })
-const tick = () => request('tick', {})
-const job = id => records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1)
+async function request(path, data) { const r = await call('management.handle', { method: data === undefined ? 'GET' : 'POST', path: `api/${path}`, query: '', content_type: data === undefined ? null : 'application/json', headers: [{name:'x-api-key',value:Array.from(Buffer.from('fixture-admin-key'))}] }, data === undefined ? Buffer.alloc(0) : data); return { status: r.result.status, value: JSON.parse(r.payload.toString()) } }
+const submit = async (ids, requestId = randomUUID()) => { const result = await request('submit', { accountIds: ids, requestId }); if (process.env.RS_REAUTH_TEST_CASE !== 'durable-batches') await tick(); return result }
+// Business progression belongs to host maintenance, never to a browser request.
+const tick = (budgetMs = 1000) => call('plugin.reconcile',{},Buffer.alloc(0),'maintenance',budgetMs,Math.max(10000,budgetMs))
+// Compact persisted jobs omit false defaults; expose the same decoded fields as api/jobs.
+const job = id => { const row = records.get('queue').value.jobs.filter(j => j.accountId === id).at(-1); return row && new Proxy(row, { get: (value, key) => value[key] ?? (['automatic','logoutOthers','cleanupStarted','freeFallback','newAccount'].includes(key) ? false : undefined) }) }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function finish(id) { for (let i = 0; i < 60; i++) { await tick(); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish: ' + JSON.stringify(job(id))) }
+async function finish(id, budgetMs) { for (let i = 0; i < 60; i++) { await tick(budgetMs); if (!['queued', 'running'].includes(job(id).status)) return job(id); await sleep(60) } throw new Error('Job did not finish: ' + JSON.stringify(job(id))) }
+async function reachProtectedCall(path) {
+ protectedGate={path,reached:Promise.withResolvers(),release:Promise.withResolvers()}
+ for(let attempt=0;attempt<60;attempt++) {
+  const pendingCall=tick(), callId=sequence
+  if(await Promise.race([protectedGate.reached.promise.then(()=>true),pendingCall.then(()=>false)]))return {pendingCall, callId}
+  await sleep(60)
+ }
+ throw new Error(`Maintenance did not reach protected fixture ${path}`)
+}
 let passed=0
 const check=name=>{passed++;console.log('PASS '+name)}
+async function verifyExpiredExistingBindings() {
+ for(const id of ['unbound_existing_team','unbound_existing_personal']) {
+  const a=add(id);a.enabled=false;a.planType='free';a.accountId=null;const c=credential(a)
+  for(const key of ['access_token','id_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;p[AUTH]={user_id:a.userId};c.facts.material[key]=jwt(p)}
+  credentials.set(id,c);const im=providedImports.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,!id.includes('personal'));assert.equal(providedImports.length,im)
+  check(id+': previously interrupted imports resume on their existing account without replaying RT or allocating another proxy')
+ }
+}
+async function verifyDurableBatches() {
+ const ids=Array.from({length:242},(_,i)=>`bulk${String(i).padStart(4,'0')}`);ids.forEach(add)
+ const requestId=randomUUID(), beforeStarts=starts.length
+ let result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(requestId+':')).length,242)
+ assert.equal(starts.length,beforeStarts);assert.equal(records.get('queue').value.pendingBatches[0].accountIds.length,242)
+ result=await submit(ids,requestId);assert.equal(result.status,200);assert.equal(records.get('queue').value.pendingBatches.length,1)
+ const saved=structuredClone(records.get('queue'))
+ assert.equal((await submit([ids[0],'independent'],randomUUID())).status,400);assert.deepEqual(records.get('queue'),saved)
+ check('All 242 selected accounts are durably queued in one atomic write; repeats and overlaps cannot duplicate any account')
+ await request('standby',{});await stop();await start();let all=(await request('jobs')).value.jobs
+ const restored=all.filter(j=>j.requestId.startsWith(requestId+':'))
+ assert.equal(restored.length,242);assert.ok(restored.every(j=>j.status==='queued'));assert.equal(starts.length,beforeStarts)
+ check('Restarting or closing the client preserves all 242 pending accounts without replaying authorization')
+ await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');let running=(await request('jobs')).value.jobs.filter(j=>j.status==='running');assert.equal(running.length,1);assert.equal(starts.length,beforeStarts+1)
+ for(let i=0;i<60&&['queued','running'].includes(job(ids[0]).status);i++){await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');await sleep(60)}
+ const first=job(ids[0]);assert.equal(first.status,'success',first.message);assert.equal(starts.length,beforeStarts+1)
+ all=(await request('jobs')).value.jobs;assert.equal(all.filter(j=>j.status==='queued').length,241)
+ check('The worker promotes only one pending account and completes native OAuth and refresh before starting another')
+ await request('cancel',{requestId:requestId+':'+ids[1]});assert.equal((await request('jobs')).value.jobs.find(j=>j.accountId===ids[1]).status,'cancelled')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)));assert.equal(starts.length,beforeStarts+1)
+ check('Cancelling one pending account or the remaining backlog never starts login for cancelled accounts')
+ const large=Array.from({length:1001},(_,i)=>`later${String(i).padStart(4,'0')}`), largeRequest=randomUUID()
+ result=await submit(large,largeRequest);assert.equal(result.status,200);assert.equal(result.value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ await request('standby',{});await stop();await start();assert.equal((await request('jobs')).value.jobs.filter(j=>j.requestId.startsWith(largeRequest+':')).length,1001)
+ assert.equal(starts.length,beforeStarts+1);assert.ok(Buffer.byteLength(JSON.stringify(records.get('queue').value))<=256*1024)
+ check('A 1001-account backlog has no 100/1000-count rejection and stays within the unchanged SDK storage budget')
+ await request('cancel',{requestId:null});assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)))
+ assert.equal(starts.length,beforeStarts+1)
+ check('Large cancellation also respects storage bounds, retains recent outcomes and leaves no pending logins')
+}
+async function verifyRtDiagnostics() {
+ const accountIds=[...rtDiagnosticReplies.keys()]
+ const originals=accountIds.map(id=>structuredClone(add(id)))
+ const counts=[starts.length,completes.length,providedImports.length]
+ const replacementsBefore=rtReplacements.length
+ const requestId=randomUUID()
+ const line=originals.map(account=>`${account.email}----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt`).join('\n')
+ const payload={requestId,line,groupIds:[]}
+ assert.equal((await request('import-line',payload)).status,200)
+ const jobs=()=>records.get('queue').value.jobs.filter(job=>job.requestId.startsWith(`${requestId}:import:`))
+ for(let attempt=0;attempt<accountIds.length+3&&jobs().some(job=>['queued','running'].includes(job.status));attempt++)await tick()
+ const readback=await request('jobs')
+ const finished=readback.value.jobs.filter(job=>job.requestId.startsWith(`${requestId}:import:`))
+ assert.deepEqual(finished.map(job=>[job.accountId,job.status]),accountIds.map(id=>[id,'review']))
+ const labels=[
+  /RS HTTP 502 \/ 50201；上游 HTTP 401 \/ invalid_grant/,
+  /RS HTTP 502 \/ 50201；上游 HTTP 403，无可记录的上游错误码/,
+  /RS HTTP 502 \/ 50201；RS 报告上游拒绝，未提供精确状态或错误码/,
+  /RS HTTP 409 \/ 40901/,
+  /RS HTTP 502 \/ 50201/,
+  /RS HTTP 502）/,
+ ]
+ for(const [index,job] of finished.entries()) {
+  assert.match(job.message,labels[index])
+  assert.match(job.message,/未自动重试或改用账密登录/)
+  assert.doesNotMatch(job.message,/fixture-echoed-secret|<html>/)
+  if(index>=2)assert.doesNotMatch(job.message,/上游 HTTP|invalid_grant/)
+  assert.equal(revisions.get(job.accountId),1)
+  assert.deepEqual(accounts.find(account=>account.id===job.accountId),originals[index])
+ }
+ assert.equal((await request('import-line',payload)).status,200)
+ await tick()
+ assert.deepEqual(rtReplacements.slice(replacementsBefore),accountIds)
+ assert.deepEqual([starts.length,completes.length,providedImports.length],counts)
+ for(const id of accountIds) accounts.splice(accounts.findIndex(account=>account.id===id),1)
+ check('Stored RT update receipts distinguish upstream 401/403, omit secrets and do not guess or replay')
+}
+
+async function verifyQueuedImports() {
+ const input = (id, hasRT = false) => `${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ${hasRT ? '----fixture-provided-rt' : ''}`
+ const readJobs = async () => (await request('jobs')).value.jobs
+ const counts = () => [starts.length, completes.length, providedImports.length, rtReplacements.length]
+ const initialStarts = starts.length
+ const first = add('queue_auth_first'), earlier = add('queue_auth_earlier'), cancelledAuth = add('queue_auth_cancelled'), later = add('queue_auth_later')
+ const firstRequest = randomUUID(), earlierRequest = randomUUID(), cancelledRequest = randomUUID(), laterRequest = randomUUID()
+ const manual = (account, requestId) => request('submit', {accountIds:[account.id], requestId})
+ for (const [account, requestId] of [[first,firstRequest],[earlier,earlierRequest],[cancelledAuth,cancelledRequest]]) {
+  assert.equal((await manual(account, requestId)).status,200)
+ }
+ await tick()
+ const running = (await readJobs()).find(row => row.accountId === first.id)
+ assert.equal(running.status,'running')
+ const before = counts()
+ const requestId = randomUUID(), otherId = randomUUID()
+ const batch = {requestId, line:[input('new_queue_first'),input('new_queue_cancelled')].join('\n'),groupIds:[]}
+ let response = await request('import-line',batch)
+ assert.equal(response.status,200,JSON.stringify(response.value))
+ assert.deepEqual(response.value.jobs.filter(row=>row.requestId.startsWith(requestId+':')).map(row=>row.status),['queued','queued'])
+ assert.equal((await request('import-line',batch)).status,200)
+ const beforeRejected = structuredClone(records.get('queue'))
+ response=await request('import-line',{requestId:randomUUID(),line:input('NEW_QUEUE_FIRST')+'\n'+input('never_added'),groupIds:[]})
+ assert.equal(response.status,400);assert.match(response.value.error.message,/已有导入排队/)
+ assert.deepEqual(records.get('queue'),beforeRejected)
+ assert.equal((await request('cancel',{requestId:cancelledRequest+':'+cancelledAuth.id})).status,200)
+ assert.equal((await request('cancel',{requestId:requestId+':import:2'})).status,200)
+ assert.equal((await manual(later,laterRequest)).status,200)
+ const legacy = {requestId:otherId,email:'new_queue_legacy@example.com',notes:input('new_queue_legacy'),groupIds:[]}
+ response=await request('import',legacy)
+ assert.equal(response.status,200);assert.equal(response.value.jobs.find(row=>row.requestId===otherId).status,'queued')
+ assert.deepEqual((await readJobs()).find(row=>row.requestId===running.requestId),running)
+ assert.deepEqual(counts(),before)
+ assert.equal((await request('standby',{})).status,400)
+ for(let attempt=0;attempt<70;attempt++) {
+  await tick()
+  if((await readJobs()).every(row=>!['running','queued'].includes(row.status)))break
+  await sleep(65)
+ }
+ const done = await readJobs()
+ assert.deepEqual([firstRequest+':'+first.id,earlierRequest+':'+earlier.id,requestId+':import:1',laterRequest+':'+later.id,otherId]
+  .map(id=>done.find(row=>row.requestId===id).status),Array(5).fill('success'))
+ assert.deepEqual(starts.slice(initialStarts).map(row=>row.accountId||row.email),[first.id,earlier.id,'new_queue_first@example.com',later.id,legacy.email])
+ assert.equal(done.find(row=>row.requestId===requestId+':import:2').status,'cancelled')
+ check('Busy worker and earlier auth batches continue in order; both import routes queue, deduplicate and cancel without premature OAuth')
+
+ const same = add('queue_same_account')
+ await submit([same.id])
+ assert.equal(job(same.id).status,'running')
+ const sameRequest = randomUUID(), replaces = rtReplacements.length
+ response=await request('import-line',{requestId:sameRequest,line:input(same.id,true),groupIds:[]})
+ assert.equal(response.status,200);assert.equal(response.value.jobs.find(row=>row.requestId===sameRequest+':import').status,'queued')
+ assert.equal((await finish(same.id)).status,'success')
+ await tick()
+ const stale=(await readJobs()).find(row=>row.requestId===sameRequest+':import')
+ assert.equal(stale.status,'review');assert.match(stale.message,/凭据版本已变化/);assert.equal(rtReplacements.length,replaces)
+ check('An RT update queued behind authorization cannot overwrite the newer credential revision')
+
+ const largeWorker=add('queue_large_worker');await submit([largeWorker.id]);assert.equal(job(largeWorker.id).status,'running')
+ const capacityStart=counts(), pendingIds=[]
+ const longRt = `fixture-${'x'.repeat(27000)}`
+ for(let batchIndex=0;batchIndex<4;batchIndex++) {
+  const requestId=randomUUID(), line=Array.from({length:16},(_,index)=>`${input(`queued_capacity_${batchIndex}_${index}`)}----${longRt}`).join('\n')
+  const accepted=await request('import-line',{requestId,line,groupIds:[]})
+  assert.equal(accepted.status,200,JSON.stringify(accepted.value))
+  pendingIds.push(requestId)
+ }
+ const overBudget={requestId:randomUUID(),line:Array.from({length:16},(_,index)=>`${input(`queued_over_${index}`)}----${longRt}`).join('\n'),groupIds:[]}
+ const fullState=structuredClone(records.get('queue'))
+ response=await request('import-line',overBudget)
+ assert.equal(response.status,400);assert.match(response.value.error.message,/队列容量/);assert.deepEqual(records.get('queue'),fullState)
+ assert.equal((await request('cancel',{requestId:pendingIds[0]+':import:1'})).status,200)
+ const many={requestId:randomUUID(),line:Array.from({length:210},(_,index)=>input(`queued_short_${index}`)).join('\n'),groupIds:[]}
+ assert.equal((await request('import-line',many)).status,200)
+ assert.equal(job(largeWorker.id).status,'running')
+ const stillQueued=(await readJobs()).filter(row=>row.status==='queued')
+ assert.equal(stillQueued.length,273)
+ assert.deepEqual(counts(),capacityStart)
+ await stop();records.get('executor').value.expires=0;await start();await tick()
+ const interrupted=(await readJobs()).filter(row=>row.requestId.startsWith(many.requestId+':'))
+ assert.equal(interrupted.length,210);assert.ok(interrupted.every(row=>row.status==='interrupted'))
+ assert.deepEqual(counts(),capacityStart)
+ check('Large concurrent batches never discard active rows; capacity failures are atomic and restart never replays pending inputs')
+}
 try {
  await start()
- const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,11)
+ {
+  const before=[starts.length,completes.length,refreshes.length,groupMoves.length]
+  assert.equal((await request('jobs')).value.automation.enabled,false)
+  await tick();await tick()
+  assert.deepEqual(nativeRefreshGroupMoves,[{provider:'openai',sourceGroup:'GPT Pro',targetGroup:'Free Wait',planType:'free'}])
+  assert.deepEqual([starts.length,completes.length,refreshes.length,groupMoves.length],before)
+  check('Native refresh group reconciliation is independent, bounded and never starts OAuth')
+ }
+ {
+  const id='rt_budget_delay',requestId=randomUUID()
+  await request('import-line',{requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]})
+  for(let i=0;i<3;i++) {
+   await tick();const row=(await request('jobs')).value.jobs.find(j=>j.requestId===requestId+':import')
+   assert.equal(row.status,'queued');assert.equal(row.step,'waiting_import');assert.equal(providedImports.filter(value=>value===id).length,0)
+  }
+  assert.equal((await finish(id)).status,'success');assert.equal(providedImports.filter(value=>value===id).length,1)
+  check('A long protected import is polled as one idempotent operation across maintenance calls and completes without replay')
+ }
+ if(process.env.RS_REAUTH_TEST_CASE==='mailshop') {
+   for(const [suffix,status,updates] of [['success','success',1],['paused','success',1],['profile','success',1],['free_upgrade','success',1],['free_upgrade_busy','success',1],['free_upgrade_team_busy','success',1],['busy_before_rt','review',0],['no_rt','review',0],['missing_saved_rt','review',1],['reject','review',1],['race','review',0],['limited','failed',0],['other_domain','failed',0],['unlisted','failed',0],['native_ok','success',0]]) {
+   const account=add(`mailshop_${suffix}`)
+    account.email=`${account.id}@${suffix==='other_domain'?'gmx.us':'gmx.com'}`
+   account.notes=`${account.email}----fixture-password----GEZDGNBVGY3TQOJQ`
+   account.enabled=suffix!=='paused'
+   if(suffix.startsWith('free_upgrade')){account.planType='free';account.groups=[{id:'free',name:'GPT Free',enabled:true}]}
+   credentials.set(account.id,credential(account))
+    const before=[rtReplacements.length,completes.length,refreshes.length,controls.length]
+    const beforeSchedules=teamScheduleWrites.length
+    const beforeStarts=starts.length
+   assert.equal((await submit([account.id])).status,200)
+    assert.equal(starts.length,beforeStarts+1,'A first attempt must start RS native OAuth')
+   if(suffix==='race'||suffix==='busy_before_rt') {
+    for(let index=0;index<40&&job(account.id).step!=='mailshop_rt';index++){await sleep(30);await tick()}
+    assert.equal(job(account.id).step,'mailshop_rt')
+    if(suffix==='race')revisions.set(account.id,2)
+    else account.capacity.usedSlots=1
+   }
+   const outcome=await finish(account.id)
+   assert.equal(outcome.status,status,outcome.message)
+   assert.equal(rtReplacements.length-before[0],updates)
+   assert.ok(!postReplacementCredentialReads.includes(account.id),'Mailshop RT writeback must not fetch native credentials a second time')
+   if(suffix==='no_rt') {
+    assert.match(outcome.message,/Mailshop 账号任务失败（HTTP 200）：邮箱验证码获取超时，未写回；未自动重试/)
+    assert.equal(account.status,'error')
+    assert.equal(revisions.get(account.id),1)
+   }
+   assert.equal(account.enabled,suffix!=='paused')
+   if(suffix==='profile'){assert.equal(account.planType,'plus');assert.equal(account.accountId,'new-workspace')}
+   if(suffix.startsWith('free_upgrade')) {
+     assert.equal(account.planType,suffix==='free_upgrade_team_busy'?'team':'plus')
+    assert.deepEqual(account.groups.map(group=>group.id),['gpt-pro'])
+     assert.equal(account.capacity.usedSlots,Number(suffix.endsWith('_busy')))
+    assert.match(outcome.message,/GPT Pro/)
+   }
+    const appliesTeamSchedule=status==='success'&&account.planType==='team'
+    assert.deepEqual(teamScheduleWrites.slice(beforeSchedules),appliesTeamSchedule?[account.id]:[])
+    assert.deepEqual([account.concurrencyLimit,account.weight],appliesTeamSchedule?[5,1]:[null,3])
+   if(suffix!=='native_ok')assert.deepEqual([completes.length,refreshes.length,controls.length],before.slice(1))
+   check(`GMX RT fallback: ${suffix}`)
+  }
+   {
+    const accountId='mailshop_no_rt', previousFinish=job(accountId).finishedAt
+    const requestId=randomUUID(), beforeStarts=starts.length, beforeWrites=rtReplacements.length
+    assert.equal((await submit([accountId],requestId)).status,200)
+    assert.equal(job(accountId).step,'mailshop_rt')
+    assert.equal(starts.length,beforeStarts,'Manual retry must not start RS native OAuth')
+    const outcome=await finish(accountId)
+    assert.equal(outcome.status,'review',outcome.message)
+    assert.equal(outcome.step,'mailshop_no_rt')
+    assert.ok(outcome.finishedAt>previousFinish)
+    assert.match(outcome.message,/Mailshop 账号任务失败/)
+    assert.equal(rtReplacements.length,beforeWrites)
+    assert.equal((await submit([accountId],requestId)).status,200)
+    assert.equal(job(accountId).finishedAt,outcome.finishedAt)
+    assert.equal(starts.length,beforeStarts)
+    check('A fresh manual retry goes directly to Mailshop, records the latest time and does not replay the same request ID')
+   }
+   {
+    const account=add('mailshop_legacy_failure')
+    account.email=`${account.id}@gmx.com`
+    account.notes=`${account.email}----fixture-password----GEZDGNBVGY3TQOJQ`
+    account.concurrencyLimit=50;account.weight=45
+    credentials.set(account.id,credential(account))
+    const finishedAt=Date.now()-3000
+    records.get('queue').value.jobs.push({requestId:`legacy:${account.id}`,accountId:account.id,status:'failed',step:'failed',message:'邮箱验证码验证：上游要求邮箱验证码，当前任务不支持人工补码续跑（HTTP 200）',startedAt:finishedAt-1000,finishedAt})
+    const beforeStarts=starts.length, beforeWrites=rtReplacements.length, beforeSchedules=teamScheduleWrites.length
+    await submit([account.id])
+    assert.equal(job(account.id).step,'mailshop_rt')
+    const outcome=await finish(account.id)
+    assert.equal(outcome.status,'success',outcome.message)
+    assert.equal(starts.length,beforeStarts)
+    assert.deepEqual(rtReplacements.slice(beforeWrites),[account.id])
+    assert.deepEqual(teamScheduleWrites.slice(beforeSchedules),[account.id])
+    assert.deepEqual([account.concurrencyLimit,account.weight],[5,1])
+    assert.equal(account.status,'normal')
+    check('A historical native failure goes directly to Mailshop and RS normalizes the verified Team schedule to 5/1')
+   }
+   for(const suffix of ['reject','limited','other_domain','unlisted']) {
+    const accountId=`mailshop_${suffix}`, beforeStarts=starts.length
+    await submit([accountId]);await finish(accountId)
+    assert.equal(starts.length,beforeStarts+1,`${suffix} must not use the direct retry route`)
+    check(`Direct Mailshop retry still excludes ${suffix}`)
+   }
+  for(const suffix of ['plan','workspace','both','busy','missing_group','wrong_subject','wrong_user','wrong_email']) {
+   const id=`current_profile_${suffix}`,account=add(id)
+   account.planType='free';account.groups=[{id:'free',name:'GPT Free',enabled:true}];credentials.set(id,credential(account))
+   const before=[completes.length,refreshes.length,rtReplacements.length,controls.length]
+   if(suffix==='missing_group')groupMode='missing'
+   await submit([id]);const outcome=await finish(id)
+   groupMode='normal'
+   const verified=!suffix.startsWith('wrong_')&&!['missing_group','busy'].includes(suffix)
+   assert.equal(outcome.status,verified?'success':'review',outcome.message)
+   assert.deepEqual([completes.length,refreshes.length,rtReplacements.length],[before[0]+1,before[1]+Number(verified),before[2]])
+   assert.equal(account.enabled,verified)
+   assert.deepEqual(account.groups.map(group=>group.id),[(verified&&suffix!=='workspace')||suffix==='busy'?'gpt-pro':'free'])
+   if(suffix==='busy') {
+    assert.equal(account.capacity.usedSlots,1)
+    assert.deepEqual(controls.slice(before[3]),[[id,false]])
+   }
+   assert.deepEqual([account.weight,account.concurrencyLimit],[3,null])
+   check(`Native reauthorization profile: ${suffix}`)
+  }
+  await stop()
+ } else if(process.env.RS_REAUTH_TEST_CASE==='new-import-retry') {
+  const importLine=(id,password='fixture-password')=>`${id}@example.com----${password}----GEZDGNBVGY3TQOJQ`
+  const runImport=async (line,requestId=randomUUID())=>{
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   for(let attempt=0;attempt<60;attempt++){
+    await tick();await sleep(60)
+    const row=records.get('queue').value.jobs.find(job=>job.requestId===requestId+':import')
+    if(!['queued','running'].includes(row.status))return row
+   }
+   assert.fail('Import did not finish')
+  }
+  for(const [id,status] of [['new_callback_no_picker','success'],['new_callback_conflicting_tokens','review'],['new_explicit_workspace_mismatch','review']]){
+   const outcome=await runImport(importLine(id))
+   assert.equal(outcome.status,status,outcome.message)
+   assert.equal(accounts.find(account=>account.id===id).enabled,status==='success')
+   assert.equal(refreshes.includes(id),status==='success')
+   check(id+': only validated native workspace and identity may enable the imported account')
+  }
+  const retried='new_retry_after_failure',firstId=randomUUID()
+  const rejected=await runImport(importLine(retried,'fixture-rejected'),firstId)
+  assert.equal(rejected.status,'failed',rejected.message)
+  assert.match(rejected.message,/新账号.*未提交 RS 原生授权/)
+  assert.equal(rejected.accountId,'')
+  const originalStart=startRequests.at(-1)
+  const before=[startRequests.length,completes.length]
+  assert.equal((await runImport(importLine(retried,'fixture-rejected'),firstId)).status,'failed')
+  assert.deepEqual([startRequests.length,completes.length],before)
+  const accepted=await runImport(importLine(retried))
+  assert.equal(accepted.status,'success',accepted.message)
+  assert.equal(startRequests.at(-1).previousFailedRequestId,originalStart.requestId)
+  assert.notEqual(startRequests.at(-1).requestId,originalStart.requestId)
+  assert.deepEqual([startRequests.length,completes.length],[before[0]+1,before[1]+1])
+  assert.equal(accounts.filter(account=>account.id===retried).length,1)
+  assert.equal((await request('import-line',{requestId:randomUUID(),line:importLine(retried),groupIds:[]})).status,400)
+  check('A failed pre-write login allows explicit resubmission without expiring or replaying the old flow')
+  await stop();console.log(`Verified ${passed} new-import workspace and retry scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='import-cancellation') {
+  for(const phase of ['start','complete','rt']) {
+   const id='new_cancel_'+phase,requestId=randomUUID(),path=phase==='start'?'/_management/onboarding/start':phase==='rt'?'/api/admin/accounts/import':'/api/admin/accounts/oauth/complete'
+   const line=id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(phase==='rt'?'----fixture-provided-rt':'')
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   const beforeBrowser=[starts.length,completes.length,providedImports.length]
+   assert.equal((await request('tick',{})).value.background,true)
+   assert.deepEqual([starts.length,completes.length,providedImports.length],beforeBrowser)
+   if(phase==='complete')await tick()
+   const {pendingCall:reconcile,callId}=await reachProtectedCall(path)
+   const browserTick=await request('tick',{})
+   assert.equal(browserTick.status,200);assert.equal(browserTick.value.background,true)
+   assert.equal((await request('tick',{unexpected:true})).status,400)
+   assert.equal(records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import').status,'running')
+   send({type:'cancel',id:callId});assert.equal((await reconcile).cancelled,true)
+   const counts=[starts.length,completes.length,providedImports.length,refreshes.length]
+   protectedGate.release.resolve();protectedGate=null;await sleep(60)
+   await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+   const done=(await request('jobs')).value.jobs.find(j=>j.requestId===requestId+':import')
+   assert.equal(done.status,'review','Cancelled parent calls must not leave a running job with no worker')
+   assert.ok(done.finishedAt);assert.match(done.message,/未确认|中断/)
+   assert.deepEqual([starts.length,completes.length,providedImports.length,refreshes.length],counts,'Uncertain native operations are never replayed')
+   if(phase!=='start')assert.equal(accounts.find(a=>a.id===id).enabled,false)
+   await tick();assert.deepEqual([starts.length,completes.length,providedImports.length,refreshes.length],counts)
+   check(phase+': cancellation settles orphaned intent and preserves native receipts, fixed exit and paused accounts without replay')
+   if(phase==='start') {
+    const originalNonce=done.importInfo.nativeStartId,beforeStarts=starts.length
+    assert.match(originalNonce,/^[0-9a-f-]{36}$/)
+    // Same persisted receipt survives a plugin restart and is recovered immediately.
+    await stop();records.get('executor').value.expires=0;await start()
+    const resumedId=randomUUID()
+    assert.equal((await request('import-line',{requestId:resumedId,line,groupIds:[]})).status,200)
+    for(let i=0;i<60;i++){await tick();await sleep(60);if(records.get('queue').value.jobs.find(j=>j.requestId===resumedId+':import').status==='success')break}
+    assert.equal(records.get('queue').value.jobs.find(j=>j.requestId===resumedId+':import').status,'success')
+    assert.equal(starts.length,beforeStarts,'Recovery must not reserve another flow or exit')
+    assert.equal(startRequests.at(-1).requestId,originalNonce)
+    check('Explicit three-field resubmission immediately recovers the exact unconsumed native start after restart without allocating or replaying complete')
+   }
+  }
+  {
+   const requestId=randomUUID(),ids=['new_cancel_batch','new_after_cancel'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ').join('\n')
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   const {pendingCall:reconcile,callId}=await reachProtectedCall('/_management/onboarding/start')
+   send({type:'cancel',id:callId});assert.equal((await reconcile).cancelled,true)
+   protectedGate.release.resolve();protectedGate=null;await sleep(60)
+   await tick();let all=(await request('jobs')).value.jobs
+   assert.equal(all.find(j=>j.requestId===requestId+':import:1').status,'review')
+   assert.equal(all.find(j=>j.requestId===requestId+':import:2').status,'queued')
+   for(let i=0;i<60;i++){await tick();await sleep(60);all=(await request('jobs')).value.jobs;if(all.find(j=>j.requestId===requestId+':import:2').status==='success')break}
+   assert.equal(all.find(j=>j.requestId===requestId+':import:2').status,'success')
+   assert.equal(starts.filter(s=>s.email===ids[0]+'@example.com').length,1)
+   assert.equal(accounts.find(a=>a.id===ids[1]).enabled,true)
+   check('The next queued import survives cancellation and completes once while the uncertain row remains in review')
+  }
+  await stop();console.log(`Verified ${passed} import cancellation scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='team-consistency') {
+  for(const id of ['up_projection_ok','up_projection_control','saved_team_ok','saved_team_projected','saved_team_expired','saved_team_wrong_user','saved_team_wrong_email','saved_team_wrong_subject','saved_team_wrong_workspace']) {
+   const a=add(id);a.enabled=false;a.status='disabled';a.planType=id.startsWith('up_')?'free':'team';credentials.set(id,credential(a))
+   if(id.startsWith('saved_')) {
+    const c=credential(a,'team-workspace','team');c.facts.material.principal=null
+    if(id==='saved_team_projected') { a.accountId='team-workspace'; c.facts.upstream_account_id='old-workspace'; }
+    if(id==='saved_team_expired') { for(const key of ['access_token','id_token']) { const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;c.facts.material[key]=jwt(p) } }
+    if(!['saved_team_ok','saved_team_projected','saved_team_expired'].includes(id)) {
+     const p=JSON.parse(Buffer.from(c.facts.material.access_token.split('.')[1],'base64url'))
+     if(id.endsWith('user'))p[AUTH].chatgpt_user_id='other-user'
+     if(id.endsWith('email')) { const ip=JSON.parse(Buffer.from(c.facts.material.id_token.split('.')[1],'base64url'));ip.email='other@example.com';c.facts.material.id_token=jwt(ip) }
+     if(id.endsWith('subject'))p.sub='other-subject'
+     if(id.endsWith('workspace'))p[AUTH].chatgpt_account_id='other-team'
+     c.facts.material.access_token=jwt(p)
+    }
+    credentials.set(id,c);nativeMaterials.set(id,structuredClone(c.facts.material))
+   }
+   const n=completes.length;await submit([id]);const done=await finish(id)
+   if(id==='up_projection_ok'||['saved_team_ok','saved_team_projected','saved_team_expired'].includes(id)) {
+    assert.equal(done.status,'success',done.message);assert.equal(a.accountId,'team-workspace');assert.equal(a.planType,'team');assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro']);assert.equal(completes.length,n+1)
+    assert.equal(a.enabled,id==='up_projection_ok');assert.ok(refreshes.includes(id))
+   } else {
+    assert.ok(['failed','review'].includes(done.status),done.message);assert.equal(a.enabled,false)
+    assert.equal(completes.length,n+(id==='up_projection_control'?1:0))
+    if(id==='up_projection_control')assert.equal(a.weight,99)
+   }
+   const counts=[starts.length,completes.length,metadataSaves.length];await tick();assert.deepEqual([starts.length,completes.length,metadataSaves.length],counts)
+   check(id+': verified Team metadata reconciles without replacing token material or replaying OAuth')
+  }
+  await stop();console.log(`Verified ${passed} Team consistency scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='import-row-limit') {
+  const row=i=>`large_import_${i}@example.com----fixture-password----GEZDGNBVGY3TQOJQ`
+  for(const size of [101,200,201,242,500]) {
+   const requestId=randomUUID(),line=Array.from({length:size},(_,i)=>row(i)).join('\n')
+   const before=[starts.length,completes.length,providedImports.length]
+   const response=await request('import-line',{requestId,line,groupIds:[]})
+   assert.equal(response.status,200,JSON.stringify(response.value))
+   const batch=response.value.jobs.filter(j=>j.requestId.startsWith(requestId+':'))
+   assert.equal(batch.length,size);assert.ok(batch.every(j=>j.status==='queued'))
+   assert.deepEqual(batch.map(j=>j.importInfo.line),Array.from({length:size},(_,i)=>i+1))
+   assert.deepEqual([starts.length,completes.length,providedImports.length],before)
+   assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+   assert.equal((await request('jobs')).value.jobs.filter(j=>j.requestId.startsWith(requestId+':')).length,size)
+   assert.equal((await request('cancel',{requestId:null})).status,200)
+   assert.ok((await request('jobs')).value.jobs.every(j=>!['queued','running'].includes(j.status)))
+   check(`${size} import rows queue atomically without truncation, duplicate submission or credential execution; cancellation clears all intents`)
+  }
+  const saved=structuredClone(records.get('queue'))
+  for(const line of [Array.from({length:242},(_,i)=>row(i)).join('\n')+'\ninvalid',Array.from({length:242},(_,i)=>row(i)).join('\n')+'\n'+row(0).toUpperCase(),Array.from({length:2000},(_,i)=>row(i)).join('\n')]) {
+   const before=[starts.length,completes.length,providedImports.length]
+   assert.equal((await request('import-line',{requestId:randomUUID(),line,groupIds:[]})).status,400)
+   assert.deepEqual(records.get('queue'),saved)
+   assert.deepEqual([starts.length,completes.length,providedImports.length],before)
+  }
+  check('Invalid or duplicate tail rows and over-budget intent state reject the entire batch before any write or account operation')
+  const requestId=randomUUID(),line=Array.from({length:242},(_,i)=>row(i)).join('\n')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  const n=starts.length
+  await tick()
+  assert.equal(starts.length,n+1)
+  assert.equal((await request('jobs')).value.jobs.filter(j=>j.status==='running').length,1)
+  await request('cancel',{requestId:null})
+  await stop();console.log(`Verified ${passed} import row-limit scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='rt-diagnostics') {
+  await verifyRtDiagnostics();await stop();console.log(`Verified ${passed} RT diagnostic scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='queued-imports') {
+  await verifyQueuedImports();await stop();console.log(`Verified ${passed} queued import scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='durable-batches') {
+  await verifyDurableBatches();await stop();console.log(`Verified ${passed} durable batch scenarios`)
+ } else if(process.env.RS_REAUTH_TEST_CASE==='expired-existing-bindings') {
+  await verifyExpiredExistingBindings();await stop();console.log(`Verified ${passed} expired existing-account native OAuth scenarios`)
+ } else {
+ const reg=JSON.parse((await call('management.register',{},Buffer.alloc(0),'registration')).payload.toString());assert.equal(reg.routes.length,14)
  assert.deepEqual((await request('runtime-check',{})).value,{ready:true});assert.equal(starts.length,0);check('Runtime preflight never starts authorization')
- for(const id of ['new_team','new_wrong_user','new_missing_rt','new_cleanup_failure','new_verify_failure']){
+ for(const id of ['new_mailbox_import','rt_mailbox_import']) {
+  const requestId=randomUUID(),notes=id+'@example.com----fixture-password----mail-password!----GEZDGNBVGY3TQOJQ',line=notes+(id.startsWith('rt_')?'----fixture-provided-rt':'')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  let done
+  for(let i=0;i<100;i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break}
+  assert.equal(done.status,'success',done.message)
+  const a=accounts.find(a=>a.id===id);assert.equal(a.notes,notes);assert.equal(a.enabled,true)
+  await submit([id]);assert.equal((await finish(id)).status,'success');assert.equal(a.notes,notes)
+  check(id+': import and subsequent native reauthorization preserve the mailbox password note and exclude RT')
+ }
+ for(const [index,reason] of ['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_grant','network','identity','invalid_client','account_deactivated','unauthorized_client'].entries()) {
+  const id='rt_fallback_'+index,requestId=randomUUID(),n=starts.length,c=completes.length,r=providedImports.length
+  const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]}
+  assert.equal((await request('import-line',body)).status,200)
+  let done
+  for(let i=0;i<100;i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break}
+  const fallback=['refresh_token_expired','refresh_token_reused','invalid_token','token_revoked','invalid_client','unauthorized_client'].includes(reason)
+  assert.equal(done.status,fallback?'success':'review',done.message)
+  assert.equal(starts.length,n+Number(fallback));assert.equal(completes.length,c+Number(fallback));assert.equal(providedImports.length,r+1)
+  assert.equal(done.importInfo.rtFallbackReason,fallback?({refresh_token_expired:'expired',refresh_token_reused:'reused',invalid_token:'invalid',token_revoked:'revoked',invalid_client:'client_rejected',unauthorized_client:'client_rejected'}[reason]):undefined)
+  if(fallback){const a=accounts.find(a=>a.id===id);assert.equal(a.enabled,true);assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'));assert.ok(credentials.get(id).facts.material.refresh_token)}
+  else assert.equal(accounts.some(a=>a.id===id),false)
+  const counts=[starts.length,completes.length,providedImports.length]
+  await request('import-line',body);await tick();assert.deepEqual([starts.length,completes.length,providedImports.length],counts)
+  if(fallback)accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check('RT fallback '+reason+': exact one native login only for definite token rejection, no repeated RT exchange')
+ }
+ for(const id of ['new_business_sku_daily_weight','rt_business_sku_daily_weight','new_business_sku','rt_business_sku','rt_business_sku_group_missing','new_business_sku_group_disabled','rt_prolite_daily_weight','new_profile_pro_daily_weight','rt_prolite_profile','new_prolite_profile','rt_prolite_shared','rt_prolite_proof_unavailable','rt_prolite_write_lost','rt_profile_pro','new_profile_pro','rt_profile_pro_write_lost','new_profile_pro_write_lost','rt_profile_pro_readback_wrong','rt_profile_pro_group_readback_wrong','new_profile_pro_group_readback_wrong','rt_profile_pro_group_disabled_readback','rt_profile_pro_group_missing','new_profile_pro_group_disabled','rt_profile_pro_group_duplicate','rt_profile_plus']) {
+  const requestId=randomUUID(),hasRT=id.startsWith('rt_'),n=starts.length,c=completes.length
+  groupMode=id.endsWith('group_missing')?'missing':id.endsWith('group_disabled')?'disabled':id.endsWith('group_duplicate')?'duplicate':'normal'
+  const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(hasRT?'----fixture-provided-rt':''),groupIds:[],concurrencyLimit:7,weight:4}
+  assert.equal((await request('import-line',body)).status,200)
+  let done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')
+  for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
+  const a=accounts.find(a=>a.id===id),failed=/shared|proof_unavailable|write_lost|readback_wrong|group_missing|group_disabled|group_duplicate/.test(id)
+  assert.equal(done.status,failed?'review':'success',done.message);assert.equal(a.enabled,!failed)
+  if(id.includes('prolite')&&!failed){assert.equal(a.concurrencyLimit,personalImportConcurrency);assert.equal(a.weight,a.id.includes('daily_weight')?99:100);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id.includes('profile_pro')&&!failed){assert.equal(a.concurrencyLimit,personalImportConcurrency);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups,[{id:'gpt-pro',name:'GPT Pro',enabled:true}])}
+  if(id.includes('business_sku')&&!failed){assert.equal(a.planType,'self_serve_business_prolite');assert.deepEqual([a.concurrencyLimit,a.weight],[10,20]);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  if(id==='rt_profile_plus'){assert.equal(a.concurrencyLimit,7);assert.equal(a.weight,4);assert.deepEqual(a.groups,[])}
+  assert.equal(a.notes,body.line.split('----').slice(0,3).join('----'))
+  if(!failed){assert.equal(a.name,a.email);assert.equal(Date.parse(a.manualExpiresAt)-Date.parse(a.manualStartsAt),30*86400000);assert.equal(Date.parse(a.manualStartsAt),done.startedAt)}
+  assert.equal(starts.length,n+(hasRT?0:1));assert.equal(completes.length,c+(hasRT?0:1))
+  const counts=[starts.length,completes.length,refreshes.length];await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
+  accounts.splice(accounts.findIndex(x=>x.id===id),1)
+  groupMode='normal'
+  check(id+': verified plan-specific import concurrency and assigned weight and enabled GPT Pro group, preserving egress and failing closed without replay')
+ }
+ for(const [weight,ids] of [
+  [50,['new_profile_pro_weight_batch_first','rt_profile_prolite_weight_batch','rt_profile_pro_weight_batch_first','rt_business_sku_weight_batch','rt_profile_pro_weight_batch_mismatch']],
+  [49,['rt_profile_pro_weight_batch_second','new_profile_pro_weight_batch_second']],
+ ]) {
+  const requestId=randomUUID()
+  const line=ids.map(id=>`${id}@example.com----fixture-password----GEZDGNBVGY3TQOJQ${id.startsWith('rt_')?'----fixture-provided-rt':''}`).join('\n')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  const batch=()=>records.get('queue').value.jobs.filter(job=>job.requestId.startsWith(`${requestId}:import:`))
+  for(let attempt=0;attempt<100&&batch().some(job=>['queued','running'].includes(job.status));attempt++) {
+   await tick();await sleep(60)
+  }
+  assert.equal(batch().length,ids.length)
+  for(const id of ids) {
+   const account=accounts.find(account=>account.id===id),done=batch().find(job=>job.accountId===id)
+   const mismatch=id.endsWith('_mismatch')
+   assert.equal(done.status,mismatch?'review':'success',done.message)
+   assert.equal(account.enabled,!mismatch)
+   if(account.planType==='pro')assert.equal(proProofBatchIds.get(id),requestId)
+   if(!mismatch)assert.equal(account.weight,account.planType==='prolite'?100:account.planType==='self_serve_business_prolite'?20:weight)
+   accounts.splice(accounts.indexOf(account),1)
+  }
+ }
+ check('Mixed OAuth and RT submissions share one Pro weight per request, keep other plans independent and pause on batch mismatch')
+  await verifyRtDiagnostics()
+ {
+  const eligible=[['replace_pro_four','normal'],['replace_pro_five','disabled'],['replace_pro_quota','quota_exhausted'],['replace_pro_quota_paused','quota_paused'],['replace_pro_rate','rate_limited'],['replace_pro_error_stays','error'],['replace_workspace_normal','normal'],['replace_workspace_disabled','disabled']]
+  const cases=[...eligible,['replace_workspace_unconfirmed','normal'],['replace_rt_reject','normal'],['replace_rt_stale','normal'],['replace_rt_busy','normal']]
+  const ids=cases.map(([id])=>id)
+  const originals=cases.map(([id,status])=>{
+   const account=add(id)
+   Object.assign(account,{status,enabled:status!=='disabled',planType:'pro',weight:27,concurrencyLimit:9,manualExpiresAt:'2027-01-01T00:00:00Z'})
+   credentials.set(id,credential(account));return structuredClone(account)
+  })
+  const updateLine=(id,mailbox=false,rt=true)=>`${id.toUpperCase()}@example.com----fixture-password----${mailbox?'unused-mailbox----':''}GEZDGNBVGY3TQOJQ${rt?'----fixture-provided-rt':''}`
+  const counts=[starts.length,completes.length,providedImports.length,groupMoves.length]
+  for(const mailbox of [false,true]) {
+   assert.equal((await request('import-line',{requestId:randomUUID(),line:updateLine(ids[0],mailbox,false),groupIds:[]})).status,400)
+  }
+  const protectedAccount=add('replace_pro_busy');protectedAccount.status='normal'
+  for(const usedSlots of [1,null]) {
+   protectedAccount.capacity.usedSlots=usedSlots
+   assert.equal((await request('import-line',{requestId:randomUUID(),line:updateLine(protectedAccount.id),groupIds:[]})).status,400)
+  }
+  const replacementsBefore=rtReplacements.length
+  const requestId=randomUUID(),line=ids.map((id,index)=>updateLine(id,index===1||id==='replace_workspace_disabled')).join('\n')
+  const body={requestId,line,groupIds:['unused'],concurrencyLimit:19,weight:8}
+  assert.equal((await request('import-line',body)).status,200)
+  revisions.set('replace_rt_stale',2)
+  accounts.find(account=>account.id==='replace_rt_busy').capacity.usedSlots=1
+  const rows=()=>records.get('queue').value.jobs.filter(job=>job.requestId.startsWith(`${requestId}:import:`))
+  for(let attempt=0;attempt<50&&rows().some(job=>['queued','running'].includes(job.status));attempt++)await tick()
+  assert.deepEqual(rows().map(job=>[job.accountId,job.status]),ids.map((id,index)=>[id,index<eligible.length?'success':'review']))
+  assert.ok(rows().every(job=>job.importInfo.rtUpdate===true && !job.newAccount))
+  assert.deepEqual(rtReplacements.slice(replacementsBefore),ids.slice(0,eligible.length+2))
+  assert.deepEqual([starts.length,completes.length,providedImports.length,groupMoves.length],counts)
+  for(const [index,id] of ids.entries()) {
+   const account=accounts.find(account=>account.id===id)
+   const original=originals[index]
+   const expected=id.startsWith('replace_workspace_')?{...original,accountId:'new-workspace',planType:'plus'}:id==='replace_rt_busy'?{...original,capacity:{usedSlots:1}}:original
+   assert.deepEqual(account,expected)
+   assert.equal(credentials.get(id).facts.material.refresh_token,index<eligible.length||id==='replace_workspace_unconfirmed'?'fixture-rotated-rt':'old-private-rt')
+   if(index===1)assert.equal(JSON.parse(Buffer.from(credentials.get(id).facts.material.id_token.split('.')[1],'base64url'))[AUTH].chatgpt_plan_type,'free')
+   assert.equal(accounts.filter(account=>account.email===originals[index].email).length,1)
+   accounts.splice(accounts.indexOf(account),1)
+  }
+  assert.equal((await request('import-line',body)).status,200);await tick()
+  assert.deepEqual(rtReplacements.slice(replacementsBefore),ids.slice(0,eligible.length+2))
+  accounts.splice(accounts.indexOf(protectedAccount),1)
+  check('Repeat imports verify the new profile, preserve settings including a manual pause, and reject busy or stale credentials without replay')
+ }
+ for(const plan of ['prolite','pro']) {
+  const a=add('existing_'+plan);a.planType=plan;a.concurrencyLimit=9;a.weight=6;credentials.set(a.id,credential(a));const original=structuredClone(a)
+  await submit([a.id]);assert.equal((await finish(a.id)).status,'success');assert.equal(a.concurrencyLimit,9);assert.equal(a.weight,6);assert.deepEqual(a.groups,original.groups)
+  accounts.splice(accounts.findIndex(x=>x.id===a.id),1);check('Existing '+plan+' reauthorization preserves manual concurrency, weight, group and proxy')
+ }
+  for(const [id,initialPlan,status] of [['team_schedule_pro_switch','pro','success'],['team_schedule_write_lost','team','review'],['team_schedule_wrong_readback','team','review']]) {
+   const account=add(id);Object.assign(account,{planType:initialPlan,concurrencyLimit:50,weight:45,groups:[{id:'gpt-pro',name:'GPT Pro',enabled:true}]});credentials.set(id,credential(account))
+   const before=structuredClone(account),scheduleCount=teamScheduleWrites.length
+   await submit([id]);const outcome=await finish(id)
+   assert.equal(outcome.status,status,outcome.message);assert.equal(account.planType,'team');assert.equal(account.enabled,status==='success')
+   assert.deepEqual([account.concurrencyLimit,account.weight],[5,id.endsWith('wrong_readback')?2:1]);assert.deepEqual(teamScheduleWrites.slice(scheduleCount),[id])
+   for(const key of ['id','email','notes','userId','outboundProxyEndpoint','groups','modelAccess'])assert.deepEqual(account[key],before[key])
+   if(status==='review')assert.match(outcome.message,/Team 并发和权重/)
+   const calls=[starts.length,completes.length,teamScheduleWrites.length];await tick();assert.deepEqual([starts.length,completes.length,teamScheduleWrites.length],calls)
+   accounts.splice(accounts.indexOf(account),1)
+   check(id+': verified final Team plan alone selects 5/1, and unknown writes or wrong readback do not replay OAuth')
+  }
+  for(const id of ['team_schedule_provided_rt','team_schedule_mismatched_rt']) {
+   const confirmedTeam=id==='team_schedule_provided_rt'
+   const account=add(id);Object.assign(account,{concurrencyLimit:50,weight:45});credentials.set(account.id,credential(account))
+   const beforeStarts=starts.length,scheduleCount=teamScheduleWrites.length
+   await request('import-line',{requestId:randomUUID(),line:account.notes+'----fixture-provided-rt',groupIds:[]})
+   const outcome=await finish(account.id);assert.equal(outcome.status,'success',outcome.message)
+   assert.deepEqual([account.concurrencyLimit,account.weight],confirmedTeam?[5,1]:[50,45]);assert.deepEqual(teamScheduleWrites.slice(scheduleCount),confirmedTeam?[account.id]:[]);assert.equal(starts.length,beforeStarts)
+   accounts.splice(accounts.indexOf(account),1)
+   check(id+': only a confirmed Team RT normalizes scheduling, without starting native login')
+  }
+ for(const [id,hasRT] of [['new_import_ui',false],['new_import_free_ui',false],['rt_team_ui',true],['rt_business_ui',true],['up_import_ui',true]]) {
+  const requestId=randomUUID(),n=starts.length,c=completes.length
+  const body={requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(hasRT?'----fixture-provided-rt':''),groupIds:[]}
+  const response=await request('import-line',body);assert.equal(response.status,200,JSON.stringify(response.value))
+  let done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')
+  for(let i=0;i<80&&['queued','running'].includes(done.status);i++){await tick();await sleep(60);done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import')}
+  assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id)
+   const account=accounts.find(a=>a.id===id)
+   assert.equal(account.enabled,id!=='new_import_free_ui');if(id!=='new_import_free_ui')assert.deepEqual(account.groups.map(g=>g.id),['gpt-pro'])
+   if(account.planType==='team')assert.deepEqual([account.concurrencyLimit,account.weight],[5,1])
+  if(id.startsWith('rt_')){assert.equal(starts.length,n);assert.equal(completes.length,c);assert.equal(done.cleanupStarted??false,false)}
+  else {assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(done.cleanupStarted??false,false)}
+  if(id==='up_import_ui'){assert.equal(accounts.find(a=>a.id===id).supplier,'AI_change_future');assert.equal(Date.parse(accounts.find(a=>a.id===id).manualStartsAt),done.startedAt);assert.equal(accounts.find(a=>a.id===id).planType,'team');assert.equal(accounts.filter(a=>a.email===id+'@example.com').length,1)}
+  const before=[starts.length,completes.length,accounts.length]
+  assert.equal((await request('import-line',body)).status,200);assert.deepEqual([starts.length,completes.length,accounts.length],before)
+  if(!hasRT)assert.equal((await request('import-line',{...body,requestId:randomUUID(),line:body.line.toUpperCase()})).status,400)
+  assert.deepEqual([starts.length,completes.length,accounts.length],before)
+  accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check(id+': format routing, native persistence, same-account Free upgrade, no duplicate allocation or replay')
+ }
+
+ {
+  const ids=['new_multi_three','password_failure','rt_multi_team','up_multi_free','rt_lost_batch']
+  const requestId=randomUUID(), beforeImports=providedImports.length
+  const line=ids.map((id,i)=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'+(i>=2?'----fixture-provided-rt':'')).join('\r\n')
+  const response=await request('import-line',{requestId,line,groupIds:[]});assert.equal(response.status,200,JSON.stringify(response.value))
+  const batch=()=>records.get('queue').value.jobs.filter(j=>j.requestId.startsWith(requestId+':'))
+  assert.equal(batch().length,5);assert.ok(batch().every(j=>j.status==='queued'))
+  assert.equal(providedImports.length,beforeImports,'Submitting a batch stores only intents, without executing RTs')
+  for(let i=0;i<160&&batch().some(j=>['queued','running'].includes(j.status));i++){await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');await sleep(40)}
+  assert.deepEqual(batch().map(j=>j.status),['success','failed','success','success','review'])
+  assert.deepEqual(batch().map(j=>j.importInfo.line),[1,2,3,4,5])
+  assert.equal(accounts.filter(a=>a.id==='up_multi_free').length,1);assert.equal(accounts.find(a=>a.id==='up_multi_free').planType,'team')
+  assert.equal(accounts.find(a=>a.id==='rt_lost_batch').enabled,false)
+  assert.equal(providedImports.length,beforeImports+3)
+  const after=[starts.length,completes.length,providedImports.length]
+  await request('import-line',{requestId,line,groupIds:[]});await tick();assert.deepEqual([starts.length,completes.length,providedImports.length],after)
+  for(const id of ids){const index=accounts.findIndex(a=>a.id===id);if(index>=0)accounts.splice(index,1)}
+  check('A mixed multiline batch runs serially without browser ticks, continues after one failed row, upgrades the same Free account and never replays an uncertain RT')
+ }
+ {
+  const row='not_submitted@example.com----fixture-password----GEZDGNBVGY3TQOJQ',before=[starts.length,completes.length,providedImports.length,records.get('queue').value.jobs.length]
+  for(const line of [row+'\ninvalid-private-row',row+'\n'+row.toUpperCase()])assert.equal((await request('import-line',{requestId:randomUUID(),line,groupIds:[]})).status,400)
+  assert.deepEqual([starts.length,completes.length,providedImports.length,records.get('queue').value.jobs.length],before)
+  check('All rows are parsed and deduplicated before any job, allocation, login or RT exchange')
+ }
+ {
+  const requestId=randomUUID(),ids=['rt_cancel_first','rt_cancel_second'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt').join('\n')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  await request('cancel',{requestId:requestId+':import:1'})
+  for(let i=0;i<4;i++)await tick()
+  assert.ok(!providedImports.includes(ids[0]));assert.ok(providedImports.includes(ids[1]))
+  assert.ok(!records.get('queue').value.automation.attempts[''])
+  accounts.splice(accounts.findIndex(a=>a.id===ids[1]),1)
+  check('Cancelling a queued row removes its in-memory credentials while the next row remains independently executable')
+ }
+ {
+  const requestId=randomUUID(),ids=['rt_restart_first','rt_restart_second'],line=ids.map(id=>id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt').join('\n')
+  assert.equal((await request('import-line',{requestId,line,groupIds:[]})).status,200)
+  await stop();records.get('executor').value.expires=0;await start();await tick() // Simulate lease expiry after the previous host exits.
+  const batch=records.get('queue').value.jobs.filter(j=>j.requestId.startsWith(requestId+':'))
+  assert.ok(batch.every(j=>j.status==='interrupted'));assert.ok(ids.every(id=>!providedImports.includes(id)))
+  await request('import-line',{requestId,line,groupIds:[]});await tick();assert.ok(ids.every(id=>!providedImports.includes(id)))
+  check('A restarted plugin retains safe row results but never reconstructs secrets or replays a queued import batch')
+ }
+ for(const id of ['legacy_profile_pro_auto','legacy_free_auto']) {
+  const req={requestId:randomUUID(),email:id+'@example.com',notes:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ'}
+  assert.equal((await request('import',req)).status,200)
+  let done
+  for(let i=0;i<80;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
+  assert.equal(done.status,'success',done.message)
+  const a=accounts.find(a=>a.id===id)
+  if(id.includes('_pro_')){assert.equal(a.enabled,true);assert.equal(a.concurrencyLimit,personalImportConcurrency);assert.equal(a.weight,a.id.includes('daily_weight')?49:50);assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])}
+  else{assert.equal(a.enabled,false);assert.equal(a.concurrencyLimit,3)}
+  accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check(id+': legacy import also reserves its fresh proxy automatically without caller proxy or group fields')
+ }
+ for(const id of ['new_team','new_wrong_user','new_missing_rt']){
   const req={requestId:randomUUID(),email:id+'@example.com',notes:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ',proxyUrl:'http://fixture:pass@127.0.0.1:21001',groupIds:['g1']}
   const n=starts.length,c=completes.length
   assert.equal((await request('import',req)).status,200)
-  const duplicate=await request('import',req);assert.equal(duplicate.status,200);assert.equal(starts.length,n+1)
+  const duplicate=await request('import',req);assert.equal(duplicate.status,200);assert.equal(starts.length,n)
   let done
   for(let i=0;i<60;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===req.requestId);if(!['queued','running'].includes(done.status))break;await sleep(60)}
-  assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,id==='new_team')
-  if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted,true);assert.ok(refreshes.includes(id))}
+  assert.equal(starts.length,n+1);assert.equal(completes.length,c+1);assert.equal(accounts.find(a=>a.id===id).enabled,id==='new_team')
+  if(id==='new_team'){assert.equal(done.status,'success',done.message);assert.equal(done.accountId,id);assert.equal(done.cleanupStarted??false,false);assert.ok(refreshes.includes(id))}
   else{assert.equal(done.status,'review',done.message);const before=[starts.length,completes.length];await tick();assert.deepEqual([starts.length,completes.length],before)}
-  const count=starts.length;assert.equal((await request('import',{...req,requestId:randomUUID(),email:'other@example.com',notes:'other@example.com----fixture-password----GEZDGNBVGY3TQOJQ'})).status,400);assert.equal(starts.length,count)
+  const count=starts.length,otherRequest=randomUUID();assert.equal((await request('import',{...req,requestId:otherRequest,email:'other@example.com',notes:'other@example.com----fixture-password----GEZDGNBVGY3TQOJQ'})).status,200);assert.equal(starts.length,count);await request('cancel',{requestId:otherRequest});await tick();assert.equal(starts.length,count)
   accounts.splice(accounts.findIndex(a=>a.id===id),1)
   check(`${id}: new accounts use native start/complete, validate AT and ID Token, enable on success and never replay`)
  }
@@ -192,14 +1105,107 @@ try {
   check('Malformed new-account credentials never start an OAuth flow')
  }
 
- for(const id of ['good','disabled','free','legacy_principal']) {
-  const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'){a.planType='free';credentials.set(id,credential(a))}
+
+ for(const id of ['unbound_team','unbound_personal','unbound_wrong_user','unbound_wrong_subject','unbound_wrong_workspace','unbound_wrong_plan']) {
+  const requestId=randomUUID(),n=starts.length,c=completes.length,im=providedImports.length
+  await request('import-line',{requestId,line:id+'@example.com----fixture-password----GEZDGNBVGY3TQOJQ----fixture-provided-rt',groupIds:[]})
+  let done
+  for(let i=0;i<100;i++){await tick();done=records.get('queue').value.jobs.find(j=>j.requestId===requestId+':import');if(!['queued','running'].includes(done.status))break;await sleep(50)}
+  assert.equal(providedImports.length,im+1);assert.equal(starts.length,n+1);assert.equal(completes.length,c+1)
+  const a=accounts.find(a=>a.id===id);assert.equal(accounts.filter(a=>a.id===id).length,1)
+  if(['unbound_team','unbound_personal'].includes(id)) {
+   assert.equal(done.status,'success',done.message);assert.equal(a.enabled,id==='unbound_team');assert.equal(a.planType,id==='unbound_team'?'team':'free')
+   assert.equal(a.accountId,id==='unbound_team'?'team-workspace':'personal-workspace');assert.equal(done.cleanupStarted??false,false)
+   assert.deepEqual(a.groups.map(g=>g.id),id==='unbound_team'?['gpt-pro']:[])
+  } else {assert.equal(done.status,'review',done.message);assert.equal(a.enabled,false)}
+  const counts=[starts.length,completes.length,providedImports.length];await tick();assert.deepEqual([starts.length,completes.length,providedImports.length],counts)
+  accounts.splice(accounts.findIndex(a=>a.id===id),1)
+  check(id+': missing old workspace continues through the same bound native OAuth and validates new identity before grouping or enabling')
+ }
+ await verifyExpiredExistingBindings()
+
+ for(const id of ['business_sku_update_lost','business_sku_supplier_wrong']) {
+  const a=add(id);a.planType='self_serve_business_prolite';a.concurrencyLimit=50;a.weight=37;a.supplier='Previous supplier';credentials.set(id,credential(a))
+  const before=structuredClone(a),r=refreshes.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'review',done.message)
+  assert.equal(a.enabled,false);assert.equal(a.weight,20);assert.equal(refreshes.length,r)
+  for(const key of ['notes','name','userId','accountId','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[key],before[key])
+  const counts=[starts.length,completes.length,refreshes.length];await tick();await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],counts)
+  accounts.splice(accounts.findIndex(x=>x.id===id),1)
+  check(id+': uncertain profile write or wrong supplier stays paused without OAuth replay')
+ }
+ for(const id of ['business_sku_enabled','business_sku_paused','up_business_sku','fb_business_sku']) {
+  const a=add(id);a.planType=id.startsWith('up_')?'free':'self_serve_business_prolite';a.enabled=!id.endsWith('paused');a.concurrencyLimit=7;a.weight=9;a.supplier='Previous supplier';a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];credentials.set(id,credential(a))
+  const before=structuredClone(a),n=completes.length,r=refreshes.length
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message)
+  assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
+  assert.equal(a.enabled,id.startsWith('fb_')?false:before.enabled)
+  assert.deepEqual([a.concurrencyLimit,a.weight],id.startsWith('fb_')?[7,9]:[10,20]);assert.equal(a.supplier,id.startsWith('fb_')?before.supplier:'shannian')
+  assert.equal(a.planType,id.startsWith('fb_')?'free':'self_serve_business_prolite')
+  assert.deepEqual(a.groups.map(g=>g.id),[id.startsWith('fb_')?'free-wait':'gpt-pro'])
+  for(const key of ['notes','name','userId','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[key],before[key])
+  check(id+': Team flow applies concurrency 10 and shannian with weight 20 while preserving identity, proxy and pause policy')
+ }
+ for(const id of ['good','disabled','free','legacy_principal','business']) {
+  const a=add(id);if(id==='legacy_principal')credentials.get(id).facts.material.principal=null;if(id==='free'||id==='business'){a.planType=id;credentials.set(id,credential(a))}
+   if(id==='good')Object.assign(a,{concurrencyLimit:50,weight:45})
   const before=structuredClone(a),n=completes.length,r=refreshes.length,m=metadataSaves.length
   await submit([id]);const done=await finish(id);assert.equal(done.status,'success',done.message)
   assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1);assert.equal(metadataSaves.length,m)
-  assert.match(done.message,/已登出其他设备/);assert.equal(credentials.get(id).facts.material.refresh_token,'native-refreshed-private-rt')
-  for(const k of ['enabled','groups','notes','name','userId','accountId','planType','outboundProxyEndpoint','weight','concurrencyLimit','modelAccess'])assert.deepEqual(a[k],before[k])
+  assert.match(done.message,/原生 RT 刷新及保存已确认/);assert.equal(credentials.get(id).facts.material.refresh_token,'native-refreshed-private-rt')
+   for(const k of ['enabled','notes','name','userId','accountId','planType','outboundProxyEndpoint','modelAccess'])assert.deepEqual(a[k],before[k])
+   assert.deepEqual([a.concurrencyLimit,a.weight],a.planType==='team'?[5,1]:[before.concurrencyLimit,before.weight])
+  assert.deepEqual(a.groups,a.planType==='free'?before.groups:[{id:'gpt-pro',name:'GPT Pro',enabled:true}])
   check(`${id}: RS native completion and native refresh exclusively issue and save RT, configuration preserved`)
+ }
+
+ for(const id of ['fb_wait','fb_wait_custom','fb_wait_existing','fb_wait_outside','fb_wait_lost','fb_wait_revision_race','fb_wait_missing','fb_wait_disabled','fb_wait_duplicate']) {
+  const a=add(id)
+  if(id!=='fb_wait_outside')a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
+  if(id==='fb_wait_custom')a.groups.push({id:'custom',name:'Custom',enabled:true})
+  if(id==='fb_wait_existing')a.groups.push({id:'free-wait',name:'Free Wait',enabled:true})
+  groupMode=id==='fb_wait_missing'?'wait_missing':id==='fb_wait_disabled'?'wait_disabled':id==='fb_wait_duplicate'?'wait_duplicate':'normal'
+  const before=structuredClone(a),moves=groupMoves.length,n=starts.length
+  await submit([id]);const done=await finish(id)
+  const review=['fb_wait_lost','fb_wait_revision_race','fb_wait_missing','fb_wait_disabled','fb_wait_duplicate'].includes(id)
+  assert.equal(done.status,review?'review':'success',done.message);assert.equal(a.enabled,false);assert.equal(a.planType,'free')
+  for(const key of ['notes','name','userId','outboundProxyEndpoint','weight','concurrencyLimit','modelAccess'])assert.deepEqual(a[key],before[key])
+  if(['fb_wait_missing','fb_wait_disabled','fb_wait_duplicate','fb_wait_outside'].includes(id)){
+   assert.equal(groupMoves.length,moves);assert.deepEqual(a.groups,before.groups)
+  }else{
+   assert.equal(groupMoves.length,moves+1)
+   assert.deepEqual(a.groups.map(g=>g.id),id==='fb_wait_custom'?['custom','free-wait']:['free-wait'])
+  }
+  const counts=[groupMoves.length,starts.length,refreshes.length];await tick();await tick();assert.deepEqual([groupMoves.length,starts.length,refreshes.length],counts);assert.equal(starts.length,n+1)
+  groupMode='normal';accounts.splice(accounts.findIndex(x=>x.id===id),1)
+  check(id+': Free in GPT Pro moves to Free Wait, preserves unrelated controls, protects unknown results and does not replay authorization')
+ }
+ {
+  const ids=['fb_wait_batch_one','fb_wait_batch_two'];for(const id of ids)add(id).groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
+  await submit(ids);for(const id of ids){assert.equal((await finish(id)).status,'success');const a=accounts.find(a=>a.id===id);assert.equal(a.enabled,false);assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])}
+  check('Batch Free fallback uses the same guarded grouping flow for each account')
+ }
+ for(const enabled of [true,false]) {
+  const a=add(enabled?'free_in_pro_enabled':'free_in_pro_paused');a.planType='free';a.enabled=enabled;a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];credentials.set(a.id,credential(a))
+  await submit([a.id]);const done=await finish(a.id);assert.equal(done.status,'success',done.message);assert.equal(a.enabled,enabled);assert.deepEqual(a.groups.map(g=>g.id),['free-wait']);assert.match(done.message,/Free Wait/)
+  accounts.splice(accounts.findIndex(x=>x.id===a.id),1)
+  check('An existing Free account in GPT Pro moves after native authorization while preserving its original enable state')
+ }
+ for(const mode of ['missing','disabled','duplicate']) {
+  const id='group_'+mode,a=add(id),moves=groupMoves.length;groupMode=mode
+  await submit([id]);const done=await finish(id);assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(groupMoves.length,moves);assert.match(done.message,/GPT Pro/)
+  groupMode='normal';check(mode+': absent, disabled or ambiguous GPT Pro never reports authorization success or enables scheduling')
+ }
+ for(const id of ['group_lost','group_revision_race']) {
+  const a=add(id),moves=groupMoves.length;await submit([id]);const done=await finish(id)
+  assert.equal(done.status,'review');assert.equal(a.enabled,false);assert.equal(groupMoves.length,moves+1)
+  await tick();assert.equal(groupMoves.length,moves+1)
+  check(id+': unconfirmed grouping or changed credentials stay paused without replaying a write')
+ }
+ {
+  const a=add('group_already');a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}];const moves=groupMoves.length
+  await submit([a.id]);assert.equal((await finish(a.id)).status,'success');assert.equal(groupMoves.length,moves)
+  check('An account already exclusively in GPT Pro is verified without a redundant grouping write')
  }
  for(const id of ['wrong_user','wrong_workspace','wrong_plan','wrong_email','wrong_subject','expired_tokens','missing_rt','native_503','pause_race','plugin_tokens_injected']) {
   const a=add(id),before=completes.length,ref=refreshes.length,meta=metadataSaves.length
@@ -225,8 +1231,8 @@ try {
   }
   credentials.set(id,c)
   const n=completes.length;await submit([id]);const done=await finish(id)
-  if(['up_stale_workspace','up_same_workspace'].includes(id)) {
-   assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(a.planType,'team');assert.equal(a.enabled,true)
+  if(['up_stale_workspace','up_same_workspace','stale_workspace_regular'].includes(id)) {
+   assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(a.planType,id==='stale_workspace_regular'?'free':'team');assert.equal(a.enabled,true)
   } else {
    assert.equal(done.status,'review');assert.equal(completes.length,n+(id==='up_stale_wrong_subject'?1:0))
   }
@@ -257,15 +1263,70 @@ try {
   assert.equal((await finish(a.id)).status,'success');assert.equal(a.enabled,false);assert.equal(a.planType,'free')
   check('Free recovery without candidates still follows the native callback flow')
  }
- for(const id of ['cleanup_failure','cleanup_no_proof','refresh_503','refresh_wrong_user','resume_lost','verify_failure']) {
+ for(const id of ['refresh_503','refresh_wrong_user','resume_lost']) {
   const a=add(id),n=completes.length;await submit([id]);const done=await finish(id);assert.equal(done.status,'review',done.message);assert.equal(completes.length,n+1)
   if(id==='resume_lost'){assert.equal(a.enabled,true);assert.match(done.message,/恢复调度结果不确定/)}else assert.equal(a.enabled,false)
   const calls=[starts.length,completes.length,refreshes.length];await tick();await tick();assert.deepEqual([starts.length,completes.length,refreshes.length],calls)
-  check(`${id}: partial device cleanup, native refresh and scheduling uncertainty are not replayed`)
+  check(`${id}: native refresh and scheduling uncertainty are not replayed`)
+ }
+ for(const {id,attempts,success,reason} of [
+  {id:'refresh_lease_recovers',attempts:2,success:true},
+  {id:'refresh_lease_exhausted',attempts:3,success:false,reason:/持续繁忙/},
+  {id:'refresh_lease_revision_changed',attempts:1,success:false,reason:/凭据版本变化/},
+  {id:'refresh_other_409',attempts:1,success:false,reason:/HTTP 409/},
+ ]) {
+  const account=add(id), proxy=account.outboundProxyEndpoint, nativeStarts=starts.length, nativeCompletes=completes.length
+  await submit([id]);const done=await finish(id,15000)
+  assert.equal(done.status,success?'success':'review',done.message)
+  assert.equal(account.enabled,success);assert.equal(account.outboundProxyEndpoint,proxy)
+  if(success){assert.equal(account.concurrencyLimit,5);assert.equal(account.weight,1)}else assert.match(done.message,reason)
+  await tick();await tick()
+  assert.equal(starts.length,nativeStarts+1);assert.equal(completes.length,nativeCompletes+1)
+  assert.equal(refreshes.filter(value=>value===id).length,attempts)
+  check(`${id}: retries only safe refresh lease failures without replaying OAuth`)
  }
  {
   const a=add('slow');await submit([a.id]);await tick();await request('cancel',{requestId:null});assert.equal(job(a.id).status,'cancelled')
   check('Cancel stops the helper without replaying login or OAuth completion')
+ }
+ {
+  const a=add('auto_old_review_recovered');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  const old=Date.now()-7*3600000,state=records.get('queue').value
+  state.automation.attempts[a.id]={at:old,recovered:false,requiresReview:true}
+  state.jobs.push({requestId:randomUUID()+':'+a.id,accountId:a.id,status:'cancelled',step:'cancelled',message:'尚未开始登录',startedAt:null,finishedAt:Date.now()})
+  recoveryRecords.set(a.id,[{accountId:a.id,provider:'openai',logicalOutcome:'succeeded',createdAt:new Date(old+1000).toISOString()}])
+  const before=starts.length
+  await request('automation',{enabled:true});await tick()
+  assert.equal(job(a.id).automatic,true);assert.equal((await finish(a.id)).status,'success')
+  assert.equal(starts.length,before+1)
+  for(let i=0;i<3;i++)await tick()
+  await request('automation',{enabled:false});await stop();records.get('executor').value.expires=0;await start();await tick()
+  assert.equal(starts.length,before+1)
+  check('A legacy review latch is reconciled only by later successful traffic from the same account; an unstarted cancellation cannot poison its new automatic attempt')
+ }
+ {
+  const a=add('auto_old_review_unconfirmed');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  records.get('queue').value.automation.attempts[a.id]={at:Date.now()-7*3600000,recovered:false,requiresReview:true}
+  recoveryRecords.set(a.id,[{accountId:'other',provider:'openai',logicalOutcome:'succeeded',createdAt:new Date().toISOString()},{accountId:a.id,provider:'openai',logicalOutcome:'failed',clientStatusCode:200,createdAt:new Date().toISOString()}])
+  const before=starts.length
+  await request('automation',{enabled:true});await tick();assert.equal(starts.length,before)
+  const row=(await request('accounts')).value.accounts.find(row=>row.id===a.id)
+  assert.equal(row.automaticStatus.code,'review');assert.match(row.automaticStatus.label,/待核对/)
+  await request('automation',{enabled:false})
+  check('Uncertain history without exact successful recovery stays blocked and exposes the reason through the account API')
+ }
+ {
+  const a=add('automatic_once_failure');a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
+  await submit([a.id]);assert.equal((await finish(a.id)).status,'failed')
+  const before=starts.length
+  await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  assert.equal(job(a.id).automatic,true);assert.equal((await finish(a.id)).status,'failed');assert.equal(starts.length,before+1)
+  for(let i=0;i<3;i++)await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  await request('automation',{enabled:false});await stop();records.get('executor').value.expires=0;await start()
+  await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  assert.equal(starts.length,before+1,'The same failure cannot retry after polling, switch changes or restart')
+  await request('automation',{enabled:false})
+  check('A prior manual login failure permits one automatic attempt, persisted across polling, disable/enable and restart')
  }
  for(const id of ['auto_good','auto_wrong_user','auto_native_503','auto_legacy_principal']) {
   const a=add(id);a.errorReason='credential_expired';a.runtimeCredentialState='expired';if(id==='auto_legacy_principal'){const c=credentials.get(id);c.facts.material.principal=null;for(const key of ['id_token','access_token']){const p=JSON.parse(Buffer.from(c.facts.material[key].split('.')[1],'base64url'));p.exp=1;c.facts.material[key]=jwt(p)}}
@@ -278,6 +1339,22 @@ try {
   const count=starts.length;await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance');assert.equal(starts.length,count)
   await request('automation',{enabled:false})
   check(`${id}: automatic authorization uses the same start/callback/complete/refresh protocol as manual authorization`)
+ }
+
+ for(const [id,plan,enabled] of [['auto_up_business_sku','free',true],['auto_up_business_sku_paused','free',false],['auto_business_sku','self_serve_business_prolite',true],['auto_business_sku_paused','self_serve_business_prolite',false],['auto_up_enabled','free',true],['auto_up_paused','free',false],['auto_fb_team','team',true]]) {
+  const a=add(id);Object.assign(a,{planType:plan,enabled,status:'error',errorReason:'credential_invalid',runtimeCredentialState:'invalid'});credentials.set(id,credential(a))
+  if(id==='auto_fb_team')a.groups=[{id:'gpt-pro',name:'GPT Pro',enabled:true}]
+  const n=completes.length,r=refreshes.length
+  await request('automation',{enabled:true});await call('plugin.reconcile',{},Buffer.alloc(0),'maintenance')
+  assert.equal(job(id).automatic,true)
+  const done=await finish(id);assert.equal(done.status,'success',done.message);assert.equal(completes.length,n+1);assert.equal(refreshes.length,r+1)
+  assert.equal(a.planType,id.includes('business_sku')?'self_serve_business_prolite':id.startsWith('auto_up_')?'team':'free');assert.equal(a.enabled,id.includes('business_sku')?enabled:id==='auto_up_enabled');if(a.planType==='team'||id.includes('business_sku'))assert.deepEqual(a.groups.map(g=>g.id),['gpt-pro'])
+  if(id==='auto_fb_team')assert.deepEqual(a.groups.map(g=>g.id),['free-wait'])
+   if(a.planType==='team')assert.deepEqual([a.concurrencyLimit,a.weight],[5,1])
+  if(id.includes('business_sku')){assert.deepEqual([a.concurrencyLimit,a.weight],[10,20]);assert.equal(a.supplier,'shannian')}
+  assert.equal(done.implementationVersion,releaseVersion);assert.equal(done.cleanupStarted??false,false);assert.equal(done.logoutOthers??false,false)
+  await request('automation',{enabled:false})
+  check(id+': native workspace validation and RT refresh preserve automatic pause policy without any device worker')
  }
  for(const enabled of [true,false]) {
   const a=add(enabled?'auto_invalid_enabled':'auto_invalid_paused');a.enabled=enabled;a.status='error';a.errorReason='credential_invalid';a.runtimeCredentialState='invalid'
@@ -303,13 +1380,38 @@ try {
   directoryGate.resolve();directoryGate=null;await reconcile
   assert.equal(starts.length,n,'A scan finishing after disable must not send login credentials')
   assert.equal((await request('jobs')).value.automation.enabled,false,'Stale queue saves must not reenable automation')
-  await stop();await start();assert.equal((await request('jobs')).value.automation.enabled,false)
+  await stop();records.get('executor').value.expires=0;await start();assert.equal((await request('jobs')).value.automation.enabled,false)
   check('Disabling stays responsive during a blocked scan, fences late work, persists across restart and cannot be overwritten by queue saves')
  }
  {
-  const a=add('legacy');await submit([a.id]);delete job(a.id).logoutOthers;delete job(a.id).cleanupStarted
-  const r=refreshes.length;assert.equal((await finish(a.id)).status,'success');assert.equal(refreshes.length,r);assert.equal(a.enabled,true)
-  check('Legacy queued records retain native authorization without silently gaining device logout')
+  const a=add('legacy');await submit([a.id]);job(a.id).logoutOthers=true;job(a.id).cleanupStarted=true
+  const r=refreshes.length;assert.equal((await finish(a.id)).status,'success');assert.equal(refreshes.length,r+1);assert.equal(a.enabled,true)
+  check('Legacy queued device flags are inert; native refresh remains required without any device action')
  }
+ {
+  for(const [id,category] of [['diagnostic_email','email_verification'],['diagnostic_banned','account_banned']]) {
+   add(id);await submit([id]);assert.equal((await finish(id)).status,'failed')
+   const detail=(await request('jobs')).value.loginFailureDetails[id]
+   assert.equal(detail.category,category);assert.ok(detail.message.includes(category==='account_banned'?'账号已被封禁或停用':'上游要求邮箱验证码'))
+   check(id+': explicit protocol evidence is exposed as a classified, safe failure reason')
+  }
+  await stop();records.get('executor').value.expires=0
+  const state=records.get('queue').value
+  state.jobs=state.jobs.filter(j=>!j.accountId.startsWith('diagnostic_'))
+  add('marker_unknown');state.loginFailureHistory.marker_unknown={failedAt:1,manualSuccessAt:0}
+  await start()
+  const stateAfter=(await request('jobs')).value
+  assert.equal(stateAfter.loginFailureDetails.diagnostic_email.category,'email_verification')
+  assert.equal(stateAfter.loginFailureDetails.diagnostic_banned.category,'account_banned')
+  assert.equal(stateAfter.loginFailureDetails.marker_unknown.category,'other')
+  assert.match(stateAfter.loginFailureDetails.marker_unknown.message,/未保存具体原因/)
+  check('Restart and terminal-history removal retain precise causes while timestamp-only legacy marks remain explicitly unknown')
+ }
+ assert.ok(!records.get('queue').value.automation.attempts[''],'Import failures without an account ID never create an empty automatic-attempt identity')
  await stop();console.log(`Verified ${passed} unified native protocol scenarios`)
+ }
 } finally {if(child?.exitCode===null)child.kill()}
+
+
+
+

@@ -67,7 +67,7 @@ packages:
     engines: {node: '>=6.9.0'}
 
   '@codex-proxy/ui@https://github.com/zyycn/codex-proxy-ui/releases/download/v0.4.1/codex-proxy-ui-0.4.1.tgz':
-    resolution: {tarball: https://github.com/zyycn/codex-proxy-ui/releases/download/v0.4.1/codex-proxy-ui-0.4.1.tgz}
+    resolution: {integrity: sha512-aEJYpvx5t/4eLqZKG2LrVMcUCoFP60qhb94cNRUIiliN6dh5vuR9Ceq18f3gkt0C7eR2W9nMs6R6GfcShmSdnA==, tarball: https://github.com/zyycn/codex-proxy-ui/releases/download/v0.4.1/codex-proxy-ui-0.4.1.tgz}
     version: 0.4.1
     engines: {node: '>=24'}
     peerDependencies:

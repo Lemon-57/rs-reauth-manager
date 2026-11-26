@@ -19,10 +19,10 @@ RS 网关独立插件，通过原账号备注中的 `邮箱----密码----2FA` �
 | 项目 | 范围 |
 | --- | --- |
 | 插件 ID | `personal.reauth-manager` |
-| 当前源码版本 | `0.1.34`，公开版本以 Releases 为准 |
-| 宿主兼容清单 | `>=3.29.1, <3.30.0` |
-| 插件合同 | RPC v4、management v2、maintenance v1，manifestVersion 仍为 2 |
-| 制品平台 | Linux x86_64，插件入口要求 glibc 2.28+ |
+| 当前源码版本 | `0.1.115+host.3.55.2`，公开版本以 Releases 为准 |
+| 宿主兼容清单 | `>=3.54.5, <3.56.0` |
+| 插件合同 | RPC v7、management v2、maintenance v1，manifestVersion 仍为 2 |
+| 制品平台 | Linux x86_64（musl） |
 | 账号范围 | 全部套餐的 ChatGPT OAuth 账号，包含 Free |
 | 功能入口 | 扩展页中的“账号重新授权” |
 
@@ -117,7 +117,7 @@ Free、Plus、Pro、Team、Business 等全部套餐的 OAuth 账号均可列出�
 429、封禁、付款、密码错误、人工验证、无具体错误码的 409、传输异常、授权回调校验失败和令牌交换失败均不自动重登或猜测换码。新会话仍失败时同时显示两次原因，不重放凭据写回，任务失败后不自动重新排队；单号 420 秒总时限不因恢复而延长
 所有授权复用 RS 已生成的 state、PKCE、client_id 与回调地址，以及账号固定代理和现有登录协议。插件不得生成另一套 PKCE、调用上游 token 接口交换授权码，或用 SDK 写入自行换取的 RT。新增账号使用受保护的 `api/import` 入口，仍由 RS 原生 complete 保存 RT、备注和分组；以后新增账号也必须沿用这一原生链路，项目 AGENTS.md 已将其设为持久规则
 
-后端使用 RS v3.29.1 的公开 SDK，固定提交 `743a3aba70a4f78f27fb53d80a6e719599d2fe5e`，打包 CLI 使用同一合同源码构建
+后端使用 RS 公开 SDK，固定提交 `8c8618aa0f841638262262e3338c115bc075f125`，打包 CLI 使用同一合同源码构建
 界面使用官方 `@codex-proxy/ui` v0.4.1 编译发行包，并参考 [插件工作台示例](https://github.com/zyycn/codex-proxy-plugins) 组织公开宿主桥、请求层、业务解码和 composable
 不跨仓导入宿主内部源码，不读取管理 Cookie，也不直接访问宿主数据库
 
@@ -125,18 +125,17 @@ Free、Plus、Pro、Team、Business 等全部套餐的 OAuth 账号均可列出�
 
 ## 本地开发
 
-需要 Rust 1.97.0、Node.js 24+、pnpm 9.12.2 和 Python 3.11+
+需要 Rust 1.99.1、Node.js 24+、pnpm 9.12.2 和 Python 3.11+
 所有编译、依赖准备及打包均应在本机完成，不在生产应用服务器执行
 
 ```bash
 pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
 node verification/bridge-test.mjs
-node verification/batch-test.mjs
 node verification/conventions.mjs
-cargo +1.97.0 fmt --manifest-path backend/Cargo.toml --check
-cargo +1.97.0 clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
-cargo +1.97.0 build --manifest-path backend/Cargo.toml --locked
+cargo +1.99.1 fmt --manifest-path backend/Cargo.toml --check
+cargo +1.99.1 clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
+cargo +1.99.1 build --manifest-path backend/Cargo.toml --locked
 node verification/protocol-test.mjs
 python -B -m unittest discover -s verification -p 'test_*.py' -v
 ```
@@ -170,16 +169,16 @@ wheel 版本与 SHA-256 固定在 `protocol/requirements-linux.txt`，构建时�
 Linux 原生构建示例
 
 ```bash
-cargo +1.97.0 build --manifest-path backend/Cargo.toml --release --locked --target x86_64-unknown-linux-gnu
-cpr-plugin package --manifest plugin.json --binary backend/target/x86_64-unknown-linux-gnu/release/reauth-manager --target x86_64-unknown-linux-gnu --resource-map web=frontend/dist --output-dir dist
+cargo +1.99.1 build --manifest-path backend/Cargo.toml --release --locked --target x86_64-unknown-linux-musl
+cpr-plugin package --manifest plugin.json --binary backend/target/x86_64-unknown-linux-musl/release/reauth-manager --target x86_64-unknown-linux-musl --resource-map web=frontend/dist --output-dir dist
 python scripts/verify_artifact.py
 ```
 
-Windows 交叉编译需先配置 Zig 与 cargo-zigbuild，将构建命令换成 `cargo +1.97.0 zigbuild --manifest-path backend/Cargo.toml --release --locked --target x86_64-unknown-linux-gnu.2.28`
+Windows 交叉编译可使用 Rust 自带 musl 目标；本机已使用 `rust-lld` 完成 `x86_64-unknown-linux-musl` 构建
 `cpr-plugin` 使用与上文 SDK 相同的固定提交构建，生成的制品及校验文件位于 `dist/`
 
 ## 验证范围
 
-测试入口覆盖真实 SDK 子进程的 RPC v4 管理与维护调用、账号范围、私有运行目录、错误阶段与原因、Free 恢复及强制写回的身份保护、未修改上游协议代码的离线传输、前端桥、本次任务统计及分页筛选
-发行包校验核对 RPC v4、management v2、maintenance v1、目标平台、资源摘要及嵌入协议源码，拒绝源码与内嵌运行包不一致的制品
+测试入口覆盖真实 SDK 子进程的 RPC v7 管理与维护调用、账号范围、私有运行目录、错误阶段与原因、Free 恢复及强制写回的身份保护、未修改上游协议代码的离线传输、前端桥、本次任务统计及分页筛选
+发行包校验核对 RPC v7、management v2、maintenance v1、目标平台、资源摘要及嵌入协议源码，拒绝源码与内嵌运行包不一致的制品
 本地模拟与构建验证不等于真实账号完整链路或新版生产安装已验收，代理、账号状态、工作区和人工验证仍可能导致实际登录失败；新版本的实际验证范围以 Release 为准

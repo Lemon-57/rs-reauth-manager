@@ -1,10 +1,15 @@
-import type { Account, Job } from '../../types'
+import type { Account, Job, JobsState, LoginFailureDetail } from '../../types'
 import { isRecord } from '../request'
 
 const nullableString = (value: unknown) => value === null || typeof value === 'string'
 const nullableTime = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value) && value >= 0
 function account(value: unknown): value is Account {
+  const usage = isRecord(value) ? value.usage : undefined
+  const automaticStatus = isRecord(value) ? value.automaticStatus : undefined
   return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string'
+    && (automaticStatus == null || isRecord(automaticStatus) && ['code', 'label', 'message'].every(key => typeof automaticStatus[key] === 'string'))
+    && ['supplier', 'manualExpiresAt', 'manualExpiresAtDisplay'].every(key => value[key] === undefined || nullableString(value[key]))
+    && (usage === undefined || isRecord(usage) && ['lastUsedAt', 'lastUsedAtDisplay', 'lastUsedAtFullDisplay'].every(key => usage[key] === undefined || nullableString(usage[key])))
     && nullableString(value.email) && nullableString(value.planType) && nullableString(value.proxy)
     && nullableString(value.accessTokenExpiresAt) && typeof value.enabled === 'boolean'
     && typeof value.notesValid === 'boolean' && typeof value.status === 'string'
@@ -17,6 +22,10 @@ function job(value: unknown): value is Job {
     && nullableTime(value.startedAt) && nullableTime(value.finishedAt)
     && (value.workspaceChoices === undefined || Array.isArray(value.workspaceChoices) && value.workspaceChoices.length <= 30 && value.workspaceChoices.every(w => isRecord(w) && typeof w.id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(w.id)))
     && (value.forceWorkspaceId === undefined || nullableString(value.forceWorkspaceId))
+    && (value.newAccount === undefined || typeof value.newAccount === 'boolean')
+    && (value.implementationVersion === undefined || typeof value.implementationVersion === 'string')
+    && (value.importInfo === undefined || isRecord(value.importInfo) && Number.isInteger(value.importInfo.line) && (value.importInfo.line as number) > 0 && typeof value.importInfo.email === 'string'
+      && (value.importInfo.rtUpdate === undefined || typeof value.importInfo.rtUpdate === 'boolean'))
     && (value.automatic === undefined || typeof value.automatic === 'boolean')
 }
 export function parseAccounts(value: unknown): { accounts: Account[] } {
@@ -24,18 +33,24 @@ export function parseAccounts(value: unknown): { accounts: Account[] } {
     throw new Error('插件账号列表格式无效')
   return { accounts: value.accounts }
 }
-export function parseJobs(value: unknown): { jobs: Job[]; automation?: { enabled: boolean } } {
+export function parseJobs(value: unknown): JobsState {
   if (!isRecord(value) || !Array.isArray(value.jobs) || !value.jobs.every(job))
     throw new Error('插件任务列表格式无效')
   if (value.automation !== undefined && (!isRecord(value.automation) || typeof value.automation.enabled !== 'boolean'))
     throw new Error('自动授权状态格式无效')
-  return { jobs: value.jobs, ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
+  if (value.loginFailures !== undefined && (!Array.isArray(value.loginFailures) || !value.loginFailures.every(id => typeof id === 'string')))
+    throw new Error('登录失败标记格式无效')
+  if (value.loginFailureDetails !== undefined && (!isRecord(value.loginFailureDetails) || !Object.values(value.loginFailureDetails).every(detail => isRecord(detail)
+    && ['email_verification', 'account_banned', 'other'].includes(detail.category as string) && typeof detail.message === 'string'
+    && typeof detail.failedAt === 'number' && nullableTime(detail.failedAt))))
+    throw new Error('登录失败原因格式无效')
+  return { jobs: value.jobs, ...(value.loginFailures !== undefined ? { loginFailures: value.loginFailures as string[] } : {}), ...(value.loginFailureDetails !== undefined ? { loginFailureDetails: value.loginFailureDetails as Record<string, LoginFailureDetail> } : {}), ...(isRecord(value.automation) ? { automation: { enabled: value.automation.enabled as boolean } } : {}) }
 }
 export function parseTick(value: unknown): { ok: true } {
   if (!isRecord(value) || value.ok !== true) throw new Error('插件任务推进结果无效')
   return { ok: true }
 }
-export function parseDeletion(value: unknown): { deletedAccountIds: string[]; jobs: Job[] } {
+export function parseDeletion(value: unknown): JobsState & { deletedAccountIds: string[] } {
   if (!isRecord(value) || !Array.isArray(value.deletedAccountIds) || !value.deletedAccountIds.length
     || !value.deletedAccountIds.every(id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id))
     || new Set(value.deletedAccountIds).size !== value.deletedAccountIds.length)

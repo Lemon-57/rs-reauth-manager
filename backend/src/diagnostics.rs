@@ -1,11 +1,79 @@
 //! 将协议诊断白名单投影为可公开的中文错误，不透传上游正文
 use serde_json::Value;
 
+pub fn login_failure_category(message: &str) -> &'static str {
+    // 复用已公开的明确诊断，不把 HTTP 403 或通用验证错误当成封禁
+    if message.contains("账号已被封禁或停用，上游拒绝继续登录") {
+        "account_banned"
+    } else if [
+        "上游要求邮箱验证码",
+        "上游未能发送邮箱验证码",
+        "上游拒绝邮箱验证码",
+        "邮箱验证流程未完成",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+    {
+        "email_verification"
+    } else {
+        "other"
+    }
+}
+
 pub fn message(output: &Value, fallback: &str) -> String {
     let Some(diagnostic) = output.get("diagnostic").filter(|d| d.is_object()) else {
         return fallback.into();
     };
     render(diagnostic, true)
+}
+
+pub fn mailshop_failure(output: &Value) -> String {
+    let fallback = "Mailshop 未返回可用的 RT";
+    if output["event"] != "error" || output["code"] != "mailshop_rt_unconfirmed" {
+        return fallback.into();
+    }
+    let diagnostic = &output["diagnostic"];
+    let reason_code = diagnostic["reason"].as_str().unwrap_or_default();
+    let reason = match reason_code {
+        "account_rejected" => "Mailshop 账号任务失败",
+        "api_rejected" => "Mailshop 接口返回失败",
+        "http_rejected" => "Mailshop 请求失败",
+        "invalid_input" => "Mailshop 请求资料无效，未调用接口",
+        "response_invalid" => "Mailshop 响应格式无效或与本次请求不匹配",
+        "timeout" => "请求 Mailshop 超时",
+        "transport" => "Mailshop 连接失败或响应中断",
+        "rt_missing" => fallback,
+        _ => return fallback.into(),
+    };
+    let mut message = reason.to_owned();
+    let mut codes = Vec::new();
+    if let Some(status) = diagnostic["httpStatus"]
+        .as_u64()
+        .filter(|status| (100..=599).contains(status))
+    {
+        codes.push(format!("HTTP {status}"));
+    }
+    if let Some(code) = diagnostic["apiCode"]
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok())
+        .filter(|code| *code != 0)
+    {
+        codes.push(format!("错误码 {code}"));
+    }
+    if !codes.is_empty() {
+        message.push_str(&format!("（{}）", codes.join("，")));
+    }
+    if matches!(
+        reason_code,
+        "account_rejected" | "api_rejected" | "http_rejected" | "rt_missing"
+    )
+        && let Some(detail) = diagnostic["detail"].as_str().filter(|text| {
+            !text.trim().is_empty() && text.chars().count() <= 240 && !text.chars().any(char::is_control)
+        })
+    {
+        message.push_str(&format!("：{detail}"));
+    }
+    message
 }
 
 fn render(diagnostic: &Value, include_previous: bool) -> String {
@@ -37,6 +105,7 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "session" => "初始化登录会话",
         "session_lookup" => "读取登录会话及工作区",
         "other_sessions" => "登出其他设备",
+        "session_verify" => "复核本次设备目录",
         "login" => "提交登录身份",
         "password" => "密码验证",
         "mfa_factor" => "识别 2FA 验证器",
@@ -93,6 +162,16 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         "email_send_failed" => "上游未能发送邮箱验证码",
         "email_code_rejected" => "上游拒绝邮箱验证码",
         "email_verification_failed" => "邮箱验证流程未完成",
+        "mailcom_no_code" => "Mailcom 未返回可用的邮箱验证码",
+        "mailcom_http_rejected" => "Mailcom 鉴权或请求被拒绝",
+        "mailcom_api_rejected" => "Mailcom 接口返回失败",
+        "mailcom_timeout" => "请求 Mailcom 超时",
+        "mailcom_transport" => "Mailcom 连接失败或响应中断",
+        "mailcom_identity_mismatch" => "Mailcom 返回的邮箱与当前账号不一致，未使用验证码",
+        "mailcom_response_invalid" => "Mailcom 响应格式无效",
+        "mailcom_email" | "mailcom_password" | "mailcom_key" | "mailcom_base_url" | "mailcom_limit" => {
+            "Mailcom 取码配置无效"
+        }
         "phone_required" => "上游要求手机验证，需要人工完成",
         "phone_verification_failed" => "手机验证未完成，需要人工检查验证状态",
         "profile_required" => "上游要求补充账号资料",
@@ -117,7 +196,7 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
             "令牌交换接口返回重定向，已拒绝跟随，不向其他地址转发授权码或 PKCE verifier"
         }
         "state_mismatch" => "授权回调 state 校验未通过，未写回",
-        "workspace_unmatched" => "无法匹配原账号工作区，已停止写回",
+        "workspace_unmatched" => "无法确认授权工作区，已停止写回",
         "workspace_evidence_invalid" => {
             "授权页的工作区数据格式无效、相互冲突或超出数量限制，未自动选择或写回"
         }
@@ -130,6 +209,13 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
         _ => "未取得可公开的具体错误，未保存上游原始响应",
     };
     let mut message = format!("{stage}：{reason}");
+    if let Some(shape) = diagnostic["mfaShape"].as_u64().filter(|v| *v < (1 << 28)) {
+        message.push_str(&format!(" [验证响应结构 {shape}]"));
+        if let Some(page) = diagnostic["mfaPage"].as_str().filter(|v| v.len() <= 64
+            && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')) {
+            message.push_str(&format!(" [验证页面 {page}]"));
+        }
+    }
     if let Some(status) = diagnostic["httpStatus"]
         .as_u64()
         .filter(|v| !local_generation && (100..=599).contains(v))
@@ -171,6 +257,51 @@ fn render(diagnostic: &Value, include_previous: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mailshop_displays_safe_failure_detail_and_numeric_codes() {
+        let output = json!({"event":"error","code":"mailshop_rt_unconfirmed","diagnostic":{
+            "reason":"api_rejected","httpStatus":200,"apiCode":10003,"detail":"API 余额不足",
+            "raw":"fixture-private-response"
+        }});
+        assert_eq!(
+            mailshop_failure(&output),
+            "Mailshop 接口返回失败（HTTP 200，错误码 10003）：API 余额不足"
+        );
+    }
+
+    #[test]
+    fn mailshop_does_not_show_unbounded_fields_or_unrecognized_errors() {
+        assert_eq!(
+            mailshop_failure(&json!({"event":"error","code":"mailshop_rt_unconfirmed"})),
+            "Mailshop 未返回可用的 RT"
+        );
+        for detail in [json!("line\nprivate"), json!("x".repeat(241)), json!({"raw":"private"})] {
+            let output = json!({"event":"error","code":"mailshop_rt_unconfirmed","diagnostic":{
+                "reason":"http_rejected","httpStatus":9999,"apiCode":"private","detail":detail
+            }});
+            assert_eq!(mailshop_failure(&output), "Mailshop 请求失败");
+        }
+    }
+
+    #[test]
+    fn failure_categories_require_explicit_login_evidence() {
+        for (reason, expected) in [
+            ("email_code_required", "email_verification"),
+            ("email_send_failed", "email_verification"),
+            ("email_code_rejected", "email_verification"),
+            ("email_verification_failed", "email_verification"),
+            ("account_banned", "account_banned"),
+            ("http_rejected", "other"),
+            ("security_challenge", "other"),
+            ("primary_factor_required", "other"),
+            ("password_rejected", "other"),
+        ] {
+            let text = message(&json!({"diagnostic":{"stage":"mfa_verify","reason":reason,"httpStatus":403}}), "fallback");
+            assert_eq!(login_failure_category(&text), expected);
+        }
+        assert_eq!(login_failure_category(""), "other");
+    }
 
     #[test]
     fn renders_only_known_diagnostic_fields() {

@@ -20,7 +20,7 @@ export async function request(method: 'GET' | 'POST', path: string, data?: unkno
   if (reply.status < 200 || reply.status >= 300) {
     const message = isRecord(value) && isRecord(value.error) && typeof value.error.message === 'string'
       ? value.error.message : `插件请求失败（HTTP ${reply.status}）`
-    throw new Error(message)
+    throw new Error(message === 'state version conflicts' ? '任务状态已被其他执行器更新，正在读取最新状态，请勿重复提交授权' : message)
   }
   return value
 }

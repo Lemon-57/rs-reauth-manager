@@ -1097,7 +1097,7 @@ class OAuthClient:
 
     @staticmethod
     def _infer_external_page_type(url, body_text=""):
-        url_low = str(url or "").lower()
+        url_low = urlparse(str(url or "")).path.lower()
         url_markers = (
             (
                 "email-verification",
@@ -1721,7 +1721,7 @@ class OAuthClient:
             if callback:
                 return _success(callback)
 
-            low = (current_url or "").lower()
+            low = urlparse(str(current_url or "")).path.lower()
             if "mfa-challenge" in low:
                 oauth_protocol["last_page_type"] = "mfa-challenge"
                 next_url = self._oauth_complete_totp_mfa_for_continue(
@@ -1939,7 +1939,7 @@ class OAuthClient:
                         final_url,
                     )
                     continue
-                if "choose-an-account" in final_url.lower() and not chose_account:
+                if "choose-an-account" in urlparse(final_url).path.lower() and not chose_account:
                     oauth_protocol["last_page_type"] = "choose-an-account"
                     oauth_protocol["choose_account_attempted"] = True
                     next_url = self._oauth_choose_account_select(html_text, final_url, user_agent, impersonate)
@@ -1951,7 +1951,7 @@ class OAuthClient:
                     referer = final_url
                     current_url = self._normalize_continue_url(next_url if next_url != final_url else original_url, final_url)
                     continue
-                if ("workspace" in final_url.lower()) or "workspace_id" in body_low or "workspaces" in body_low:
+                if ("workspace" in urlparse(final_url).path.lower()) or "workspace_id" in body_low or "workspaces" in body_low:
                     oauth_protocol["last_page_type"] = "workspace"
                     callback, next_url = self._select_workspace_for_callback(final_url, html_text, expected_state, redirect_uri, user_agent, impersonate, device_id, max_hops, oauth_protocol)
                     if callback:
@@ -2014,7 +2014,7 @@ class OAuthClient:
     @classmethod
     def _is_mfa_challenge(cls, page_type="", continue_url="", data=None):
         page_low = str(page_type or cls._oauth_page_type(data) or "").lower()
-        url_low = str(continue_url or "").lower()
+        url_low = urlparse(str(continue_url or "")).path.lower()
         return "mfa_challenge" in page_low or "mfa-challenge" in url_low
 
     @staticmethod
@@ -2350,7 +2350,7 @@ class OAuthClient:
         continue_url = self._normalize_continue_url(self._extract_continue_url_from_json(data), current_url)
         page_type = str(((data.get("page") or {}) if isinstance(data, dict) else {}).get("type") or "").strip()
         page_low = page_type.lower()
-        url_low = (continue_url or "").lower()
+        url_low = urlparse(str(continue_url or "")).path.lower()
 
         if self._is_mfa_challenge(page_type, continue_url, data):
             return self._oauth_complete_totp_mfa_for_continue(
@@ -2505,7 +2505,7 @@ class OAuthClient:
                                 pwdless_data = {}
                             pwdless_continue_url = self._normalize_continue_url(self._extract_continue_url_from_json(pwdless_data), password_page_url)
                             pwdless_page_type = str(((pwdless_data.get("page") or {}) if isinstance(pwdless_data, dict) else {}).get("type") or "").strip()
-                            pwdless_low = (pwdless_continue_url or "").lower()
+                            pwdless_low = urlparse(str(pwdless_continue_url or "")).path.lower()
                             if pwdless_page_type.lower() in {"email_otp_verification", "contact_verification"} or "email-verification" in pwdless_low or "email-otp" in pwdless_low:
                                 next_url = self._oauth_complete_email_otp_for_continue(
                                     email=email,
@@ -2532,7 +2532,7 @@ class OAuthClient:
             continue_url = self._normalize_continue_url(self._extract_continue_url_from_json(data), password_page_url)
             page_type = str(((data.get("page") or {}) if isinstance(data, dict) else {}).get("type") or page_type).strip()
             page_low = page_type.lower()
-            url_low = (continue_url or "").lower()
+            url_low = urlparse(str(continue_url or "")).path.lower()
 
         if self._is_mfa_challenge(page_type, continue_url, data):
             return self._oauth_complete_totp_mfa_for_continue(

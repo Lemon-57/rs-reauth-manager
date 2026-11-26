@@ -5,7 +5,91 @@ use gateway_plugin_sdk::{PluginFault, call::host::AuthCredential, client::HostCl
 use serde_json::{Value, json};
 
 const AUTH: &str = "https://api.openai.com/auth";
-const IDENTITY_ERROR: &str = "工作区授权身份校验失败，未更改账号或提交凭据";
+const IDENTITY_ERROR: &str = "授权身份、工作区、套餐或令牌有效期未确认，请核对已保存结果";
+
+pub(crate) fn missing_workspace(original: &Value) -> bool {
+    original["planType"]
+        .as_str()
+        .is_some_and(|p| p.eq_ignore_ascii_case("free"))
+        && original["accountId"]
+            .as_str()
+            .is_none_or(|w| w.trim().is_empty())
+}
+
+// 旧 RT 可以没有 ChatGPT 工作区声明；仅用于绑定已有用户，不能据此启用或归组
+pub(crate) fn validate_binding(tokens: &Value, original: &Value) -> Result<String, PluginFault> {
+    validate_binding_with_expiry(tokens, original, true)
+}
+
+// Existing saved credentials establish historical identity only. Fresh OAuth results
+// and supplied RT imports still require live tokens through validate_binding/validate.
+pub(crate) fn validate_existing_binding(
+    tokens: &Value,
+    original: &Value,
+) -> Result<String, PluginFault> {
+    validate_binding_with_expiry(tokens, original, false)
+}
+
+fn validate_binding_with_expiry(
+    tokens: &Value,
+    original: &Value,
+    require_fresh: bool,
+) -> Result<String, PluginFault> {
+    let (identity, _) = bound_claims(tokens, original, require_fresh)?;
+    Ok(text(&identity, "sub")?.to_owned())
+}
+
+fn bound_claims(
+    tokens: &Value,
+    original: &Value,
+    require_fresh: bool,
+) -> Result<(Value, Value), PluginFault> {
+    text(tokens, "refresh_token")?;
+    let identity = decode_claims(text(tokens, "id_token")?, require_fresh)?;
+    let access = decode_claims(text(tokens, "access_token")?, require_fresh)?;
+    let email = identity["email"]
+        .as_str()
+        .or_else(|| identity["https://api.openai.com/profile"]["email"].as_str());
+    if !email
+        .is_some_and(|e| e.eq_ignore_ascii_case(original["email"].as_str().unwrap_or_default()))
+    {
+        return Err(fault("已保存 RT 的邮箱身份未确认，账号保持暂停"));
+    }
+    let user = text(original, "userId")?;
+    for c in [&identity, &access] {
+        if c[AUTH]["chatgpt_user_id"]
+            .as_str()
+            .or_else(|| c[AUTH]["user_id"].as_str())
+            != Some(user)
+        {
+            return Err(fault("已保存 RT 的用户身份不一致，账号保持暂停"));
+        }
+    }
+    let subject = text(&identity, "sub")?;
+    if access["sub"].as_str() != Some(subject) {
+        return Err(fault("已保存 RT 的双令牌主体不一致，账号保持暂停"));
+    }
+    Ok((identity, access))
+}
+
+pub(crate) fn validate_rt_replacement(
+    tokens: &Value,
+    original: &Value,
+) -> Result<Option<String>, PluginFault> {
+    let workspace = text(original, "accountId")?;
+    let (identity, access) = bound_claims(tokens, original, true)
+        .map_err(|_| fault("已保存 RT 的身份或令牌有效期未确认，请核对原账号"))?;
+    if [&identity, &access]
+        .into_iter()
+        .any(|claims| claims[AUTH]["chatgpt_account_id"] != workspace)
+    {
+        return Err(fault("已保存 RT 与原工作区不一致，请核对原账号"));
+    }
+    Ok(identity[AUTH]["chatgpt_plan_type"]
+        .as_str()
+        .filter(|plan| access[AUTH]["chatgpt_plan_type"] == *plan)
+        .map(str::to_owned))
+}
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
     value[key]
@@ -19,6 +103,10 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PluginFault> {
 }
 
 pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
+    decode_claims(token, true)
+}
+
+fn decode_claims(token: &str, require_fresh: bool) -> Result<Value, PluginFault> {
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
         return Err(fault(IDENTITY_ERROR));
@@ -30,7 +118,9 @@ pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
     // 私有 TLS 交换结果的字段投影，不宣称为 JWT 签名校验
     let expires = claims["exp"]
         .as_u64()
-        .filter(|exp| *exp > now() / 1000 + 30 && *exp < 253402300799)
+        .filter(|exp| {
+            *exp > 0 && *exp < 253402300799 && (!require_fresh || *exp > now() / 1000 + 30)
+        })
         .ok_or_else(|| fault(IDENTITY_ERROR))?;
     if !claims.is_object() || expires.checked_mul(1000).is_none() {
         return Err(fault(IDENTITY_ERROR));
@@ -38,7 +128,26 @@ pub(crate) fn claims(token: &str) -> Result<Value, PluginFault> {
     Ok(claims)
 }
 
+pub(crate) fn existing_claims(token: &str) -> Result<Value, PluginFault> {
+    decode_claims(token, false)
+}
+
+pub(crate) fn validate_existing(
+    output: &Value,
+    original: &Value,
+) -> Result<(Value, Value), PluginFault> {
+    validate_with_expiry(output, original, false)
+}
+
 pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value), PluginFault> {
+    validate_with_expiry(output, original, true)
+}
+
+fn validate_with_expiry(
+    output: &Value,
+    original: &Value,
+    fresh: bool,
+) -> Result<(Value, Value), PluginFault> {
     let workspace = text(output, "workspaceId")?;
     let user = text(original, "userId")?;
     let email = text(original, "email")?;
@@ -50,14 +159,20 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
         && original["planType"]
             .as_str()
             .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"));
+    let recovered = output["event"] == "workspace_recovered"
+        && missing_workspace(original)
+        && output["uniqueWorkspaceConfirmed"] == true
+        && matches!(output["selectedPlan"].as_str(), Some("free" | "team"));
     if (!same
         && !forced
         && !forced_free
         && !upgraded
+        && !recovered
         && (output["event"] != "free_fallback" || output["originalWorkspaceUnavailable"] != true))
         || output["originalWorkspaceId"] != original["accountId"]
         || (same && workspace != text(original, "accountId")?)
         || (!same
+            && !recovered
             && workspace == text(original, "accountId")?
             && !upgraded
             && !(forced_free
@@ -68,8 +183,8 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
         return Err(fault(IDENTITY_ERROR));
     }
     text(&output["tokens"], "refresh_token")?;
-    let identity = claims(text(&output["tokens"], "id_token")?)?;
-    let access = claims(text(&output["tokens"], "access_token")?)?;
+    let identity = decode_claims(text(&output["tokens"], "id_token")?, fresh)?;
+    let access = decode_claims(text(&output["tokens"], "access_token")?, fresh)?;
     text(&identity, "sub")?;
     let token_email = identity["email"]
         .as_str()
@@ -90,15 +205,18 @@ pub(crate) fn validate(output: &Value, original: &Value) -> Result<(Value, Value
                     && ((same
                         && original["planType"]
                             .as_str()
-                            .is_some_and(|old| p.trim().eq_ignore_ascii_case(old.trim())))
+                            .is_some_and(|old| crate::plans::same_family(p, old)))
                         || (!same
                             && (forced
                                 || (upgraded
-                                    && matches!(
-                                        p.to_ascii_lowercase().as_str(),
-                                        "team" | "business"
-                                    ))
-                                || (!upgraded && p.eq_ignore_ascii_case("free")))))
+                                    && crate::plans::team(p))
+                                || (recovered
+                                    && if output["selectedPlan"] == "team" {
+                                        crate::plans::team(p)
+                                    } else {
+                                        p.eq_ignore_ascii_case("free")
+                                    })
+                                || (!upgraded && !recovered && p.eq_ignore_ascii_case("free")))))
             })
         {
             return Err(fault(IDENTITY_ERROR));
@@ -137,7 +255,7 @@ pub fn subject(credential: &AuthCredential) -> Result<String, PluginFault> {
     subject_with_workspace_check(credential, true)
 }
 
-pub fn subject_for_team_upgrade(credential: &AuthCredential) -> Result<String, PluginFault> {
+pub fn subject_for_profile_change(credential: &AuthCredential) -> Result<String, PluginFault> {
     subject_with_workspace_check(credential, false)
 }
 
@@ -205,4 +323,110 @@ fn subject_with_workspace_check(
         return Err(fault("原账号 ID 与访问令牌主体不一致"));
     }
     Ok(subjects.remove(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn business_prolite_uses_team_family_without_weakening_token_identity() {
+        let sku = crate::plans::BUSINESS_PROLITE;
+        let make = |plan: &str, user: &str, workspace: &str| {
+            let value = json!({"email":"fixture@example.com","sub":"subject","exp":now()/1000+3600,
+                AUTH:{"user_id":user,"chatgpt_account_id":workspace,"chatgpt_plan_type":plan}});
+            format!("fixture.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap()))
+        };
+        let token = make(sku, "user", "workspace");
+        let tokens = json!({"id_token":token,"access_token":token,"refresh_token":"fixture-rt"});
+        let original = json!({"email":"fixture@example.com","userId":"user","accountId":"workspace","planType":"team"});
+        let output = json!({"event":"same_workspace","workspaceId":"workspace","originalWorkspaceId":"workspace","tokens":tokens});
+        assert!(validate(&output, &original).is_ok());
+        let mut personal = original.clone();
+        personal["planType"] = json!("prolite");
+        assert!(validate(&output, &personal).is_err());
+        assert_eq!(
+            validate_rt_replacement(&output["tokens"], &personal)
+                .unwrap()
+                .as_deref(),
+            Some(sku)
+        );
+        for (plan, user, workspace) in [("team", "user", "workspace"), (sku, "other", "workspace"), (sku, "user", "other")] {
+            let mut wrong = output.clone();
+            wrong["tokens"]["access_token"] = json!(make(plan, user, workspace));
+            assert!(validate(&wrong, &original).is_err());
+            let replacement = validate_rt_replacement(&wrong["tokens"], &original);
+            if user == "user" && workspace == "workspace" {
+                assert_eq!(replacement.unwrap(), None);
+            } else {
+                assert!(replacement.is_err());
+            }
+        }
+        let mut upgrade = output.clone();
+        upgrade["event"] = json!("team_upgrade");
+        upgrade["uniqueTeamConfirmed"] = json!(true);
+        let mut free = original.clone();
+        free["planType"] = json!("free");
+        assert!(validate(&upgrade, &free).is_ok());
+        upgrade["uniqueTeamConfirmed"] = json!(false);
+        assert!(validate(&upgrade, &free).is_err());
+    }
+    fn expired_token(user: &str, subject: &str, email: &str) -> String {
+        let value = json!({"email":email,"sub":subject,"exp":1,AUTH:{"user_id":user}});
+        format!(
+            "fixture.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        )
+    }
+    #[test]
+    fn expired_saved_credentials_bind_identity_but_cannot_authorize_or_import() {
+        let original = json!({"email":"fixture@example.com","userId":"user","planType":"free","accountId":null});
+        let old = expired_token("user", "subject", "fixture@example.com");
+        let tokens = json!({"id_token":old,"access_token":old,"refresh_token":"fixture-rt"});
+        assert_eq!(
+            validate_existing_binding(&tokens, &original).unwrap(),
+            "subject"
+        );
+        assert!(validate_binding(&tokens, &original).is_err());
+        assert!(claims(&old).is_err());
+        assert!(validate(&json!({"event":"workspace_recovered","workspaceId":"workspace","originalWorkspaceId":null,"uniqueWorkspaceConfirmed":true,"selectedPlan":"free","tokens":tokens}), &original).is_err());
+        for (user, subject, email) in [
+            ("other", "subject", "fixture@example.com"),
+            ("user", "other", "fixture@example.com"),
+            ("user", "subject", "other@example.com"),
+        ] {
+            let mut wrong = tokens.clone();
+            let key = if email == "other@example.com" {
+                "id_token"
+            } else {
+                "access_token"
+            };
+            wrong[key] = json!(expired_token(user, subject, email));
+            assert!(validate_existing_binding(&wrong, &original).is_err());
+        }
+        for invalid in ["not-a-token", "fixture.e30.signature"] {
+            let mut wrong = tokens.clone();
+            wrong["access_token"] = json!(invalid);
+            assert!(validate_existing_binding(&wrong, &original).is_err());
+        }
+    }
+    fn token(user: &str, subject: &str) -> String {
+        let value = json!({"email":"fixture@example.com","sub":subject,"exp":now()/1000+3600,AUTH:{"user_id":user}});
+        format!(
+            "fixture.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        )
+    }
+    #[test]
+    fn unbound_rt_proves_user_only_and_cannot_pass_workspace_validation() {
+        let original = json!({"email":"fixture@example.com","userId":"user","planType":"free","accountId":null});
+        let tokens = json!({"id_token":token("user","subject"),"access_token":token("user","subject"),"refresh_token":"fixture-rt"});
+        assert!(missing_workspace(&original));
+        assert_eq!(validate_binding(&tokens, &original).unwrap(), "subject");
+        assert!(validate(&json!({"event":"same_workspace","workspaceId":null,"originalWorkspaceId":null,"tokens":tokens}),&original).is_err());
+        for (user, sub) in [("wrong-user", "subject"), ("user", "wrong-subject")] {
+            let mut changed = tokens.clone();
+            changed["access_token"] = json!(token(user, sub));
+            assert!(validate_binding(&changed, &original).is_err());
+        }
+    }
 }

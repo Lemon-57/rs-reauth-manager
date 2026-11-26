@@ -1,7 +1,7 @@
 //! 所有授权共用 RS 原生完成接口，仅在原生保存后核验及修正工作区元数据
 use crate::{
     Job, detail,
-    host::{admin, fault},
+    host::{admin, admin_replace_rt, fault},
     recovery, require_idle, settings,
 };
 use gateway_plugin_sdk::{
@@ -25,6 +25,268 @@ fn final_status_confirmed(status: &Value) -> bool {
     )
 }
 
+async fn apply_team_schedule(
+    host: &HostClient,
+    id: &str,
+    expected: &Value,
+    revision: u64,
+) -> Result<Value, PluginFault> {
+    let mut wanted = expected.clone();
+    let Some((concurrency, weight)) = expected["planType"]
+        .as_str()
+        .and_then(crate::plans::fixed_team_schedule)
+    else {
+        return Ok(wanted);
+    };
+    wanted["concurrencyLimit"] = json!(concurrency);
+    wanted["weight"] = json!(weight);
+    if wanted == *expected {
+        return Ok(wanted);
+    }
+    let before = detail(host, id).await?;
+    if settings(&before) != *expected || before["_credentialRevision"].as_u64() != Some(revision) {
+        return Err(fault(
+            "Team 调度更新前账号配置或凭据已变化，未修改并发和权重",
+        ));
+    }
+    let reply = admin(
+        host,
+        "POST",
+        "/api/admin/accounts/batch-update",
+        Some(json!({"accountIds":[id],"concurrencyLimit":concurrency,"weight":weight})),
+    )
+    .await
+    .map_err(|_| fault("Team 并发和权重更新未确认，请核对实际配置，不会自动重放"))?;
+    if reply["accountIds"] != json!([id]) || reply["configRevision"].as_u64().is_none() {
+        return Err(fault("Team 并发和权重更新回执不一致，请核对实际配置"));
+    }
+    let after = detail(host, id).await?;
+    if settings(&after) != wanted
+        || after["outboundProxyId"] != before["outboundProxyId"]
+        || after["_credentialRevision"].as_u64() != Some(revision)
+    {
+        return Err(fault("Team 并发和权重或固定配置读回不一致，请人工核对"));
+    }
+    Ok(wanted)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtReplacementMode {
+    Import,
+    Mailshop,
+}
+
+pub(crate) async fn replace_rt(
+    host: &HostClient,
+    before: &Value,
+    revision: u64,
+    rt: &str,
+    mode: RtReplacementMode,
+) -> Result<bool, PluginFault> {
+    let id = before["id"]
+        .as_str()
+        .ok_or_else(|| fault("原账号 ID 无效"))?;
+    let mut expected = settings(before);
+    let original_proxy = crate::proxy(host, before).await?;
+    let next = revision
+        .checked_add(1)
+        .ok_or_else(|| fault("原账号凭据版本无效"))?;
+    let mut request = json!({"accountId":id,"expectedCredentialRevision":revision,"refreshToken":rt,"allowWorkspaceAndPlanChange":true});
+    if mode == RtReplacementMode::Import {
+        request["allowPlanMismatch"] = json!(true);
+        request["allowAnyStatus"] = json!(true);
+    }
+    let reply = admin_replace_rt(host, request).await?;
+    if reply["accountId"] != id || reply["credentialRevision"].as_u64() != Some(next) {
+        return Err(fault("原账号 RT 更新回执不匹配，请人工核对"));
+    }
+    let saved = if mode == RtReplacementMode::Import {
+        Some(recovery::credential(host, id).await?)
+    } else {
+        None
+    };
+    let after = detail(host, id).await?;
+    let workspace_changed = after["accountId"] != before["accountId"];
+    if mode == RtReplacementMode::Mailshop || workspace_changed {
+        if after["hasRefreshToken"] != true
+            || ["accountId", "planType"]
+                .iter()
+                .any(|field| after[*field].as_str().is_none_or(str::is_empty))
+        {
+            return Err(fault("RS 未确认 RT 或新套餐与工作区已保存"));
+        }
+        expected["accountId"] = after["accountId"].clone();
+        expected["planType"] = after["planType"].clone();
+    }
+    if saved
+        .as_ref()
+        .is_some_and(|credential| credential.credential_revision != next)
+        || after["_credentialRevision"].as_u64() != Some(next)
+        || settings(&after) != expected
+        || after["outboundProxyId"] != before["outboundProxyId"]
+        || !same_proxy(&crate::proxy(host, &after).await?, &json!(original_proxy))
+    {
+        return Err(fault("原账号 RT、配置或固定代理读回不一致，请人工核对"));
+    }
+    let apply_schedule = match saved {
+        Some(saved) => {
+            let plan = recovery::validate_rt_replacement(&recovery::tokens(&saved), &expected)?;
+            if workspace_changed
+                && !plan
+                    .as_deref()
+                    .zip(expected["planType"].as_str())
+                    .is_some_and(|(verified, stored)| verified.eq_ignore_ascii_case(stored))
+            {
+                return Err(fault("已保存 RT 的新工作区套餐未确认，请核对原账号"));
+            }
+            plan.as_deref()
+                .and_then(crate::plans::fixed_team_schedule)
+                .is_some()
+        }
+        None => true,
+    };
+    let free_upgraded =
+        mode == RtReplacementMode::Mailshop && crate::grouping::free_upgrade(before, &expected);
+    if free_upgraded {
+        expected = crate::grouping::assign_mailshop_free_upgrade(host, id, &expected, next)
+            .await
+            .map_err(|error| fault(&format!("RT 已写回，GPT Pro 归组未确认：{}", error.message)))?;
+    }
+    if apply_schedule {
+        expected = apply_team_schedule(host, id, &expected, next)
+            .await
+            .map_err(|error| fault(&format!("RT 已写回，{}", error.message)))?;
+    }
+    let final_account = detail(host, id).await?;
+    if settings(&final_account) != expected || final_account["outboundProxyId"] != before["outboundProxyId"]
+        || final_account["_credentialRevision"].as_u64() != Some(next)
+        || final_account["_credentialState"] != "ready"
+        || (mode == RtReplacementMode::Mailshop
+            && (final_account["hasRefreshToken"] != true
+                || !final_status_confirmed(&final_account["status"])))
+    {
+        return Err(fault("RT 更新后的凭据版本、配置或调度状态未确认"));
+    }
+    Ok(free_upgraded)
+}
+
+fn paid_import_plan(plan: &str) -> bool {
+    matches!(
+        plan.trim().to_ascii_lowercase().as_str(),
+        "team"
+            | "business"
+            | "self_serve_business_prolite"
+            | "plus"
+            | "pro"
+            | "prolite"
+            | "promax"
+            | "go"
+    )
+}
+
+// 接受原生保存所投影的已验证套餐/工作区，其他控制字段仍逐项一致
+fn native_settings_match(actual: &Value, expected: &Value, workspace: &str, plan: &str) -> bool {
+    let mut actual = settings(actual);
+    for (key, verified) in [("accountId", workspace), ("planType", plan)] {
+        if actual[key] != expected[key] && actual[key].as_str() != Some(verified) {
+            return false;
+        }
+        actual[key] = expected[key].clone();
+    }
+    actual == *expected
+}
+
+// 仅在显式手动任务中补齐已保存 Team 凭据的元数据，不登录、不交换或恢复旧 RT
+pub async fn reconcile_saved_team(host: &HostClient, job: &Job) -> Result<(), PluginFault> {
+    if job.automatic {
+        return Ok(());
+    }
+    let before = detail(host, &job.account_id).await?;
+    require_idle(&before)?;
+    let original = settings(&before);
+    let mut saved = recovery::credential(host, &job.account_id).await?;
+    let Ok(identity) = recovery::existing_claims(
+        recovery::tokens(&saved)["id_token"]
+            .as_str()
+            .unwrap_or_default(),
+    ) else {
+        return Ok(());
+    };
+    let auth = &identity["https://api.openai.com/auth"];
+    let workspace = auth["chatgpt_account_id"].as_str().unwrap_or_default();
+    let plan = auth["chatgpt_plan_type"].as_str().unwrap_or_default();
+    if !crate::plans::team(plan)
+        || workspace.is_empty()
+        || (original["accountId"] == workspace
+            && original["planType"] == plan
+            && saved.facts.upstream_account_id.as_deref() == Some(workspace)
+            && saved.facts.plan_type.as_deref() == Some(plan))
+    {
+        return Ok(());
+    }
+    if before["enabled"] != false {
+        return Err(fault("已保存 Team 工作区待核对，请先暂停账号"));
+    }
+    let subject = recovery::validate_existing_binding(&recovery::tokens(&saved), &original)?;
+    if saved
+        .facts
+        .material
+        .get("principal")
+        .and_then(|v| v["oauth_subject"].as_str())
+        .is_some_and(|v| v != subject)
+    {
+        return Err(fault("已保存 Team 凭据主体不一致，未修正元数据"));
+    }
+    let mut target = original.clone();
+    target["accountId"] = json!(workspace);
+    target["planType"] = json!(plan);
+    recovery::validate_existing(
+        &json!({"event":"same_workspace","workspaceId":workspace,"originalWorkspaceId":workspace,"tokens":recovery::tokens(&saved)}),
+        &target,
+    )?;
+    let guard = detail(host, &job.account_id).await?;
+    require_idle(&guard)?;
+    if settings(&guard) != original
+        || guard["_credentialRevision"].as_u64() != Some(saved.credential_revision)
+    {
+        return Err(fault("补齐 Team 元数据前配置或凭据变化，未写入"));
+    }
+    saved.facts.upstream_account_id = Some(workspace.to_owned());
+    saved.facts.plan_type = Some(plan.to_owned());
+    saved.facts.material.insert(
+        "principal".into(),
+        json!({"oauth_subject":subject,"poid":null}),
+    );
+    let request = AuthSaveRequest::Replace {
+        account_id: job.account_id.clone(),
+        credential_revision: saved.credential_revision,
+        facts: saved.facts.clone(),
+    };
+    crate::executor::check(host).await?;
+    let reply = host
+        .call(
+            "host.auth.save",
+            json!({}),
+            serde_json::to_vec(&request).map_err(|_| fault("Team 元数据请求无效"))?,
+        )
+        .await
+        .map_err(|_| fault("Team 元数据保存未确认，请回读，未重放"))?;
+    let result: AuthSaveResult =
+        serde_json::from_slice(&reply.payload).map_err(|_| fault("Team 元数据回执未确认"))?;
+    let read = recovery::credential(host, &job.account_id).await?;
+    let after = detail(host, &job.account_id).await?;
+    if result.account_id != job.account_id
+        || result.credential_revision != saved.credential_revision + 1
+        || read.credential_revision != result.credential_revision
+        || settings(&after) != target
+        || serde_json::to_value(read.facts).map_err(|_| fault("Team 元数据读回失败"))?
+            != serde_json::to_value(saved.facts).map_err(|_| fault("Team 元数据读回失败"))?
+    {
+        return Err(fault("Team 元数据读回未确认，账号保持暂停"));
+    }
+    Ok(())
+}
+
 pub async fn restore(
     host: &HostClient,
     id: &str,
@@ -39,6 +301,8 @@ pub async fn restore(
     {
         return Err(fault("恢复调度前账号配置、凭据或在途状态变化，请人工核对"));
     }
+    let expected = crate::grouping::assign(host, id, expected, revision).await?;
+    let expected = apply_team_schedule(host, id, &expected, revision).await?;
     if enabled {
         admin(
             host,
@@ -68,17 +332,24 @@ pub async fn complete(
     output: &Value,
 ) -> Result<(String, bool), PluginFault> {
     if snapshot["newAccount"] == true {
-        return complete_new_account(host, snapshot, output).await;
+        let batch_id = crate::onboarding::batch_id(&job.request_id)?;
+        return complete_new_account(host, snapshot, output, &batch_id).await;
     }
     let event = output["event"].as_str().unwrap_or_default();
     let forced = event == "forced_workspace";
     let free = matches!(event, "free_fallback" | "forced_free");
     let team = event == "team_upgrade";
+    let recovered = event == "workspace_recovered";
+    let accept_current_profile = event == "complete" && snapshot["acceptCurrentProfile"] == true;
     if !matches!(
         event,
-        "complete" | "free_fallback" | "forced_free" | "forced_workspace" | "team_upgrade"
+        "complete"
+            | "free_fallback"
+            | "forced_free"
+            | "forced_workspace"
+            | "team_upgrade"
+            | "workspace_recovered"
     ) || output.get("tokens").is_some()
-        || (job.automatic && event != "complete")
         || (forced
             && (job.force_workspace_id.as_deref() != output["workspaceId"].as_str()
                 || output["administratorConfirmed"] != true))
@@ -90,15 +361,24 @@ pub async fn complete(
                 || !snapshot["settings"]["planType"]
                     .as_str()
                     .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"))))
+        || (recovered
+            && (snapshot["recoverWorkspace"] != true
+                || !recovery::missing_workspace(&snapshot["settings"])
+                || output["uniqueWorkspaceConfirmed"] != true
+                || !matches!(output["selectedPlan"].as_str(), Some("free" | "team"))))
     {
         return Err(fault(
             "授权类型与原账号或管理员确认不一致，未提交原生完成接口",
         ));
     }
     let original = snapshot["settings"].clone();
-    if ["email", "userId", "accountId", "planType"]
+    if ["email", "userId", "planType"]
         .iter()
         .any(|key| original[*key].as_str().is_none_or(|v| v.trim().is_empty()))
+        || (!recovered
+            && original["accountId"]
+                .as_str()
+                .is_none_or(|v| v.trim().is_empty()))
     {
         return Err(fault("原账号身份、工作区或套餐不完整，未提交原生完成接口"));
     }
@@ -109,17 +389,16 @@ pub async fn complete(
     {
         return Err(fault("登录期间账号配置或凭据变化，未提交原生完成接口"));
     }
-    if job.automatic && !crate::automatic::ready(&current) {
-        return Err(fault("自动授权条件已经变化，未提交原生完成接口"));
-    }
     let old = recovery::credential(host, &job.account_id).await?;
     if Some(old.credential_revision) != snapshot["credentialRevision"].as_u64()
         || old.facts.upstream_user_id.as_deref() != original["userId"].as_str()
     {
         return Err(fault("原账号身份或凭据版本未确认，未提交原生完成接口"));
     }
-    let old_subject = if team {
-        recovery::subject_for_team_upgrade(&old)?
+    let old_subject = if recovered {
+        recovery::validate_existing_binding(&recovery::tokens(&old), &original)?
+    } else if team || accept_current_profile {
+        recovery::subject_for_profile_change(&old)?
     } else {
         recovery::subject(&old)?
     };
@@ -147,11 +426,15 @@ pub async fn complete(
             "暂停后账号配置、凭据或在途状态变化，未提交原生完成接口",
         ));
     }
+    let mut completion = json!({"provider":"openai","flowId":snapshot["flowId"],"callbackUrl":callback});
+    if accept_current_profile {
+        completion["expectedIdentityRevision"] = json!(old.credential_revision);
+    }
     let done = admin(
         host,
         "POST",
         "/api/admin/accounts/oauth/complete",
-        Some(json!({"provider":"openai","flowId":snapshot["flowId"],"callbackUrl":callback})),
+        Some(completion),
     )
     .await
     .map_err(|error| {
@@ -164,10 +447,8 @@ pub async fn complete(
         return Err(fault("原生 OAuth 返回账号不一致，账号保持暂停"));
     }
     let after = detail(host, &job.account_id).await?;
-    require_idle(&after)?;
     let mut saved = recovery::credential(host, &job.account_id).await?;
-    if settings(&after) != expected
-        || after["_credentialRevision"].as_u64() != Some(old.credential_revision + 1)
+    if after["_credentialRevision"].as_u64() != Some(old.credential_revision + 1)
         || saved.credential_revision != old.credential_revision + 1
     {
         return Err(fault(
@@ -184,13 +465,18 @@ pub async fn complete(
         .as_str()
         .ok_or_else(|| fault("原生授权工作区缺失"))?;
     let selected = output["workspaceId"].as_str().filter(|s| !s.is_empty());
-    if (event == "complete" && Some(actual) != original["accountId"].as_str())
+    if (event == "complete"
+        && !accept_current_profile
+        && Some(actual) != original["accountId"].as_str())
         || selected.is_some_and(|s| s != actual)
         || Some(old_subject.as_str()) != identity["sub"].as_str()
     {
-        return Err(fault(
-            "原生保存的授权主体或工作区不一致，账号保持暂停，未退出设备",
-        ));
+        return Err(fault("原生保存的授权主体或工作区不一致，账号保持暂停"));
+    }
+    let mut token_binding = original.clone();
+    if accept_current_profile {
+        token_binding["accountId"] = json!(actual);
+        token_binding["planType"] = identity["https://api.openai.com/auth"]["chatgpt_plan_type"].clone();
     }
     let mut checked = output.clone();
     checked["event"] = json!(if event == "complete" {
@@ -199,18 +485,21 @@ pub async fn complete(
         event
     });
     checked["workspaceId"] = json!(actual);
-    checked["originalWorkspaceId"] = original["accountId"].clone();
+    checked["originalWorkspaceId"] = token_binding["accountId"].clone();
     checked["tokens"] = tokens;
-    let (identity, _) = recovery::validate(&checked, &original)?;
+    let (identity, _) = recovery::validate(&checked, &token_binding)?;
     let plan = identity["https://api.openai.com/auth"]["chatgpt_plan_type"]
         .as_str()
         .ok_or_else(|| fault("原生授权套餐缺失"))?
         .trim()
         .to_ascii_lowercase();
+    if !native_settings_match(&after, &expected, actual, &plan) {
+        return Err(fault("原生保存后账号控制配置变化，账号保持暂停"));
+    }
     if event != "complete" {
         let guard = detail(host, &job.account_id).await?;
         require_idle(&guard)?;
-        if settings(&guard) != expected
+        if !native_settings_match(&guard, &expected, actual, &plan)
             || guard["_credentialRevision"].as_u64() != Some(saved.credential_revision)
         {
             return Err(fault("工作区元数据写回前配置或凭据变化，账号保持暂停"));
@@ -233,6 +522,7 @@ pub async fn complete(
             credential_revision: saved.credential_revision,
             facts: saved.facts.clone(),
         };
+        crate::executor::check(host).await?;
         let reply = host
             .call(
                 "host.auth.save",
@@ -260,41 +550,93 @@ pub async fn complete(
         }
     }
     let verified = detail(host, &job.account_id).await?;
-    require_idle(&verified)?;
+    if event == "complete" {
+        expected["accountId"] = json!(actual);
+        expected["planType"] = json!(plan);
+    }
     if settings(&verified) != expected
         || verified["_credentialRevision"].as_u64() != Some(saved.credential_revision)
     {
         return Err(fault("原生授权最终状态未确认，账号保持暂停"));
     }
-    let resume = team || (!free && !forced && original["enabled"] == true);
-    snapshot["postAuthorizationSettings"] = expected.clone();
-    snapshot["resumeAfterCleanup"] = json!(resume);
-    if !job.logout_others {
-        restore(
+    let free_upgraded = crate::grouping::free_upgrade(&original, &expected);
+    let expected = if free_upgraded {
+        let grouped = crate::grouping::assign_free_upgrade(
             host,
             &job.account_id,
             &expected,
             saved.credential_revision,
-            resume,
         )
         .await?;
-    }
-    let message = if team {
+        if grouped["planType"].as_str().is_some_and(|plan| {
+            plan.trim().eq_ignore_ascii_case(crate::plans::BUSINESS_PROLITE)
+        }) {
+            crate::grouping::assign(host, &job.account_id, &grouped, saved.credential_revision).await?
+        } else {
+            grouped
+        }
+    } else {
+        require_idle(&verified)?;
+        crate::grouping::assign(host, &job.account_id, &expected, saved.credential_revision).await?
+    };
+    let expected = if job.import_info.is_some() {
+        crate::import_profile::apply_details(host, &Value::Null, &job.account_id, &expected,
+            saved.credential_revision, job.started_at.ok_or_else(|| fault("导入开始时间缺失，账号保持暂停"))?).await?
+    } else { expected };
+    let recovered_team = recovered && crate::grouping::team(&expected);
+    let free = free || (recovered && !recovered_team);
+    let resume = (team || recovered_team || (!free && !forced && original["enabled"] == true))
+        && !(job.automatic && original["enabled"] == false);
+    snapshot["postAuthorizationSettings"] = expected.clone();
+    snapshot["resumeEnabled"] = json!(resume);
+    snapshot["authorizedCredentialRevision"] = json!(saved.credential_revision);
+    let message = if recovered_team {
+        "RS 原生 OAuth 已补齐并验证唯一 Team 工作区"
+    } else if team {
         "原生授权已切换到唯一 Team 工作区"
     } else if free {
         "原生授权已退回同一用户 Free，已停止调度"
     } else if forced {
         "管理员已确认，原生工作区授权已保存，已停止调度"
+    } else if accept_current_profile
+        && (expected["accountId"] != original["accountId"] || expected["planType"] != original["planType"])
+    {
+        "RS 原生 OAuth 已写回同一账号的 RT，套餐及工作区按新凭据确认"
     } else {
         "RS 原生 OAuth 已换取、保存 RT，身份及配置已读回确认"
     };
-    Ok((message.into(), free))
+    let message = if free_upgraded || crate::grouping::team(&expected) {
+        format!("{message}；已移入 GPT Pro 分组")
+    } else if expected["planType"]
+        .as_str()
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("free"))
+        && original["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|g| g["name"] == "GPT Pro"))
+    {
+        format!("{message}；已移入 Free Wait 分组")
+    } else {
+        message.into()
+    };
+    Ok((message, free))
+}
+
+fn new_account_workspace_matches(output: &Value, account: &Value) -> bool {
+    account["accountId"]
+        .as_str()
+        .filter(|workspace| !workspace.is_empty())
+        .is_some_and(|workspace| {
+            output
+                .get("workspaceId")
+                .is_none_or(|selected| selected.as_str() == Some(workspace))
+        })
 }
 
 async fn complete_new_account(
     host: &HostClient,
     snapshot: &mut Value,
     output: &Value,
+    batch_id: &str,
 ) -> Result<(String, bool), PluginFault> {
     if output["event"] != "complete" || output.get("tokens").is_some() {
         return Err(fault("新增账号必须取得 RS 原生授权回调，未提交完成接口"));
@@ -307,28 +649,31 @@ async fn complete_new_account(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| fault("新增账号 OAuth flow 缺失"))?;
     let settings = snapshot["settings"].clone();
-    let done = admin(
-        host,
-        "POST",
-        "/api/admin/accounts/oauth/complete",
-        Some(json!({
-            "provider":"openai",
-            "flowId":flow,
-            "callbackUrl":callback,
-            "settings":settings
-        })),
-    )
-    .await
-    .map_err(|error| {
-        fault(&format!(
-            "RS 新增 OAuth 完成接口未确认：{}，账号未完成写入",
-            error.message
-        ))
-    })?;
+    let body =
+        json!({"provider":"openai","flowId":flow,"callbackUrl":callback,"settings":settings});
+    let done = if snapshot["protectedTransport"].is_object() {
+        crate::onboarding::request(
+            host,
+            &snapshot["protectedTransport"],
+            "/api/admin/accounts/oauth/complete",
+            body,
+        )
+        .await?
+    } else {
+        admin(
+            host,
+            "POST",
+            "/api/admin/accounts/oauth/complete",
+            Some(body),
+        )
+        .await?
+    };
     let id = done["accountId"]
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| fault("RS 新增 OAuth 未返回账号 ID"))?;
+    // Keep the authoritative receipt even when a later check requires review.
+    snapshot["createdAccountId"] = json!(id);
     let account = detail(host, id).await?;
     if account["provider"] != "openai"
         || account["authenticationKind"] != "oauth"
@@ -337,14 +682,12 @@ async fn complete_new_account(
             !email.eq_ignore_ascii_case(snapshot["email"].as_str().unwrap_or_default())
         })
         || account["planType"].as_str().is_none_or(|plan| {
-            !matches!(
-                plan.trim().to_ascii_lowercase().as_str(),
-                "team" | "business"
-            )
+            !(paid_import_plan(plan)
+                || (snapshot["allowFreeNew"] == true && plan.trim().eq_ignore_ascii_case("free")))
         })
         || require_idle(&account).is_err()
     {
-        return Err(fault("新增账号身份、Team 套餐或停用状态读回不一致"));
+        return Err(fault("新增账号身份、套餐或停用状态读回不一致"));
     }
     let expected_groups = settings["groupIds"].as_array().cloned().unwrap_or_default();
     let actual_groups = account["groups"]
@@ -371,16 +714,41 @@ async fn complete_new_account(
         "originalWorkspaceId":account["accountId"],"tokens":tokens});
     recovery::validate(&check, &crate::settings(&account))?;
     if credential.credential_revision != account["_credentialRevision"].as_u64().unwrap_or(0)
-        || output["workspaceId"] != account["accountId"]
+        || !new_account_workspace_matches(output, &account)
         || !same_proxy(&crate::proxy(host, &account).await?, &snapshot["proxy"])
     {
         return Err(fault("新增账号凭据版本、所选工作区或固定代理不一致"));
     }
-    snapshot["postAuthorizationSettings"] = crate::settings(&account);
-    snapshot["resumeAfterCleanup"] = json!(true);
     snapshot["createdAccountId"] = json!(id);
+    let verified_settings = crate::grouping::assign(
+        host,
+        id,
+        &crate::settings(&account),
+        credential.credential_revision,
+    )
+    .await?;
+    let verified_settings = crate::import_profile::apply(
+        host,
+        &snapshot["protectedTransport"],
+        id,
+        &verified_settings,
+        credential.credential_revision,
+        snapshot["importStartedAt"]
+            .as_u64()
+            .ok_or_else(|| fault("导入开始时间缺失，账号保持暂停"))?,
+        batch_id,
+    )
+    .await?;
+    snapshot["postAuthorizationSettings"] = verified_settings;
+    let paid = account["planType"].as_str().is_some_and(paid_import_plan);
+    snapshot["resumeEnabled"] = json!(paid);
+    snapshot["authorizedCredentialRevision"] = json!(credential.credential_revision);
     Ok((
-        "RS 原生 OAuth 已创建并保存 Team RT，备注与 GPT Pro 分组已读回确认".into(),
+        if paid {
+            "RS 原生 OAuth 已创建并保存付费账号 RT，备注与分组已读回确认".into()
+        } else {
+            "RS 原生 OAuth 已保存 Free RT，未发现唯一 Team 成员资格，账号保持暂停".into()
+        },
         false,
     ))
 }
@@ -389,6 +757,41 @@ async fn complete_new_account(
 mod tests {
     use super::final_status_confirmed;
     use serde_json::json;
+
+    #[test]
+    fn new_account_accepts_an_implicit_workspace_but_checks_an_explicit_selection() {
+        let account = json!({"accountId":"issued-workspace"});
+        for output in [json!({}), json!({"workspaceId":"issued-workspace"})] {
+            assert!(super::new_account_workspace_matches(&output, &account));
+        }
+        for workspace in [json!(""), json!(null), json!("other-workspace")] {
+            assert!(!super::new_account_workspace_matches(
+                &json!({"workspaceId":workspace}),
+                &account
+            ));
+        }
+        assert!(!super::new_account_workspace_matches(&json!({}), &json!({})));
+    }
+
+    #[test]
+    fn paid_import_accepts_pro_variants_without_accepting_unknown_plans() {
+        for plan in [
+            "team",
+            "business",
+            "self_serve_business_prolite",
+            "plus",
+            "pro",
+            "prolite",
+            "promax",
+            "go",
+            " ProLite ",
+        ] {
+            assert!(super::paid_import_plan(plan));
+        }
+        for plan in ["free", "", "unknown", "professional"] {
+            assert!(!super::paid_import_plan(plan));
+        }
+    }
 
     #[test]
     fn proxy_normalization_preserves_authentication_and_fixed_endpoint() {
